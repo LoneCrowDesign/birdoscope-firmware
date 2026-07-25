@@ -1,0 +1,11 @@
+# Host-side Python dependencies.
+#
+# Only the serial debug tools under tools/ need anything. Building and flashing
+# the firmware needs PlatformIO, which manages its own toolchain separately.
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements.txt
+#
+# See tools/serial_debug/README.md for usage.
+
+pyserial>=3.5

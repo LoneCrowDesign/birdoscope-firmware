@@ -1,0 +1,54 @@
+Birdoscope firmware
+Copyright (c) 2026 Lone Crow Design, LLC
+Licensed under the MIT License — see LICENSE.
+
+============================================================================
+Upstream and prior-work attribution
+============================================================================
+
+This firmware is a fork of, and builds on, the work of others. The detection
+engine and several core mechanisms are derived from upstream code and research;
+they retain their original names in the source as a provenance marker (see
+docs/attribution.md for the full map). Credit is due to:
+
+  * colonelpanichacks — "flock-you" firmware (https://github.com/colonelpanichacks/flock-you)
+      The firmware this project was forked from. The promiscuous-mode WiFi
+      detection engine, OUI matching, Flock information-element fingerprinting,
+      SPIFFS session persistence, serial JSON emission, and LED/buzzer feedback
+      derive from this project.
+
+  * @NitekryDPaul — original research, initial firmware, and the Flock OUI
+      target list that the detection method relies on.
+
+  * Michael / @DeFlockJoplin (https://github.com/DeflockJoplin/flock-you) —
+      research on the wildcard-probe-request signature of Flock infrastructure,
+      and OUI contributions. (DeFlockJoplin forked the same upstream research
+      base, not this repository.)
+
+  * Pintor, Lucia & Atzori, Luigi (2022), "Analysis of Wi-Fi Probe Requests
+      Towards Information Element Fingerprinting" — academic basis for the IE
+      fingerprinting approach.
+
+  * PlatformIO and PIOArduino for making MCU development easy and powerful
+
+Original contributions in this repository (added after the fork) are Copyright
+(c) 2026 Lone Crow Design, LLC and licensed under the MIT License.
+
+----------------------------------------------------------------------------
+Upstream licensing
+----------------------------------------------------------------------------
+The upstream colonelpanichacks/flock-you repository publishes no explicit
+LICENSE file, but its author has confirmed support for this fork. The MIT
+license here is applied to this project's original contributions; the derived
+upstream portions are used under that permission grant.
+
+----------------------------------------------------------------------------
+Third-party dependencies
+----------------------------------------------------------------------------
+The optional on-device web data portal links the WebConsole library
+("esp_webserver"), which is licensed under GPLv3. This does not affect the
+license of birdoscope's own source (MIT). However, a compiled firmware image
+that links WebConsole is a combined work governed by GPLv3: if you distribute
+such a binary (a release image or a pre-flashed device), distribute it under
+GPLv3 and make the complete corresponding source available. Builds that exclude
+the web portal carry no such obligation.

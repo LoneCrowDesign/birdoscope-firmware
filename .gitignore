@@ -1,0 +1,36 @@
+# Build output and toolchain
+.pio
+bin
+compile_commands.json
+
+# Python venv
+.venv
+.venvs
+__pycache__/
+*.pyc
+
+# local config
+.vscode
+.claude
+.cache
+.specify
+.tokensave
+CLAUDE.md
+
+# Swap and backup files
+*.swp
+*.swo
+*~
+.*.kate-swp
+.#*
+\#*#
+
+# Working docs
+docs/todo.md
+docs/migration_todo.md
+docs/old
+.old
+
+# OS noise
+.DS_Store
+Thumbs.db
