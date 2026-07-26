@@ -50,9 +50,7 @@ Every board below has a build environment in `platformio.ini`:
 | Heltec WiFi LoRa 32 V4 | `heltec_v4` |
 | ESP32-S3-DevKitC-1 N16R8 | `esp32-s3-devkitc1-n16r8` |
 | ESP32-S3-DevKitC-1 N8R2 | `esp32-s3-devkitc1-n8r2` |
-| Birdoscope Analyze r0.1 (ESP32-S3), N8R2 module | `analyze_r01_n8r2` |
-| Birdoscope Analyze r0.1, N16R8 module | `analyze_r01_n16r8` |
-| ESP32 round LCD (GC9A01) | `esp32round` |
+| ESP32 Round LCD (GC9A01) | `esp32round` |
 
 Per-board pinouts live in [`docs/hardware/`](docs/hardware/), and
 [`docs/hardware_variants.md`](docs/hardware_variants.md) covers how the variants
