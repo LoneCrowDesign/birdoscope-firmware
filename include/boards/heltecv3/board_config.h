@@ -1,8 +1,23 @@
 // Copyright (C) 2026 Lone Crow Design, LLC
 // Licensed under the MIT License. See LICENSE.
 //
-// Board config for the Heltec WiFi LoRa 32 V4 (env:heltec_v4).
-// Selected via the -I include/boards/heltecv4 build flag in platformio.ini.
+// PLACEHOLDER board config for the Heltec WiFi LoRa 32 V3.
+//
+// The pin assignments here are UNVERIFIED. They are seeded from the closest
+// verified board so the file has the right shape, then adjusted where this
+// board's documentation gives a value. Flashing this without checking every
+// pin against the board can damage hardware.
+//
+// Seeded from the V4. The V3 has a different pinout and feature set, so
+// every pin below needs checking against the V3 schematic.
+//
+// Building is blocked on purpose. Define HELTECV3_UNVERIFIED_OK to
+// build anyway, once the pins have been checked.
+
+#ifndef HELTECV3_UNVERIFIED_OK
+#error "heltecv3 board config is an unverified placeholder. See the comment above."
+#endif
+
 #pragma once
 
 #define BUZZER_PIN 3
@@ -131,4 +146,4 @@ static const size_t SSID_KEYWORD_COUNT = sizeof(target_ssid_keywords) / sizeof(t
 // canonically-named file for the rest of the session.
 #define SD_LOG_FILE          "/log.csv"
 // Canonical post-anchor SD log filename: /bscope-M-D-YY-N.csv
-#define LOG_PREFIX            "bscope-"
+#define LOG_PREFIX      "bscope-"

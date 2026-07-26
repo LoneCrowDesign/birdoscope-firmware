@@ -27,9 +27,6 @@
 #ifndef HAS_GPS
 #define HAS_GPS 0
 #endif
-#ifndef HAS_LORA_MODEM
-#define HAS_LORA_MODEM 0
-#endif
 #ifndef HAS_BUTTONS
 #define HAS_BUTTONS 0
 #endif
@@ -260,15 +257,6 @@ bool coreHandleSerialCommand(const char* verb, const char* arg);
 // prints their board-specific verbs (status/inject/log/…) then calls this, so
 // the core command list lives in one place.
 void corePrintSerialHelp();
-
-// ============================================================
-// LORA IDLE-PIN HOLDING: for a board with an unused LoRa modem sharing SPI bus
-// pins with something else. The radio is never used. This holds NSS/RST high
-// and BUSY/DIO1 as inputs so the idle radio does not interfere with the bus.
-// Gated on HAS_LORA_MODEM, and a no-op otherwise.
-// ============================================================
-
-void coreLoraIdleInit();
 
 // ============================================================
 // NOTIFICATIONS: LED (NeoPixel) and buzzer feedback, gated on USE_LED/

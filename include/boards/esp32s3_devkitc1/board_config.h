@@ -7,7 +7,7 @@
 //
 // Shared by two environments, esp32-s3-devkitc1-n16r8 and
 // esp32-s3-devkitc1-n8r2, which differ only in on-module flash and PSRAM. Both
-// select this file with the -I include/boards/esp32s3n16r8 build flag in
+// select this file with the -I include/boards/esp32s3_devkitc1 build flag in
 // platformio.ini, so an edit here changes both boards.
 #pragma once
 

@@ -1,6 +1,6 @@
 # Name,   Type, SubType,  Offset,   Size,     Flags
 # Shared 8MB-flash layout for ESP32-S3 boards with an 8MB chip
-# (env:esp32-s3-devkitc1-n8r2 test board, env:pcb_r01_analyze). Mirrors
+# (env:esp32-s3-devkitc1-n8r2 test board, env:analyze_r01_esp32s3). Mirrors
 # partitions.csv but scaled to 8MB: app0 shrunk from 12MB to 4MB (still ~2x the
 # real binary), spiffs kept at the same 0x3F0000 as the 16MB table. Single OTA
 # slot, same as the 16MB layout.

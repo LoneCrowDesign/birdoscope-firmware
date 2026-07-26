@@ -503,8 +503,6 @@ void setup() {
   digitalWrite(BUZZER_PIN, LOW);
 #endif
 
-  coreLoraIdleInit();  // no-op unless HAS_LORA_MODEM
-
   displayInit();
   coreNotifyBoot();    // startup tune + RGB sanity cycle (no-op unless USE_LED/USE_BUZZER)
 

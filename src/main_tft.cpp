@@ -2,8 +2,8 @@
 // Licensed under the MIT License. See LICENSE.
 //
 // Shared main file for the sprite-graphics TFT boards. Detection logic and the
-// LoRa, notification, and input peripherals live in lib/birdoscope_core, so
-// this file covers display drawing plus setup() and loop() orchestration only.
+// notification and input peripherals live in lib/birdoscope_core, so this file
+// covers display drawing plus setup() and loop() orchestration only.
 // Another TFT board would reuse this file, differing only via board_config.h.
 #include <Arduino.h>
 #include <string.h>

@@ -1,16 +1,18 @@
 // Copyright (C) 2026 Lone Crow Design, LLC
 // Licensed under the MIT License. See LICENSE.
 //
-// Board config for the Birdoscope PCB r0.1 "analyze" (env:pcb_r01_analyze), an
-// ESP32-S3-N16R8 analyzer on a custom PCB. Notable features:
+// Board config for the Birdoscope Analyze r0.1 (ESP32-S3), a custom carrier
+// board that takes an ESP32-S3 DevKitC-1 module. Built by env:analyze_r01_n8r2
+// or env:analyze_r01_n16r8, which differ only in the populated module's flash
+// and PSRAM. Notable features:
 //   * SH1106 OLED, mounted upside-down, requiring OLED_SH1106 lib
 //     plus a flip in code: OLED_ROTATION = U8G2_R2 (180°)
 //   * Three onboard buttons, driving the semantic nav scheme.
 //
-// docs/hardware/hardware_pcb_r01.md carries the full PCB pinout from
+// docs/hardware/hardware_analyze_r01_esp32s3.md carries the full PCB pinout from
 // the schematic as manufactured.
 //
-// Selected via the -I include/boards/pcb_r01_analyze build flag in
+// Selected via the -I include/boards/analyze_r01_esp32s3 build flag in
 // platformio.ini.
 #pragma once
 

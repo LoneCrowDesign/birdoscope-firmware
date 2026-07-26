@@ -1582,25 +1582,6 @@ CoreAlertResult coreHandleAlert(const AlertEntry& e) {
 }
 
 // ============================================================
-// LORA IDLE-PIN HOLDING
-// ============================================================
-//
-// This firmware never uses the radio. Holding NSS high (deselected) and RST
-// high (not in reset) keeps the idle modem off the shared SPI bus, and leaving
-// BUSY/DIO1 as inputs avoids driving lines the modem itself may pull.
-// LORA_SCK/LORA_MOSI/LORA_MISO are bus pins only and are never touched here,
-// though board_config.h documents them alongside the others.
-
-void coreLoraIdleInit() {
-#if HAS_LORA_MODEM
-  pinMode(LORA_NSS,  OUTPUT); digitalWrite(LORA_NSS,  HIGH);
-  pinMode(LORA_RST,  OUTPUT); digitalWrite(LORA_RST,  HIGH);
-  pinMode(LORA_BUSY, INPUT);
-  pinMode(LORA_DIO1, INPUT);
-#endif
-}
-
-// ============================================================
 // NOTIFICATIONS: LED (NeoPixel) and buzzer
 // ============================================================
 

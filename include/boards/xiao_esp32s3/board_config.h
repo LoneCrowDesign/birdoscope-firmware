@@ -1,15 +1,31 @@
 // Copyright (C) 2026 Lone Crow Design, LLC
 // Licensed under the MIT License. See LICENSE.
 //
-// Board config for the Heltec WiFi LoRa 32 V4 (env:heltec_v4).
-// Selected via the -I include/boards/heltecv4 build flag in platformio.ini.
+// PLACEHOLDER board config for the Seeed XIAO ESP32-S3.
+//
+// The pin assignments here are UNVERIFIED. They are seeded from the closest
+// verified board so the file has the right shape, then adjusted where this
+// board's documentation gives a value. Flashing this without checking every
+// pin against the board can damage hardware.
+//
+// Pins are the proposed assignment from docs/hardware/hardware_xiao.md.
+// The XIAO has no Vext rail and no OLED reset line, and its single UART
+// pair is consumed by GPS, so the serial mirror is off.
+//
+// Building is blocked on purpose. Define XIAO_ESP32S3_UNVERIFIED_OK to
+// build anyway, once the pins have been checked.
+
+#ifndef XIAO_ESP32S3_UNVERIFIED_OK
+#error "xiao_esp32s3 board config is an unverified placeholder. See the comment above."
+#endif
+
 #pragma once
 
-#define BUZZER_PIN 3
+#define BUZZER_PIN      4
 #define USE_BUZZER 1
 
 // External NeoPixel on a free GPIO since the V4 carries no onboard RGB LED.
-#define LED_PIN          4
+#define LED_PIN         41
 #define USE_LED          1
 #define LED_FLASH_MS     120
 // repeat detection (default)
@@ -33,9 +49,9 @@
 // stays unused until config commands are needed. HAS_GPS=1 is safe with no
 // module fitted, because the time chain falls back when no fix arrives. Set to
 // 0 if your board does not have a GPS module
-#define HAS_GPS          1
-#define GPS_RX_PIN       39   // ESP RX  ← L76 TXD
-#define GPS_TX_PIN       38   // ESP TX  → L76 RXD
+#define HAS_GPS         1
+#define GPS_RX_PIN      44   // ESP RX  ← L76 TXD
+#define GPS_TX_PIN      43   // ESP TX  → L76 RXD
 #define GPS_RST_PIN      42   // GNSS_RST, active LOW, must be driven HIGH
 #define GPS_WAKEUP_PIN   40   // GNSS_Wakeup
 #define GPS_VGNSS_CTRL   34   // GNSS power enable, active LOW (same as VEXT_CTRL)
@@ -44,10 +60,10 @@
 
 // Built-in SSD1315 OLED on GPIO17/18 I2C with GPIO21 reset. This board leaves
 // no hardware I2C bus free, so OLED_HW_I2C=0 selects a software I2C driver.
-#define OLED_SDA  17
-#define OLED_SCL  18
+#define OLED_SDA        5
+#define OLED_SCL        6
 #define OLED_RST  21
-#define OLED_HW_I2C 0
+#define OLED_HW_I2C     1
 // Vext (GPIO36) is active-LOW and drives the OLED power rail
 #define VEXT_CTRL 36
 
@@ -62,14 +78,14 @@
 // the only required define, and MOSI/MISO/SCK can be remapped via SPI.begin().
 #define USE_SD        1
 #define SD_SELFTEST   0   // set 1 to run wiring verification at boot (independent of USE_SD)
-#define SD_CS_PIN     5
-#define SD_MOSI_PIN   6
-#define SD_MISO_PIN   2
-#define SD_SCK_PIN    46   // GPIO46 is a strapping pin (ROM log enable), but SCK is
+#define SD_CS_PIN       42
+#define SD_MOSI_PIN     9
+#define SD_MISO_PIN     8
+#define SD_SCK_PIN      7   // GPIO46 is a strapping pin (ROM log enable), but SCK is
                            // ESP32-driven so the line floats low at boot, which is
                            // benign. GPIO45 (VDD_SPI) would be worse.
 
-#define MIRROR_SERIAL    1
+#define MIRROR_SERIAL   0
 #define MIRROR_TX_PIN    43
 #define MIRROR_BAUD      115200
 
@@ -131,4 +147,4 @@ static const size_t SSID_KEYWORD_COUNT = sizeof(target_ssid_keywords) / sizeof(t
 // canonically-named file for the rest of the session.
 #define SD_LOG_FILE          "/log.csv"
 // Canonical post-anchor SD log filename: /bscope-M-D-YY-N.csv
-#define LOG_PREFIX            "bscope-"
+#define LOG_PREFIX      "bscope-"
