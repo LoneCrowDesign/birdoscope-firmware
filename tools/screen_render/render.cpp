@@ -1,0 +1,193 @@
+// Copyright (C) 2026 Lone Crow Design, LLC
+// Licensed under the MIT License. See LICENSE.
+//
+// Host-side renderer for the OLED screen carousel. Compiles u8g2's plain-C
+// sources natively, includes src/screens.inc verbatim, and dumps each frame's
+// 1KB display buffer for to_png.py to turn into an image. Because the draw code
+// is the firmware's own, a rendered frame cannot drift from the panel.
+//
+// What this file supplies is everything screens.inc expects the firmware to
+// have in scope: a `u8g2` object, the disp* state, core's screen/menu state and
+// helpers, and the board macros. All of it is a stub; nothing here runs on the
+// device.
+//
+// u8g2 has no I/O here. u8x8_byte_empty / u8x8_dummy_cb stand in for the I2C
+// and GPIO callbacks, and the buffer is read directly rather than sent, so no
+// display init ever happens.
+
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+extern "C" {
+#include "u8g2.h"
+}
+
+// ============================================================
+// BOARD CONFIG: set here rather than inherited from any one board's
+// board_config.h, so the images show the screens rather than one PCB's quirks.
+// ============================================================
+
+#define NAV_SCHEME_3BTN  1
+#define HAS_GPS          1
+#define CHANNEL_DWELL_MS 350
+
+// ============================================================
+// CORE STATE MIRROR: these enums mirror core.h, which cannot be included on the
+// host (it pulls in Arduino.h and esp_wifi.h). Needs to be kept in sync with
+// current menu state or it will render older versions.
+// ============================================================
+
+typedef enum {
+  SCREEN_OVERVIEW,
+  SCREEN_GPS,
+  SCREEN_DETECTIONS,
+  SCREEN_SCAN_DETAIL,
+  SCREEN_SCAN_MODES,
+  SCREEN_ALERTS,
+  SCREEN_CONFIG,
+  SCREEN_COUNT,
+} ScreenId;
+
+typedef enum { MENU_NONE, MENU_LIST, MENU_PICK_CHANNEL } MenuState;
+
+static ScreenId  coreCurrentScreen = SCREEN_OVERVIEW;
+static MenuState coreMenuState     = MENU_NONE;
+static int       coreMenuSel       = 0;
+static bool      coreBuzzerEnabled = true;
+static bool      coreLedEnabled    = true;
+
+// ============================================================
+// SCENARIO: the sample scan the images depict. Matches the DEMO_MODE values in
+// main_oled.cpp so renders and device photos tell the same story, but kept
+// separate: DEMO_MODE pins one frame, the renderer varies state per frame.
+// ============================================================
+
+#define DEMO_DET_COUNT 5
+#define DEMO_CHANNEL   6
+#define DEMO_OUI       "e4:aa:ea"        // drawn from core.cpp's target_ouis[]
+#define DEMO_MAC       DEMO_OUI ":7b:04:19"
+#define DEMO_RSSI      (-58)
+
+// Placeholder fix: Point Nemo, the oceanic pole of inaccessibility and the
+// furthest point on earth from any land. Exact rather than approximate, and a
+// scan reporting zero traffic from there is at least honest.
+#define DEMO_LAT       (-48.87664)
+#define DEMO_LNG       (-123.39335)
+
+static char    dispMac[18] = DEMO_MAC;
+static char    dispOui[9]  = DEMO_OUI;
+static int8_t  dispRssi    = DEMO_RSSI;
+static uint8_t dispCh      = DEMO_CHANNEL;
+
+static int      fyDetCount     = DEMO_DET_COUNT;
+static uint8_t  currentChannel = DEMO_CHANNEL;
+static bool     gpsHasFix      = true;
+static double   gpsLat         = DEMO_LAT;
+static double   gpsLng         = DEMO_LNG;
+
+static void coreGpsStats(unsigned long& good, unsigned long& bad,
+                         unsigned long& fixSent, int& sats) {
+  good = 1284; bad = 3; fixSent = 5; sats = 9;
+}
+// Spelling matches core.cpp's channelModeName() exactly; the SCAN screen prints
+// it verbatim, so a prettified stub would show a string the device never does.
+static const char* channelModeName() { return "CUSTOM"; }
+static int         coreScanModeIndex() { return 0; }
+
+// ============================================================
+// U8G2 SHIM: the firmware draws through U8g2lib's C++ object, which is
+// Arduino-only. This forwards the handful of calls screens.inc makes to the
+// plain-C API underneath, so the draw code compiles unchanged.
+// ============================================================
+
+static u8g2_t u8g2_dev;
+
+struct U8g2Shim {
+  void clearBuffer()                       { u8g2_ClearBuffer(&u8g2_dev); }
+  void sendBuffer()                        { /* buffer is read directly */ }
+  void setFont(const uint8_t* f)           { u8g2_SetFont(&u8g2_dev, f); }
+  void drawStr(int x, int y, const char* s){ u8g2_DrawStr(&u8g2_dev, x, y, s); }
+  int  getStrWidth(const char* s)          { return u8g2_GetStrWidth(&u8g2_dev, s); }
+  void drawHLine(int x, int y, int w)      { u8g2_DrawHLine(&u8g2_dev, x, y, w); }
+  void drawFrame(int x, int y, int w, int h) { u8g2_DrawFrame(&u8g2_dev, x, y, w, h); }
+  void drawBox(int x, int y, int w, int h) { u8g2_DrawBox(&u8g2_dev, x, y, w, h); }
+};
+static U8g2Shim u8g2;
+
+// The firmware's screen drawing, verbatim.
+#include "screens.inc"
+
+// ============================================================
+// FRAME TABLE + OUTPUT
+// ============================================================
+
+struct Frame {
+  const char* name;
+  ScreenId    screen;
+  MenuState   menu;
+  int         sel;
+};
+
+// More frames than there are ScreenIds: the menu screens each look different
+// browsing (MENU_NONE) versus drilled in (MENU_LIST), and Single opens a
+// channel picker. The mark overlay is handled separately below.
+static const Frame FRAMES[] = {
+  { "01_overview",          SCREEN_OVERVIEW,    MENU_NONE,         0 },
+  { "02_gps",               SCREEN_GPS,         MENU_NONE,         0 },
+  { "03_detections",        SCREEN_DETECTIONS,  MENU_NONE,         0 },
+  { "04_scan",              SCREEN_SCAN_DETAIL, MENU_NONE,         0 },
+  { "05_scan_mode",         SCREEN_SCAN_MODES,  MENU_NONE,         0 },
+  { "06_scan_mode_open",    SCREEN_SCAN_MODES,  MENU_LIST,         1 },
+  { "07_scan_mode_channel", SCREEN_SCAN_MODES,  MENU_PICK_CHANNEL, 6 },
+  { "08_alerts",            SCREEN_ALERTS,      MENU_NONE,         0 },
+  { "09_alerts_open",       SCREEN_ALERTS,      MENU_LIST,         0 },
+  { "10_web_config",        SCREEN_CONFIG,      MENU_NONE,         0 },
+  { "11_web_config_open",   SCREEN_CONFIG,      MENU_LIST,         0 },
+};
+static const int FRAME_COUNT = sizeof(FRAMES) / sizeof(FRAMES[0]);
+
+static bool dumpBuffer(const char* outDir, const char* name) {
+  char path[512];
+  snprintf(path, sizeof(path), "%s/%s.bin", outDir, name);
+  FILE* f = fopen(path, "wb");
+  if (!f) { fprintf(stderr, "cannot write %s\n", path); return false; }
+  // Full-buffer mode: 128 columns x 8 tile rows, one byte per 8 vertical px.
+  size_t bytes = (size_t)u8g2_GetBufferTileWidth(&u8g2_dev) * 8
+               * (size_t)u8g2_GetBufferTileHeight(&u8g2_dev);
+  fwrite(u8g2_GetBufferPtr(&u8g2_dev), 1, bytes, f);
+  fclose(f);
+  return true;
+}
+
+int main(int argc, char** argv) {
+  const char* outDir = (argc > 1) ? argv[1] : ".";
+
+  u8g2_Setup_ssd1306_128x64_noname_f(&u8g2_dev, U8G2_R0,
+                                     u8x8_byte_empty, u8x8_dummy_cb);
+  u8g2_SetFontMode(&u8g2_dev, 1);
+  u8g2_SetFontDirection(&u8g2_dev, 0);
+
+  // Orientation probe: a 4x4 block in the top-left, so the buffer-to-pixel
+  // mapping can be confirmed on a known shape instead of guessed at from text.
+  u8g2.clearBuffer();
+  u8g2.drawBox(0, 0, 4, 4);
+  if (!dumpBuffer(outDir, "00_probe")) return 1;
+
+  for (int i = 0; i < FRAME_COUNT; i++) {
+    coreCurrentScreen = FRAMES[i].screen;
+    coreMenuState     = FRAMES[i].menu;
+    coreMenuSel       = FRAMES[i].sel;
+    displayScreen();
+    if (!dumpBuffer(outDir, FRAMES[i].name)) return 1;
+    printf("%s\n", FRAMES[i].name);
+  }
+
+  // The mark overlay is not a carousel position; it is drawn over whatever
+  // screen is up when a manual mark is logged.
+  drawMarkOverlay();
+  if (!dumpBuffer(outDir, "12_mark_overlay")) return 1;
+  printf("12_mark_overlay\n");
+
+  return 0;
+}

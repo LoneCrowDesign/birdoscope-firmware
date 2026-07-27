@@ -20,15 +20,39 @@ read-only detail views and three are menus you drill into with Select.
 
 1. Overview: detection count, channel, GPS fix flag (Y/N), and the scanning or
    last-hit headline. Also surfaces the Mark area-of-interest gesture.
+
+   ![Overview screen](../assets/images/carousel_demo/01_overview.png)
+
 2. GPS: fix status and satellite count, current position, and parser health
    counters (ok and bad checksums, fix-carrying sentences), matching the `[gps]`
    serial line.
+
+   ![GPS screen](../assets/images/carousel_demo/02_gps.png)
+
 3. Detections: count and last detection MAC.
+
+   ![Detections screen](../assets/images/carousel_demo/03_detections.png)
+
 4. Scan: current channel, dwell time, and mode.
+
+   ![Scan screen](../assets/images/carousel_demo/04_scan.png)
+
 5. Scan Mode (menu): Custom Scan, Full Channel, or Single, which opens a channel
    picker.
+
+   ![Scan Mode screen](../assets/images/carousel_demo/05_scan_mode.png)
+
 6. Alerts (menu): Buzzer Muted/Unmuted and LED On/Off, toggled in place.
+
+   ![Alerts screen](../assets/images/carousel_demo/08_alerts.png)
+
 7. Web Config (menu): Web Console On or Off, the Admin-mode entry.
+
+   ![Web Config screen](../assets/images/carousel_demo/10_web_config.png)
+
+Screens are rendered from the firmware's own drawing code by
+`tools/screen_render`, not photographed, so they track the display exactly. The
+sample values are a stand-in scan, not a real capture.
 
 ### Scan Mode menu
 

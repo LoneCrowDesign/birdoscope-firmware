@@ -1,3 +1,7 @@
+![BirdoscopeLogo](assets/images/gh_logo_3bird_bw_600x200.png)
+
+![Birdoscope Device](assets/images/gh_bscope_90deg.jpg)
+
 # Birdoscope Firmware
 
 Detection and data capture firmware for locating Flock surveillance
