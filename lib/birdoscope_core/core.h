@@ -183,6 +183,13 @@ CoreAlertResult coreHandleAlert(const AlertEntry& e);
 extern int  fyDetCount;
 extern unsigned long fyLastTargetSeen;
 
+// Distinct new MACs that could not be recorded because the detection table hit
+// MAX_DETECTIONS. The table does not evict, so once full fyDetCount stops
+// moving and would otherwise read as "nothing new out here". Repeat hits on
+// already-known MACs still update, so this counts devices missed, not frames.
+// On a USE_SD board the SD event log is unaffected and no capture data is lost.
+extern uint16_t fyDroppedNew;
+
 // ============================================================
 // SPIFFS SESSION PERSISTENCE
 // ============================================================

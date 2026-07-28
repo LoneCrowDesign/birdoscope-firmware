@@ -437,6 +437,7 @@ typedef struct {
 
 static FYDetection fyDet[MAX_DETECTIONS];
 int           fyDetCount       = 0;
+uint16_t      fyDroppedNew     = 0;
 bool          fySpiffsReady    = false;
 #if USE_SD
 bool          fySDReady        = false;
@@ -504,6 +505,16 @@ static int fyAddDetection(const char* mac, const char* method,
     }
   }
   if (fyDetCount >= MAX_DETECTIONS) {
+    // Table full: no eviction, no wraparound. Count what we could not record so
+    // the display can say so, because otherwise fyDetCount simply stops moving
+    // and reads as "nothing new out here" rather than "out of room". Repeat
+    // hits on MACs already in the table still update above, so this counts
+    // distinct devices missed, not frames.
+    //
+    // On a USE_SD board no capture data is lost: sdAppendRow() is called
+    // unconditionally by coreHandleAlert(), independent of this return value.
+    // On a board without SD, these devices are genuinely gone.
+    if (fyDroppedNew < 0xFFFF) fyDroppedNew++;
     if (outChirpWorthy) *outChirpWorthy = false;
     return -1;
   }
@@ -738,8 +749,16 @@ static unsigned long lastHeartbeat = 0;
 
 void printHeartbeat() {
   if (millis() - lastHeartbeat >= HEARTBEAT_MS) {
-    dualPrintf("[bscope] scanning (ch=%u mode=%s det=%d)\n",
-                  currentChannel, channelModeName(), fyDetCount);
+    if (fyDroppedNew) {
+      // Table is full and has been dropping devices. Say so every heartbeat,
+      // since det= is pinned at MAX_DETECTIONS and looks like a quiet area.
+      dualPrintf("[bscope] scanning (ch=%u mode=%s det=%d TABLE FULL, missed=%u)\n",
+                    currentChannel, channelModeName(), fyDetCount,
+                    (unsigned)fyDroppedNew);
+    } else {
+      dualPrintf("[bscope] scanning (ch=%u mode=%s det=%d)\n",
+                    currentChannel, channelModeName(), fyDetCount);
+    }
     lastHeartbeat = millis();
   }
 }
