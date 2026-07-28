@@ -15,8 +15,8 @@ the round TFT board renders its own UX. See [Board parity](board_parity.md).
 
 ## Top-level screens (carousel)
 
-Up and Down cycle through seven screens, wrapping at both ends. Four are
-read-only detail views and three are menus you drill into with Select.
+Up and Down cycle through eight screens, wrapping at both ends. Four are
+read-only detail views and four are menus you drill into with Select.
 
 1. Overview: detection count, channel, GPS fix flag (Y/N), and the scanning or
    last-hit headline. Also surfaces the Mark area-of-interest gesture.
@@ -42,17 +42,23 @@ read-only detail views and three are menus you drill into with Select.
 
    ![Scan Mode screen](../assets/images/carousel_demo/05_scan_mode.png)
 
-6. Alerts (menu): Buzzer Muted/Unmuted and LED On/Off, toggled in place.
+6. Targets (menu): Flock, Axon, or All, the vendors the OUI matcher accepts.
+
+   ![Targets screen](../assets/images/carousel_demo/13_targets.png)
+
+7. Alerts (menu): Buzzer Muted/Unmuted and LED On/Off, toggled in place.
 
    ![Alerts screen](../assets/images/carousel_demo/08_alerts.png)
 
-7. Web Config (menu): Web Console On or Off, the Admin-mode entry.
+8. Web Config (menu): Web Console On or Off, the Admin-mode entry.
 
    ![Web Config screen](../assets/images/carousel_demo/10_web_config.png)
 
 Screens are rendered from the firmware's own drawing code by
 `tools/screen_render`, not photographed, so they track the display exactly. The
-sample values are a stand-in scan, not a real capture.
+sample values are a stand-in scan, not a real capture. Image filenames follow the
+renderer's frame order rather than the carousel positions above, so that adding a
+screen does not rename the existing files.
 
 ### Scan Mode menu
 
@@ -64,6 +70,25 @@ Custom on reboot. The active mode is marked `*` and the cursor is `>`.
 - **Single**: lock to one channel for stationary close-listen capture. Selecting
   it opens a channel picker, where Up and Down dial 1 to 13, Select sets the
   channel, and long-Back cancels back to the list.
+
+### Targets menu
+
+Selects which vendors the OUI matcher accepts, live and in RAM, resetting to All
+on reboot. Deliberately orthogonal to Scan Mode: Targets picks what to look for,
+Scan Mode picks where to listen. Act-and-close, the same idiom as Scan Mode, with
+the active target marked `*` and the cursor `>`.
+
+- **Flock**: the 31 Flock Safety prefixes only.
+- **Axon**: the four Axon prefixes only, covering the Axon, VieVu and Fusus
+  registrations.
+- **All**: every prefix in the table. The default, and the right choice for
+  discovery, since matching costs nothing extra and the narrower targets only
+  discard hits.
+
+Narrowing does not speed up scanning or change channel behaviour. It exists to
+keep the logs and alerts from one drive attributable to a single vendor.
+
+![Targets menu, drilled in](../assets/images/carousel_demo/14_targets_open.png)
 
 ### Alerts menu
 

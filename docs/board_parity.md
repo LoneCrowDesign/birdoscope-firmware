@@ -62,8 +62,8 @@ to draw.
 4. Gated on `NAV_SCHEME_3BTN`, so only the three-button Analyze r0.1 reads
    physical buttons through it. The serial injector works on every board, and
    boards with two buttons keep `coreInputTick()`.
-5. Covers menu drill-in: Scan Mode with its channel picker, Alerts, and Web
-   Config. The round TFT board shares the core screen and menu state but renders
+5. Covers menu drill-in: Scan Mode with its channel picker, Targets, Alerts, and
+   Web Config. The round TFT board shares the core screen and menu state but renders
    its own round-screen UX, which is divergent by design rather than pending
    work. Other OLED boards show the single status view until they gain controls.
    See [Menu UX](menu_ux.md).

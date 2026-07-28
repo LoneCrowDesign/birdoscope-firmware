@@ -30,7 +30,7 @@ extern "C" {
 
 #define NAV_SCHEME_3BTN  1
 #define HAS_GPS          1
-#define CHANNEL_DWELL_MS 350
+#define CHANNEL_DWELL_MS 250
 
 // ============================================================
 // CORE STATE MIRROR: these enums mirror core.h, which cannot be included on the
@@ -44,6 +44,7 @@ typedef enum {
   SCREEN_DETECTIONS,
   SCREEN_SCAN_DETAIL,
   SCREEN_SCAN_MODES,
+  SCREEN_TARGETS,
   SCREEN_ALERTS,
   SCREEN_CONFIG,
   SCREEN_COUNT,
@@ -65,7 +66,7 @@ static bool      coreLedEnabled    = true;
 
 #define DEMO_DET_COUNT 5
 #define DEMO_CHANNEL   6
-#define DEMO_OUI       "e4:aa:ea"        // drawn from core.cpp's target_ouis[]
+#define DEMO_OUI       "e4:aa:ea"        // drawn from core.cpp's oui_table[]
 #define DEMO_MAC       DEMO_OUI ":7b:04:19"
 #define DEMO_RSSI      (-58)
 
@@ -81,6 +82,9 @@ static int8_t  dispRssi    = DEMO_RSSI;
 static uint8_t dispCh      = DEMO_CHANNEL;
 
 static int      fyDetCount     = DEMO_DET_COUNT;
+// Zero so the OVERVIEW and DETECTIONS frames show the normal case. The full-table
+// indicators only draw when this is nonzero.
+static uint16_t fyDroppedNew   = 0;
 static uint8_t  currentChannel = DEMO_CHANNEL;
 static bool     gpsHasFix      = true;
 static double   gpsLat         = DEMO_LAT;
@@ -94,6 +98,9 @@ static void coreGpsStats(unsigned long& good, unsigned long& bad,
 // it verbatim, so a prettified stub would show a string the device never does.
 static const char* channelModeName() { return "CUSTOM"; }
 static int         coreScanModeIndex() { return 0; }
+// 2 = All, the boot default (VENDOR_MASK_ALL), so the TARGETS frame shows what a
+// freshly flashed board does.
+static int         coreTargetIndex()   { return 2; }
 
 // ============================================================
 // U8G2 SHIM: the firmware draws through U8g2lib's C++ object, which is
@@ -144,6 +151,11 @@ static const Frame FRAMES[] = {
   { "09_alerts_open",       SCREEN_ALERTS,      MENU_LIST,         0 },
   { "10_web_config",        SCREEN_CONFIG,      MENU_NONE,         0 },
   { "11_web_config_open",   SCREEN_CONFIG,      MENU_LIST,         0 },
+  // Appended rather than inserted at carousel position 6: renumbering would
+  // rename the committed PNGs and break every image link in docs/menu_ux.md.
+  // The prose list in that doc renumbers on its own.
+  { "13_targets",           SCREEN_TARGETS,     MENU_NONE,         0 },
+  { "14_targets_open",      SCREEN_TARGETS,     MENU_LIST,         1 },
 };
 static const int FRAME_COUNT = sizeof(FRAMES) / sizeof(FRAMES[0]);
 
