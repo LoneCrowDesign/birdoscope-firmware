@@ -88,17 +88,45 @@ void dualPrintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void dualPrintln(const char* str);
 
 // ============================================================
+// TARGET VENDORS: the OUI table is one flat list tagged by vendor, so a match
+// reports which vendor hit rather than a bare yes/no. `coreVendorMask` selects
+// which vendors the matcher accepts, one bit per Vendor, and is what the
+// Targets menu switches. A single aligned byte store is atomic on Xtensa, so it
+// can change live without stopping the sniffer.
+// ============================================================
+
+typedef enum : uint8_t {
+  VENDOR_FLOCK = 0,
+  VENDOR_AXON  = 1,
+  VENDOR_COUNT
+} Vendor;
+
+#define VENDOR_MASK_ALL ((uint8_t)((1u << VENDOR_COUNT) - 1))
+
+extern volatile uint8_t coreVendorMask;
+
+// "flock" / "axon" / "unknown". Stable strings, safe to log.
+const char* vendorName(uint8_t vendor);
+
+// ============================================================
 // MAC / OUI HELPERS
 // ============================================================
 
 void macToStr(const uint8_t* mac, char* buf, size_t len);
 void ouiFromMac(const uint8_t* mac, char* buf, size_t len);
+
+// Validates the target table and prints a boot-time summary of what this
+// firmware is hunting. Call once from setup().
 void precompileOuis();
-bool matchOuiRaw(const uint8_t* mac);
+
+// Returns the matching Vendor, or -1 for no match. Honours coreVendorMask and
+// the per-entry prefix length, so MA-M (28-bit) registrations match on the high
+// nibble of byte 4. Callers needing a yes/no can test >= 0.
+int  matchOuiRaw(const uint8_t* mac);
 bool isMulticast(const uint8_t* mac);
 
-// Returns the first entry in the target OUI table (3 bytes). Used to build a
-// synthetic but realistic target MAC for the `inject` command.
+// Returns the first *currently active* entry in the target OUI table (3 bytes).
+// Used to build a synthetic but realistic target MAC for the `inject` command.
 void coreGetFirstTargetOui(uint8_t out[3]);
 
 // ============================================================

@@ -84,7 +84,7 @@ static unsigned long dispLastRefresh = 0;
 #if DEMO_MODE
 #define DEMO_DET_COUNT 5
 #define DEMO_CHANNEL   6
-#define DEMO_OUI       "e4:aa:ea"       // drawn from core.cpp's target_ouis[]
+#define DEMO_OUI       "e4:aa:ea"       // drawn from core.cpp's oui_table[]
 #define DEMO_MAC       DEMO_OUI ":7b:04:19"
 #define DEMO_RSSI      (-58)
 
