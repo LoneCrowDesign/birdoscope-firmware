@@ -110,6 +110,11 @@ extern volatile uint8_t coreVendorMask;
 // administered, which controls the randomised-MAC fast path in matchOuiRaw().
 void coreSetVendorMask(uint8_t mask);
 
+// Active target set as the Targets menu's list index: 0=Flock, 1=Axon, 2=All.
+// Returns -1 for any other mask, so the menu shows no active marker rather than
+// mislabelling a combination it has no row for.
+int coreTargetIndex();
+
 // "flock" / "axon" / "unknown". Stable strings, safe to log.
 const char* vendorName(uint8_t vendor);
 
@@ -394,6 +399,7 @@ typedef enum {
   SCREEN_DETECTIONS,    // detail: num detections / last detection MAC
   SCREEN_SCAN_DETAIL,   // detail: current channel, dwell, mode
   SCREEN_SCAN_MODES,    // menu: Custom Scan / Full Channel Scan
+  SCREEN_TARGETS,       // menu: which vendors to match (Flock / Axon / All)
   SCREEN_ALERTS,        // menu: Buzzer mute/unmute + LED on/off (toggle in place)
   SCREEN_CONFIG,        // menu: web console On / Off (Admin entry)
   SCREEN_COUNT,

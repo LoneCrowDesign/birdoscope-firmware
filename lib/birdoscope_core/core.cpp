@@ -149,6 +149,21 @@ void coreSetVendorMask(uint8_t mask) {
   recomputeLaaTargets();
 }
 
+// Menu row order for SCREEN_TARGETS. Kept adjacent to coreTargetIndex() so the
+// two cannot drift; screens.inc renders labels in the same order.
+static const uint8_t TARGET_MASKS[3] = {
+  (uint8_t)(1u << VENDOR_FLOCK),
+  (uint8_t)(1u << VENDOR_AXON),
+  VENDOR_MASK_ALL,
+};
+
+int coreTargetIndex() {
+  for (int i = 0; i < 3; i++) {
+    if (coreVendorMask == TARGET_MASKS[i]) return i;
+  }
+  return -1;   // a mask with no row, e.g. everything cleared
+}
+
 // ============================================================
 // OUTPUT
 // ============================================================
@@ -1987,6 +2002,12 @@ NavAction coreNavApply(NavEvent ev) {
           coreMenuSel   = coreScanModeIndex();      // start on the active mode
           return NAV_ACT_REDRAW;
         }
+        if (coreCurrentScreen == SCREEN_TARGETS) {
+          coreMenuState = MENU_LIST;
+          const int t   = coreTargetIndex();
+          coreMenuSel   = (t >= 0) ? t : 0;           // start on the active set
+          return NAV_ACT_REDRAW;
+        }
         if (coreCurrentScreen == SCREEN_ALERTS) {
           coreMenuState = MENU_LIST;
           coreMenuSel   = 0;                          // start on the Buzzer row
@@ -2003,7 +2024,8 @@ NavAction coreNavApply(NavEvent ev) {
     }
 
   case MENU_LIST: {
-    const int n = (coreCurrentScreen == SCREEN_SCAN_MODES) ? 3 : 2;
+    const int n = (coreCurrentScreen == SCREEN_SCAN_MODES ||
+                   coreCurrentScreen == SCREEN_TARGETS) ? 3 : 2;
     switch (ev) {
       case NAV_UP:   coreMenuSel = (coreMenuSel + n - 1) % n; return NAV_ACT_REDRAW;
       case NAV_DOWN: coreMenuSel = (coreMenuSel + 1) % n;     return NAV_ACT_REDRAW;
@@ -2015,6 +2037,17 @@ NavAction coreNavApply(NavEvent ev) {
           // close Scan Mode / Config menus).
           if (coreMenuSel == 0) coreBuzzerEnabled = !coreBuzzerEnabled;   // Buzzer
           else                  coreLedEnabled    = !coreLedEnabled;      // LED
+          return NAV_ACT_REDRAW;
+        }
+        if (coreCurrentScreen == SCREEN_TARGETS) {
+          // Act-and-close, like Scan Mode. Switching the mask is a single byte
+          // store, so the sniffer keeps running across the change.
+          if (coreMenuSel >= 0 && coreMenuSel < 3) {
+            coreSetVendorMask(TARGET_MASKS[coreMenuSel]);
+            dualPrintf("[bscope] targets -> %s\n",
+                       coreMenuSel == 0 ? "flock" : coreMenuSel == 1 ? "axon" : "all");
+          }
+          coreMenuState = MENU_NONE;
           return NAV_ACT_REDRAW;
         }
         if (coreCurrentScreen == SCREEN_SCAN_MODES) {
