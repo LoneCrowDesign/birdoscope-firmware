@@ -55,10 +55,14 @@ static void drawOverview() {
   // the line within 128px even at max det/channel. `ch` is left-justified to
   // width 2 (channels are 1–13) so a single→double digit hop pads with a space
   // instead of shoving `gps:` right as the channel scans.
-  snprintf(line, sizeof(line), "det:%-3d ch:%-2u gps:%c",
-           fyDetCount, currentChannel, gpsHasFix ? 'Y' : 'N');
+  // '!' after the count marks a full detection table (see DETECTIONS screen for
+  // how many were missed). One char, so the line still fits 128px.
+  snprintf(line, sizeof(line), "det:%-3d%c ch:%-2u gps:%c",
+           fyDetCount, fyDroppedNew ? '!' : ' ', currentChannel,
+           gpsHasFix ? 'Y' : 'N');
 #else
-  snprintf(line, sizeof(line), "det:%-3d ch:%u", fyDetCount, currentChannel);
+  snprintf(line, sizeof(line), "det:%-3d%c ch:%u",
+           fyDetCount, fyDroppedNew ? '!' : ' ', currentChannel);
 #endif
   u8g2.drawStr(0, ROW1, line);
   if (fyDetCount > 0) {
@@ -105,6 +109,13 @@ static void drawDetections() {
   } else {
     u8g2.drawStr(0, ROW2, "no detections yet");
   }
+  // Only drawn once the table has actually overflowed, so the row costs nothing
+  // in the normal case. Without it, count: pins at MAX_DETECTIONS and reads as
+  // a quiet area rather than a full table.
+  if (fyDroppedNew) {
+    snprintf(line, sizeof(line), "FULL! missed:%u", (unsigned)fyDroppedNew);
+    u8g2.drawStr(0, ROW4, line);
+  }
 }
 
 static void drawScanDetail() {
@@ -134,6 +145,23 @@ static void drawScanModes() {
   }
   static const char* const opts[3] = { "Custom Scan", "Full Channel", "Single" };
   int active = coreScanModeIndex();
+  for (int i = 0; i < 3; i++) {
+    char line[22];
+    char cursor = (coreMenuState == MENU_LIST && coreMenuSel == i) ? '>' : ' ';
+    char act    = (i == active) ? '*' : ' ';
+    snprintf(line, sizeof(line), "%c%c%s", cursor, act, opts[i]);
+    u8g2.drawStr(0, ROW1 + i * 12, line);
+  }
+  if (coreMenuState == MENU_NONE) u8g2.drawStr(0, ROW4, "Select to change");
+}
+
+// Targets menu. Which vendors the OUI matcher accepts, orthogonal to Scan Mode:
+// this picks WHAT to look for, Scan Mode picks WHERE to listen. Act-and-close,
+// same idiom as Scan Mode. Row order must match TARGET_MASKS in core.cpp.
+static void drawTargets() {
+  drawScreenHeader("TARGETS");
+  static const char* const opts[3] = { "Flock", "Axon", "All" };
+  int active = coreTargetIndex();          // -1 if the mask matches no row
   for (int i = 0; i < 3; i++) {
     char line[22];
     char cursor = (coreMenuState == MENU_LIST && coreMenuSel == i) ? '>' : ' ';
@@ -183,6 +211,7 @@ static void displayScreen() {
     case SCREEN_DETECTIONS:  drawDetections();  break;
     case SCREEN_SCAN_DETAIL: drawScanDetail();  break;
     case SCREEN_SCAN_MODES:  drawScanModes();   break;
+    case SCREEN_TARGETS:     drawTargets();     break;
     case SCREEN_ALERTS:      drawAlerts();      break;
     case SCREEN_CONFIG:      drawConfig();      break;
     default: break;

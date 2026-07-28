@@ -1,6 +1,10 @@
-![BirdoscopeLogo](assets/images/gh_logo_3bird_bw_600x200.png)
+<p align="center">
+  <img src="assets/images/gh_logo_3bird_bw_600x200.png" alt="BirdoscopeLogo">
+</p>
 
-![Birdoscope Device](assets/images/gh_bscope_90deg.jpg)
+<p align="center">
+  <img src="assets/images/gh_bscope_90deg.jpg" alt="Birdoscope Device">
+</p>
 
 # Birdoscope Firmware
 

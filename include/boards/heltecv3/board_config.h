@@ -93,7 +93,9 @@
 #define CHANNEL_MODE_SINGLE     2
 
 #define CHANNEL_MODE CHANNEL_MODE_CUSTOM
-#define CHANNEL_DWELL_MS 350
+// 250ms gives two full 125ms frame-burst windows per visit while keeping the
+// rotation short: 3 channels in 0.75s on Custom, 11 in 2.75s on Full Hop.
+#define CHANNEL_DWELL_MS 250
 #define SINGLE_CHANNEL 1
 
 static const uint8_t customChannels[]  = {1, 6, 11};

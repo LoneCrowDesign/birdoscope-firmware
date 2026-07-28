@@ -88,17 +88,55 @@ void dualPrintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void dualPrintln(const char* str);
 
 // ============================================================
+// TARGET VENDORS: the OUI table is one flat list tagged by vendor, so a match
+// reports which vendor hit rather than a bare yes/no. `coreVendorMask` selects
+// which vendors the matcher accepts, one bit per Vendor, and is what the
+// Targets menu switches. A single aligned byte store is atomic on Xtensa, so it
+// can change live without stopping the sniffer.
+// ============================================================
+
+typedef enum : uint8_t {
+  VENDOR_FLOCK = 0,
+  VENDOR_AXON  = 1,
+  VENDOR_COUNT
+} Vendor;
+
+#define VENDOR_MASK_ALL ((uint8_t)((1u << VENDOR_COUNT) - 1))
+
+extern volatile uint8_t coreVendorMask;
+
+// Set the active vendor mask. Use this rather than assigning coreVendorMask
+// directly: it also recomputes whether any active target is locally
+// administered, which controls the randomised-MAC fast path in matchOuiRaw().
+void coreSetVendorMask(uint8_t mask);
+
+// Active target set as the Targets menu's list index: 0=Flock, 1=Axon, 2=All.
+// Returns -1 for any other mask, so the menu shows no active marker rather than
+// mislabelling a combination it has no row for.
+int coreTargetIndex();
+
+// "flock" / "axon" / "unknown". Stable strings, safe to log.
+const char* vendorName(uint8_t vendor);
+
+// ============================================================
 // MAC / OUI HELPERS
 // ============================================================
 
 void macToStr(const uint8_t* mac, char* buf, size_t len);
 void ouiFromMac(const uint8_t* mac, char* buf, size_t len);
+
+// Validates the target table and prints a boot-time summary of what this
+// firmware is hunting. Call once from setup().
 void precompileOuis();
-bool matchOuiRaw(const uint8_t* mac);
+
+// Returns the matching Vendor, or -1 for no match. Honours coreVendorMask and
+// the per-entry prefix length, so MA-M (28-bit) registrations match on the high
+// nibble of byte 4. Callers needing a yes/no can test >= 0.
+int  matchOuiRaw(const uint8_t* mac);
 bool isMulticast(const uint8_t* mac);
 
-// Returns the first entry in the target OUI table (3 bytes). Used to build a
-// synthetic but realistic target MAC for the `inject` command.
+// Returns the first *currently active* entry in the target OUI table (3 bytes).
+// Used to build a synthetic but realistic target MAC for the `inject` command.
 void coreGetFirstTargetOui(uint8_t out[3]);
 
 // ============================================================
@@ -144,6 +182,13 @@ void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t* mac,
 CoreAlertResult coreHandleAlert(const AlertEntry& e);
 extern int  fyDetCount;
 extern unsigned long fyLastTargetSeen;
+
+// Distinct new MACs that could not be recorded because the detection table hit
+// MAX_DETECTIONS. The table does not evict, so once full fyDetCount stops
+// moving and would otherwise read as "nothing new out here". Repeat hits on
+// already-known MACs still update, so this counts devices missed, not frames.
+// On a USE_SD board the SD event log is unaffected and no capture data is lost.
+extern uint16_t fyDroppedNew;
 
 // ============================================================
 // SPIFFS SESSION PERSISTENCE
@@ -361,6 +406,7 @@ typedef enum {
   SCREEN_DETECTIONS,    // detail: num detections / last detection MAC
   SCREEN_SCAN_DETAIL,   // detail: current channel, dwell, mode
   SCREEN_SCAN_MODES,    // menu: Custom Scan / Full Channel Scan
+  SCREEN_TARGETS,       // menu: which vendors to match (Flock / Axon / All)
   SCREEN_ALERTS,        // menu: Buzzer mute/unmute + LED on/off (toggle in place)
   SCREEN_CONFIG,        // menu: web console On / Off (Admin entry)
   SCREEN_COUNT,

@@ -55,22 +55,114 @@
 #endif
 
 // ============================================================
-// TARGET OUI LIST  (all lowercase, colons only). Shared target data, not
-// board config. Contributed by @NitekryDPaul + Michael/DeFlockJoplin field
+// TARGET OUI TABLE. Shared target data, not board config. One flat table
+// tagged by vendor rather than a table per vendor: a single scan in the
+// promiscuous hot path, and the match reports *which* vendor hit, which the
+// logging side needs to distinguish Flock from Axon.
+//
+// Flock entries contributed by @NitekryDPaul + Michael/DeFlockJoplin field
 // research: https://github.com/DeflockJoplin/flock-you
+// Axon entries from IEEE registrations, see working/axon_scan/.
+//
+// DRAM_ATTR is load-bearing, not decoration. matchOuiRaw() is IRAM_ATTR and
+// runs from the WiFi promiscuous callback, which must not depend on flash being
+// readable: SPIFFS autosave writes make the flash mapping briefly unavailable,
+// and a fetch from memory-mapped .rodata during that window faults. The
+// previous oui_bytes[][] avoided this by being uninitialised .bss, written at
+// boot by precompileOuis().
+//
+// Dropping const is NOT sufficient on its own. GCC promotes a static array it
+// can prove is never written into .rodata regardless, which puts it back in
+// flash; verified by checking the symbol's section in the .elf. DRAM_ATTR
+// forces .dram0.data. Do not remove it, and do not add const.
 // ============================================================
 
-static const char* target_ouis[] = {
-  "70:c9:4e", "3c:91:80", "d8:f3:bc", "80:30:49", "b8:35:32",
-  "14:5a:fc", "74:4c:a1", "08:3a:88", "9c:2f:9d", "c0:35:32",
-  "94:08:53", "e4:aa:ea", "f4:6a:dd", "f8:a2:d6", "24:b2:b9",
-  "00:f4:8d", "d0:39:57", "e8:d0:fc", "e0:4f:43", "b8:1e:a4",
-  "70:08:94", "58:8e:81", "ec:1b:bd", "3c:71:bf", "58:00:e3",
-  "90:35:ea", "5c:93:a2", "64:6e:69", "48:27:ea", "a4:cf:12",
-  "82:6b:f2"
+// nibbles: how many hex digits of the prefix are significant.
+//   6 = MA-L, a 24-bit OUI, b[3] unused
+//   7 = MA-M, a 28-bit prefix, high nibble of b[3] significant
+typedef struct {
+  uint8_t b[4];
+  uint8_t nibbles;
+  uint8_t vendor;
+} OuiEntry;
+
+static DRAM_ATTR OuiEntry oui_table[] = {
+  // --- Flock Safety ---
+  {{0x70,0xC9,0x4E,0}, 6, VENDOR_FLOCK}, {{0x3C,0x91,0x80,0}, 6, VENDOR_FLOCK},
+  {{0xD8,0xF3,0xBC,0}, 6, VENDOR_FLOCK}, {{0x80,0x30,0x49,0}, 6, VENDOR_FLOCK},
+  {{0xB8,0x35,0x32,0}, 6, VENDOR_FLOCK}, {{0x14,0x5A,0xFC,0}, 6, VENDOR_FLOCK},
+  {{0x74,0x4C,0xA1,0}, 6, VENDOR_FLOCK}, {{0x08,0x3A,0x88,0}, 6, VENDOR_FLOCK},
+  {{0x9C,0x2F,0x9D,0}, 6, VENDOR_FLOCK}, {{0xC0,0x35,0x32,0}, 6, VENDOR_FLOCK},
+  {{0x94,0x08,0x53,0}, 6, VENDOR_FLOCK}, {{0xE4,0xAA,0xEA,0}, 6, VENDOR_FLOCK},
+  {{0xF4,0x6A,0xDD,0}, 6, VENDOR_FLOCK}, {{0xF8,0xA2,0xD6,0}, 6, VENDOR_FLOCK},
+  {{0x24,0xB2,0xB9,0}, 6, VENDOR_FLOCK}, {{0x00,0xF4,0x8D,0}, 6, VENDOR_FLOCK},
+  {{0xD0,0x39,0x57,0}, 6, VENDOR_FLOCK}, {{0xE8,0xD0,0xFC,0}, 6, VENDOR_FLOCK},
+  {{0xE0,0x4F,0x43,0}, 6, VENDOR_FLOCK}, {{0xB8,0x1E,0xA4,0}, 6, VENDOR_FLOCK},
+  {{0x70,0x08,0x94,0}, 6, VENDOR_FLOCK}, {{0x58,0x8E,0x81,0}, 6, VENDOR_FLOCK},
+  {{0xEC,0x1B,0xBD,0}, 6, VENDOR_FLOCK}, {{0x3C,0x71,0xBF,0}, 6, VENDOR_FLOCK},
+  {{0x58,0x00,0xE3,0}, 6, VENDOR_FLOCK}, {{0x90,0x35,0xEA,0}, 6, VENDOR_FLOCK},
+  {{0x5C,0x93,0xA2,0}, 6, VENDOR_FLOCK}, {{0x64,0x6E,0x69,0}, 6, VENDOR_FLOCK},
+  {{0x48,0x27,0xEA,0}, 6, VENDOR_FLOCK}, {{0xA4,0xCF,0x12,0}, 6, VENDOR_FLOCK},
+  // Locally-administered (0x82 has bit 0x02 set) and unregistered with IEEE,
+  // which is what a derived virtual-interface MAC looks like. Field-tested by
+  // Michael/DeFlockJoplin as catching cameras the original 30 missed, so it is
+  // a live target, not stale data. matchOuiRaw()'s LAA fast-path exists for it:
+  // see g_haveLaaTargets.
+  {{0x82,0x6B,0xF2,0}, 6, VENDOR_FLOCK},
+
+  // --- Axon Enterprise and acquired brands ---
+  {{0x00,0x25,0xDF,0}, 6, VENDOR_AXON},   // Axon Enterprise (was TASER Intl)
+  {{0xFC,0x01,0x9E,0}, 6, VENDOR_AXON},   // VieVu, acquired 2018
+  {{0x7C,0x83,0x34,0x40}, 7, VENDOR_AXON},// Fusus MA-M /28, acquired 2024
+  {{0x84,0xB3,0x86,0x50}, 7, VENDOR_AXON},// Fusus MA-M /28
 };
-static const size_t OUI_COUNT = sizeof(target_ouis) / sizeof(target_ouis[0]);
-static uint8_t oui_bytes[OUI_COUNT][3];
+static const size_t OUI_COUNT = sizeof(oui_table) / sizeof(oui_table[0]);
+
+// Which vendors the matcher currently accepts, one bit per Vendor. A single
+// aligned byte store is atomic on Xtensa, so the Targets menu can switch this
+// live without stopping the sniffer or double-buffering the table.
+volatile uint8_t coreVendorMask = VENDOR_MASK_ALL;
+
+// True when any active target prefix is itself locally-administered. Gates the
+// LAA fast-path in matchOuiRaw(): skipping randomised MACs wholesale is a big
+// win, but it silently blocks an LAA target such as 82:6b:f2. Recomputed by
+// precompileOuis() and by coreSetVendorMask(), since masking out a vendor can
+// remove the last LAA target and re-enable the fast path.
+//
+// Defaults true, which is the fail-safe direction: before precompileOuis()
+// runs we scan more than necessary, never less. Both mains call it before
+// coreWifiSnifferStart(), so in practice it is correct by the time any frame
+// arrives.
+static DRAM_ATTR bool g_haveLaaTargets = true;
+
+static void recomputeLaaTargets() {
+  bool any = false;
+  for (size_t i = 0; i < OUI_COUNT; i++) {
+    if ((oui_table[i].b[0] & 0x02) &&
+        (coreVendorMask & (1u << oui_table[i].vendor))) { any = true; break; }
+  }
+  g_haveLaaTargets = any;
+}
+
+void coreSetVendorMask(uint8_t mask) {
+  coreVendorMask = (uint8_t)(mask & VENDOR_MASK_ALL);
+  recomputeLaaTargets();
+}
+
+// Menu row order for SCREEN_TARGETS. Kept adjacent to coreTargetIndex() so the
+// two cannot drift; screens.inc renders labels in the same order.
+static const uint8_t TARGET_MASKS[3] = {
+  (uint8_t)(1u << VENDOR_FLOCK),
+  (uint8_t)(1u << VENDOR_AXON),
+  VENDOR_MASK_ALL,
+};
+
+int coreTargetIndex() {
+  for (int i = 0; i < 3; i++) {
+    if (coreVendorMask == TARGET_MASKS[i]) return i;
+  }
+  return -1;   // a mask with no row, e.g. everything cleared
+}
 
 // ============================================================
 // OUTPUT
@@ -111,35 +203,73 @@ void ouiFromMac(const uint8_t* mac, char* buf, size_t len) {
   snprintf(buf, len, "%02x:%02x:%02x", mac[0], mac[1], mac[2]);
 }
 
-void precompileOuis() {
-  for (size_t i = 0; i < OUI_COUNT; i++) {
-    const char* o  = target_ouis[i];
-    oui_bytes[i][0] = (uint8_t)strtol(o,     nullptr, 16);
-    oui_bytes[i][1] = (uint8_t)strtol(o + 3, nullptr, 16);
-    oui_bytes[i][2] = (uint8_t)strtol(o + 6, nullptr, 16);
+const char* vendorName(uint8_t vendor) {
+  switch (vendor) {
+    case VENDOR_FLOCK: return "flock";
+    case VENDOR_AXON:  return "axon";
+    default:           return "unknown";
   }
 }
 
+// The table is a byte literal now, so there is nothing left to parse. Retained
+// because both board mains call it in setup() and because a boot-time summary
+// of what the firmware is actually hunting is worth the two lines when you are
+// about to drive around testing a new target set.
+void precompileOuis() {
+  uint16_t per[VENDOR_COUNT] = {0};
+  uint16_t laa = 0;
+  for (size_t i = 0; i < OUI_COUNT; i++) {
+    if (oui_table[i].vendor < VENDOR_COUNT) per[oui_table[i].vendor]++;
+    if (oui_table[i].b[0] & 0x02) laa++;
+  }
+  recomputeLaaTargets();
+  dualPrintf("[bscope] targets: %u flock, %u axon (%u total, %u locally-administered)\n",
+             (unsigned)per[VENDOR_FLOCK], (unsigned)per[VENDOR_AXON],
+             (unsigned)OUI_COUNT, (unsigned)laa);
+}
+
 void coreGetFirstTargetOui(uint8_t out[3]) {
-  out[0] = oui_bytes[0][0];
-  out[1] = oui_bytes[0][1];
-  out[2] = oui_bytes[0][2];
+  // Must honour the active mask: the `inject` command builds a synthetic target
+  // MAC from this, and returning a Flock OUI while the Targets menu is set to
+  // Axon would make the injected test frame miss.
+  for (size_t i = 0; i < OUI_COUNT; i++) {
+    if (coreVendorMask & (1u << oui_table[i].vendor)) {
+      out[0] = oui_table[i].b[0];
+      out[1] = oui_table[i].b[1];
+      out[2] = oui_table[i].b[2];
+      return;
+    }
+  }
+  out[0] = oui_table[0].b[0];   // mask cleared entirely: fall back to entry 0
+  out[1] = oui_table[0].b[1];
+  out[2] = oui_table[0].b[2];
 }
 
 bool IRAM_ATTR isMulticast(const uint8_t* mac) {
   return mac[0] & 0x01;
 }
 
-bool IRAM_ATTR matchOuiRaw(const uint8_t* mac) {
-  // Locally-administered (randomised) MACs have bit 1 of byte 0 set.
-  // Fixed infrastructure devices never use them, so skip immediately.
-  if (mac[0] & 0x02) return false;
+// Returns the matching Vendor, or -1 for no match. Callers that only need a
+// yes/no can test >= 0.
+int IRAM_ATTR matchOuiRaw(const uint8_t* mac) {
+  // Locally-administered (randomised) MACs have bit 1 of byte 0 set, and fixed
+  // infrastructure normally never uses them, so skipping them wholesale avoids
+  // scanning the table for most phone probe traffic. Only valid while no active
+  // target is itself LAA: 82:6b:f2 is, and this early return silently blocked
+  // it before g_haveLaaTargets existed. Byte 0 carries the LAA bit, so the
+  // prefix compare below already keeps LAA inputs matching only LAA entries.
+  if ((mac[0] & 0x02) && !g_haveLaaTargets) return -1;
+  const uint8_t mask = coreVendorMask;
   for (size_t i = 0; i < OUI_COUNT; i++) {
-    if (mac[0] == oui_bytes[i][0] &&
-        mac[1] == oui_bytes[i][1] &&
-        mac[2] == oui_bytes[i][2]) return true;
+    const OuiEntry& e = oui_table[i];
+    // Prefix compare first: it rejects almost every frame on byte 0, so the
+    // mask test only runs on an actual prefix hit.
+    if (mac[0] != e.b[0] || mac[1] != e.b[1] || mac[2] != e.b[2]) continue;
+    if (!(mask & (1u << e.vendor)))                               continue;
+    if (e.nibbles == 7 && ((mac[3] ^ e.b[3]) & 0xF0))             continue;
+    return (int)e.vendor;
   }
-  return false;
+  return -1;
 }
 
 #if ENABLE_SSID_MATCH
@@ -307,6 +437,7 @@ typedef struct {
 
 static FYDetection fyDet[MAX_DETECTIONS];
 int           fyDetCount       = 0;
+uint16_t      fyDroppedNew     = 0;
 bool          fySpiffsReady    = false;
 #if USE_SD
 bool          fySDReady        = false;
@@ -374,6 +505,16 @@ static int fyAddDetection(const char* mac, const char* method,
     }
   }
   if (fyDetCount >= MAX_DETECTIONS) {
+    // Table full: no eviction, no wraparound. Count what we could not record so
+    // the display can say so, because otherwise fyDetCount simply stops moving
+    // and reads as "nothing new out here" rather than "out of room". Repeat
+    // hits on MACs already in the table still update above, so this counts
+    // distinct devices missed, not frames.
+    //
+    // On a USE_SD board no capture data is lost: sdAppendRow() is called
+    // unconditionally by coreHandleAlert(), independent of this return value.
+    // On a board without SD, these devices are genuinely gone.
+    if (fyDroppedNew < 0xFFFF) fyDroppedNew++;
     if (outChirpWorthy) *outChirpWorthy = false;
     return -1;
   }
@@ -608,8 +749,16 @@ static unsigned long lastHeartbeat = 0;
 
 void printHeartbeat() {
   if (millis() - lastHeartbeat >= HEARTBEAT_MS) {
-    dualPrintf("[bscope] scanning (ch=%u mode=%s det=%d)\n",
-                  currentChannel, channelModeName(), fyDetCount);
+    if (fyDroppedNew) {
+      // Table is full and has been dropping devices. Say so every heartbeat,
+      // since det= is pinned at MAX_DETECTIONS and looks like a quiet area.
+      dualPrintf("[bscope] scanning (ch=%u mode=%s det=%d TABLE FULL, missed=%u)\n",
+                    currentChannel, channelModeName(), fyDetCount,
+                    (unsigned)fyDroppedNew);
+    } else {
+      dualPrintf("[bscope] scanning (ch=%u mode=%s det=%d)\n",
+                    currentChannel, channelModeName(), fyDetCount);
+    }
     lastHeartbeat = millis();
   }
 }
@@ -878,7 +1027,7 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   //
   // Non-probe frames from the same OUI still emit the broad ADDR2 alert.
   // See: https://github.com/DeflockJoplin/flock-you
-  if (matchOuiRaw(hdr->addr2)) {
+  if (matchOuiRaw(hdr->addr2) >= 0) {
     bool emitted = false;
     if (type == WIFI_PKT_MGMT) {
       if (ftype == 0 && subtype == 4) {                        // Probe Request
@@ -920,7 +1069,7 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   // analysis pipeline can look up the AP's position and use it as a camera
   // location proxy. The RSSI here reflects AP→scanner path loss, not
   // camera→scanner, so it can't be used for triangulation directly.
-  if (!isMulticast(hdr->addr1) && matchOuiRaw(hdr->addr1)) {
+  if (!isMulticast(hdr->addr1) && matchOuiRaw(hdr->addr1) >= 0) {
     enqueueAlert(ALERT_OUI_ADDR1, hdr->addr1, hdr->addr2, rssi, ch, nullptr, "addr1", fsub);
   }
 #endif
@@ -928,7 +1077,7 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
 #if CHECK_ADDR3
   // addr3 fallback: catches cases where addr2 is randomised but addr3
   // carries the real BSSID OUI (management frames only).
-  if (type == WIFI_PKT_MGMT && matchOuiRaw(hdr->addr3)) {
+  if (type == WIFI_PKT_MGMT && matchOuiRaw(hdr->addr3) >= 0) {
     enqueueAlert(ALERT_OUI_ADDR3, hdr->addr3, nullptr, rssi, ch, nullptr, "addr3", fsub);
   }
 #endif
@@ -1872,6 +2021,12 @@ NavAction coreNavApply(NavEvent ev) {
           coreMenuSel   = coreScanModeIndex();      // start on the active mode
           return NAV_ACT_REDRAW;
         }
+        if (coreCurrentScreen == SCREEN_TARGETS) {
+          coreMenuState = MENU_LIST;
+          const int t   = coreTargetIndex();
+          coreMenuSel   = (t >= 0) ? t : 0;           // start on the active set
+          return NAV_ACT_REDRAW;
+        }
         if (coreCurrentScreen == SCREEN_ALERTS) {
           coreMenuState = MENU_LIST;
           coreMenuSel   = 0;                          // start on the Buzzer row
@@ -1888,7 +2043,8 @@ NavAction coreNavApply(NavEvent ev) {
     }
 
   case MENU_LIST: {
-    const int n = (coreCurrentScreen == SCREEN_SCAN_MODES) ? 3 : 2;
+    const int n = (coreCurrentScreen == SCREEN_SCAN_MODES ||
+                   coreCurrentScreen == SCREEN_TARGETS) ? 3 : 2;
     switch (ev) {
       case NAV_UP:   coreMenuSel = (coreMenuSel + n - 1) % n; return NAV_ACT_REDRAW;
       case NAV_DOWN: coreMenuSel = (coreMenuSel + 1) % n;     return NAV_ACT_REDRAW;
@@ -1900,6 +2056,17 @@ NavAction coreNavApply(NavEvent ev) {
           // close Scan Mode / Config menus).
           if (coreMenuSel == 0) coreBuzzerEnabled = !coreBuzzerEnabled;   // Buzzer
           else                  coreLedEnabled    = !coreLedEnabled;      // LED
+          return NAV_ACT_REDRAW;
+        }
+        if (coreCurrentScreen == SCREEN_TARGETS) {
+          // Act-and-close, like Scan Mode. Switching the mask is a single byte
+          // store, so the sniffer keeps running across the change.
+          if (coreMenuSel >= 0 && coreMenuSel < 3) {
+            coreSetVendorMask(TARGET_MASKS[coreMenuSel]);
+            dualPrintf("[bscope] targets -> %s\n",
+                       coreMenuSel == 0 ? "flock" : coreMenuSel == 1 ? "axon" : "all");
+          }
+          coreMenuState = MENU_NONE;
           return NAV_ACT_REDRAW;
         }
         if (coreCurrentScreen == SCREEN_SCAN_MODES) {
