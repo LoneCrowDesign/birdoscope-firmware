@@ -62,7 +62,10 @@
 //
 // Flock entries contributed by @NitekryDPaul + Michael/DeFlockJoplin field
 // research: https://github.com/DeflockJoplin/flock-you
-// Axon entries from IEEE registrations, see working/axon_scan/.
+// Axon entries transcribed from the IEEE registry
+// (https://standards-oui.ieee.org), covering the Axon Enterprise, VieVu and
+// Fusus assignments. The two Fusus ones are MA-M /28 blocks, which is the whole
+// reason the nibbles field exists.
 //
 // DRAM_ATTR is load-bearing, not decoration. matchOuiRaw() is IRAM_ATTR and
 // runs from the WiFi promiscuous callback, which must not depend on flash being
