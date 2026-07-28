@@ -364,7 +364,7 @@ void setup() {
     dualPrintln("[bscope] SPIFFS ready");
     fyPromotePrevSession();
   } else {
-    dualPrintln("[bscope] SPIFFS init FAILED – running without persistence");
+    dualPrintln("[bscope] SPIFFS init FAILED - running without persistence");
   }
 
   // One-shot time anchor, before any promiscuous setup. coreTimeSync() probes
@@ -392,7 +392,7 @@ void setup() {
     sdSetup();
     sdTryNameLog();
   } else {
-    dualPrintln("[bscope] SD card not found – skipping");
+    dualPrintln("[bscope] SD card not found - skipping");
   }
 #endif
 

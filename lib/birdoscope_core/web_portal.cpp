@@ -476,7 +476,7 @@ void webPortalStart(const char* apSsid, const char* apPassword) {
   lastClientMs  = portalStartMs;
   everHadClient = false;
   portalActive  = true;
-  dualPrintf("[web_portal] started (WebConsole) – heap=%u largest_block=%u\n",
+  dualPrintf("[web_portal] started (WebConsole) - heap=%u largest_block=%u\n",
              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 }
 
@@ -496,7 +496,7 @@ void webPortalStop() {
 
   portalActive  = false;
   exitRequested = false;
-  dualPrintln("[web_portal] stopped – resumed Detect");
+  dualPrintln("[web_portal] stopped - resumed Detect");
 }
 
 void webPortalTick() {
@@ -526,7 +526,7 @@ void webPortalTick() {
   bool wentIdle       =  everHadClient && console.clientCount() == 0
                                        && (now - lastClientMs > WEB_PORTAL_IDLE_MS);
   if (neverConnected || wentIdle) {
-    dualPrintln("[web_portal] idle timeout – resuming Detect");
+    dualPrintln("[web_portal] idle timeout - resuming Detect");
     webPortalStop();
   }
 }

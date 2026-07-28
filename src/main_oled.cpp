@@ -377,7 +377,7 @@ void setup() {
     dualPrintln("[bscope] SPIFFS ready");
     fyPromotePrevSession();
   } else {
-    dualPrintln("[bscope] SPIFFS init FAILED – running without persistence");
+    dualPrintln("[bscope] SPIFFS init FAILED - running without persistence");
   }
 
   // coreTimeSync() powers on the GPS rail and starts Serial2 at GPS_BAUD on
@@ -401,7 +401,7 @@ void setup() {
     // No card, which is non-fatal: fall back to onboard SPIFFS. Signal it visibly
     // (5 blue LED flashes + on-screen notice) since boot otherwise looks
     // silent. Runs before loop()/coreInputTick(), so the LED pin is still ours.
-    dualPrintln("[bscope] SD card not found – saving to SPIFFS");
+    dualPrintln("[bscope] SD card not found - saving to SPIFFS");
     coreLedBlink(0, 0, 255, 5, 150, 150);
 #if NAV_SCHEME_3BTN
     // A board with a Confirm button blocks here until the operator

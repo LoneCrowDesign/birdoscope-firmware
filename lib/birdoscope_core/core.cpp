@@ -684,19 +684,19 @@ void fySaveSession() {
   f.close();
 
   if (wrote != payloadBytes) {
-    dualPrintf("[bscope] save WARNING: wrote %u expected %u – aborting\n",
+    dualPrintf("[bscope] save WARNING: wrote %u expected %u - aborting\n",
                (unsigned)wrote, (unsigned)payloadBytes);
     return;
   }
 
   if (!fyValidateSessionFile(FY_SESSION_TMP)) {
-    dualPrintln("[bscope] save verify FAILED – old session preserved");
+    dualPrintln("[bscope] save verify FAILED - old session preserved");
     return;
   }
 
   SPIFFS.remove(FY_SESSION_FILE);
   if (!fyAtomicPromote(FY_SESSION_TMP, FY_SESSION_FILE)) {
-    dualPrintf("[bscope] promote FAILED – data in %s for recovery\n", FY_SESSION_TMP);
+    dualPrintf("[bscope] promote FAILED - data in %s for recovery\n", FY_SESSION_TMP);
     return;
   }
 
@@ -1349,7 +1349,7 @@ static bool ntpTimeAnchored = false;
 static void ntpSync() {
   String ssid, pass;
   if (!coreWifiCredsLoad(ssid, pass)) {
-    dualPrintln("[bscope] no saved WiFi network – timestamping from boot");
+    dualPrintln("[bscope] no saved WiFi network - timestamping from boot");
     return;   // never bring WiFi up: leave the radio clean for the sniffer
   }
 
@@ -1368,7 +1368,7 @@ static void ntpSync() {
     if (WiFi.SSID(i) == ssid) inRange = true;
   if (n >= 0) WiFi.scanDelete();
   if (!inRange) {
-    dualPrintln("[bscope] saved network not in range – timestamping from boot");
+    dualPrintln("[bscope] saved network not in range - timestamping from boot");
     WiFi.mode(WIFI_OFF);
     return;
   }
@@ -1382,7 +1382,7 @@ static void ntpSync() {
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    dualPrintln("[bscope] WiFi join timed out – timestamping from boot");
+    dualPrintln("[bscope] WiFi join timed out - timestamping from boot");
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     return;
@@ -1396,7 +1396,7 @@ static void ntpSync() {
     strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
     dualPrintf("[bscope] time synced: %s\n", buf);
   } else {
-    dualPrintln("[bscope] NTP sync failed – timestamping from boot");
+    dualPrintln("[bscope] NTP sync failed - timestamping from boot");
   }
 
   WiFi.disconnect(true);
@@ -1407,7 +1407,7 @@ void coreTimeSync() {
 #if HAS_GPS
   gpsSetup();
   if (gpsProbePresent())
-    dualPrintln("[bscope] GPS module present – it will master timing once it locks");
+    dualPrintln("[bscope] GPS module present - it will master timing once it locks");
   else
     dualPrintln("[bscope] no GPS module detected");
   // A GPS module can't have a lock this early (cold-start takes far longer than
@@ -1533,7 +1533,7 @@ void sdTryNameLog() {
 
   sdLog = SD.open(newPath, FILE_WRITE);
   if (!sdLog) {
-    dualPrintf("[sd] failed to open named log %s – falling back to %s\n", newPath, SD_LOG_FILE);
+    dualPrintf("[sd] failed to open named log %s - falling back to %s\n", newPath, SD_LOG_FILE);
     sdLog = SD.open(SD_LOG_FILE, FILE_APPEND);
     return;
   }
