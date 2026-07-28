@@ -48,9 +48,10 @@ to draw.
 | Admin (SoftAP) mode screen         | yes, core hop logic                               | yes  | yes     |      |
 | Word-based serial commands         | yes, core tokenizer plus per-board verbs          | yes  | yes     | 3    |
 | Semantic nav layer (`NavEvent`)    | yes, core                                         | yes  | n/a     | 4    |
-| Seven-screen carousel, three menus | yes, core state (`ScreenId`, `MenuState`)         | yes  | n/a     | 5    |
+| Eight-screen carousel, four menus  | yes, core state (`ScreenId`, `MenuState`)         | yes  | n/a     | 5    |
 | Runtime alert gates                | yes, core (`coreBuzzerEnabled`, `coreLedEnabled`) | yes  | yes     | 6    |
 | Runtime scan-mode switch           | yes, core (`coreSetScanMode`)                     | yes  | yes     | 7    |
+| Runtime target switch              | yes, core (`coreSetVendorMask`)                   | yes  | n/a     | 8    |
 
 1. The OLED path blinks blue five times and shows "SD Card Not Found / Saving to
    SPIFFS", then blocks until Confirm on a board with buttons so the missing
@@ -63,13 +64,17 @@ to draw.
    physical buttons through it. The serial injector works on every board, and
    boards with two buttons keep `coreInputTick()`.
 5. Covers menu drill-in: Scan Mode with its channel picker, Targets, Alerts, and
-   Web Config. The round TFT board shares the core screen and menu state but renders
-   its own round-screen UX, which is divergent by design rather than pending
-   work. Other OLED boards show the single status view until they gain controls.
-   See [Menu UX](menu_ux.md).
+   Web Config. The round TFT board shares the core screen and menu state but
+   renders its own round-screen UX, which is divergent by design rather than
+   pending work. Other OLED boards show the single status view until they gain
+   controls. See [Menu UX](menu_ux.md).
 6. The gates live in core, so every board's chirp and flash obey them. Only the
    three-button OLED board can toggle them live. Held in RAM, resetting to
    enabled on reboot.
 7. Both board files already show the mode name via `channelModeName()`. Only the
    three-button OLED board can change it live. Held in RAM, resetting to the
    board default on reboot.
+8. The mask is consulted inside `matchOuiRaw()`, so every board's detections obey
+   it, but only the three-button OLED board has a Targets screen and neither
+   board file displays the active target. Held in RAM, resetting to All on
+   reboot.

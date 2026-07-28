@@ -144,7 +144,7 @@ One grammar applies at both levels: move, confirm, back. On the 3-button board:
 
 | Button | Gesture | Top level                                       | Inside a menu             |
 |--------|---------|-------------------------------------------------|---------------------------|
-| BTN_1  | short   | Up, advance to the next screen (1→2→…→7, wraps) | move highlight up         |
+| BTN_1  | short   | Up, advance to the next screen (1→2→…→8, wraps) | move highlight up         |
 | BTN_1  | long    | Mark (area-of-interest)                         | Mark (area-of-interest)   |
 | BTN_2  | short   | Down, back a screen (wraps)                     | move highlight down       |
 | BTN_3  | short   | enter menu (menu screens only)                  | confirm selection         |
