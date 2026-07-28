@@ -105,6 +105,11 @@ typedef enum : uint8_t {
 
 extern volatile uint8_t coreVendorMask;
 
+// Set the active vendor mask. Use this rather than assigning coreVendorMask
+// directly: it also recomputes whether any active target is locally
+// administered, which controls the randomised-MAC fast path in matchOuiRaw().
+void coreSetVendorMask(uint8_t mask);
+
 // "flock" / "axon" / "unknown". Stable strings, safe to log.
 const char* vendorName(uint8_t vendor);
 

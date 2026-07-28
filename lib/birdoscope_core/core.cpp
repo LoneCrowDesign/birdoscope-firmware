@@ -103,10 +103,11 @@ static DRAM_ATTR OuiEntry oui_table[] = {
   {{0x58,0x00,0xE3,0}, 6, VENDOR_FLOCK}, {{0x90,0x35,0xEA,0}, 6, VENDOR_FLOCK},
   {{0x5C,0x93,0xA2,0}, 6, VENDOR_FLOCK}, {{0x64,0x6E,0x69,0}, 6, VENDOR_FLOCK},
   {{0x48,0x27,0xEA,0}, 6, VENDOR_FLOCK}, {{0xA4,0xCF,0x12,0}, 6, VENDOR_FLOCK},
-  // UNREACHABLE: 0x82 has the locally-administered bit (0x02) set, and
-  // matchOuiRaw() rejects LAA addresses before consulting this table, so this
-  // entry can never match. Carried over from the original list rather than
-  // removed, since dropping a documented target OUI is a data decision.
+  // Locally-administered (0x82 has bit 0x02 set) and unregistered with IEEE,
+  // which is what a derived virtual-interface MAC looks like. Field-tested by
+  // Michael/DeFlockJoplin as catching cameras the original 30 missed, so it is
+  // a live target, not stale data. matchOuiRaw()'s LAA fast-path exists for it:
+  // see g_haveLaaTargets.
   {{0x82,0x6B,0xF2,0}, 6, VENDOR_FLOCK},
 
   // --- Axon Enterprise and acquired brands ---
@@ -121,6 +122,32 @@ static const size_t OUI_COUNT = sizeof(oui_table) / sizeof(oui_table[0]);
 // aligned byte store is atomic on Xtensa, so the Targets menu can switch this
 // live without stopping the sniffer or double-buffering the table.
 volatile uint8_t coreVendorMask = VENDOR_MASK_ALL;
+
+// True when any active target prefix is itself locally-administered. Gates the
+// LAA fast-path in matchOuiRaw(): skipping randomised MACs wholesale is a big
+// win, but it silently blocks an LAA target such as 82:6b:f2. Recomputed by
+// precompileOuis() and by coreSetVendorMask(), since masking out a vendor can
+// remove the last LAA target and re-enable the fast path.
+//
+// Defaults true, which is the fail-safe direction: before precompileOuis()
+// runs we scan more than necessary, never less. Both mains call it before
+// coreWifiSnifferStart(), so in practice it is correct by the time any frame
+// arrives.
+static DRAM_ATTR bool g_haveLaaTargets = true;
+
+static void recomputeLaaTargets() {
+  bool any = false;
+  for (size_t i = 0; i < OUI_COUNT; i++) {
+    if ((oui_table[i].b[0] & 0x02) &&
+        (coreVendorMask & (1u << oui_table[i].vendor))) { any = true; break; }
+  }
+  g_haveLaaTargets = any;
+}
+
+void coreSetVendorMask(uint8_t mask) {
+  coreVendorMask = (uint8_t)(mask & VENDOR_MASK_ALL);
+  recomputeLaaTargets();
+}
 
 // ============================================================
 // OUTPUT
@@ -175,12 +202,15 @@ const char* vendorName(uint8_t vendor) {
 // about to drive around testing a new target set.
 void precompileOuis() {
   uint16_t per[VENDOR_COUNT] = {0};
+  uint16_t laa = 0;
   for (size_t i = 0; i < OUI_COUNT; i++) {
     if (oui_table[i].vendor < VENDOR_COUNT) per[oui_table[i].vendor]++;
+    if (oui_table[i].b[0] & 0x02) laa++;
   }
-  dualPrintf("[bscope] targets: %u flock, %u axon (%u total)\n",
+  recomputeLaaTargets();
+  dualPrintf("[bscope] targets: %u flock, %u axon (%u total, %u locally-administered)\n",
              (unsigned)per[VENDOR_FLOCK], (unsigned)per[VENDOR_AXON],
-             (unsigned)OUI_COUNT);
+             (unsigned)OUI_COUNT, (unsigned)laa);
 }
 
 void coreGetFirstTargetOui(uint8_t out[3]) {
@@ -207,9 +237,13 @@ bool IRAM_ATTR isMulticast(const uint8_t* mac) {
 // Returns the matching Vendor, or -1 for no match. Callers that only need a
 // yes/no can test >= 0.
 int IRAM_ATTR matchOuiRaw(const uint8_t* mac) {
-  // Locally-administered (randomised) MACs have bit 1 of byte 0 set.
-  // Fixed infrastructure devices never use them, so skip immediately.
-  if (mac[0] & 0x02) return -1;
+  // Locally-administered (randomised) MACs have bit 1 of byte 0 set, and fixed
+  // infrastructure normally never uses them, so skipping them wholesale avoids
+  // scanning the table for most phone probe traffic. Only valid while no active
+  // target is itself LAA: 82:6b:f2 is, and this early return silently blocked
+  // it before g_haveLaaTargets existed. Byte 0 carries the LAA bit, so the
+  // prefix compare below already keeps LAA inputs matching only LAA entries.
+  if ((mac[0] & 0x02) && !g_haveLaaTargets) return -1;
   const uint8_t mask = coreVendorMask;
   for (size_t i = 0; i < OUI_COUNT; i++) {
     const OuiEntry& e = oui_table[i];
