@@ -57,7 +57,7 @@
 // ============================================================
 // TARGET OUI TABLE. Shared target data, not board config. One flat table
 // tagged by vendor rather than a table per vendor: a single scan in the
-// promiscuous hot path, and the match reports *which* vendor hit, which the
+// promiscuous hot path, and the match reports which vendor hit, which the
 // logging side needs to distinguish Flock from Axon.
 //
 // Flock entries contributed by @NitekryDPaul + Michael/DeFlockJoplin field
@@ -215,9 +215,8 @@ const char* vendorName(uint8_t vendor) {
 }
 
 // The table is a byte literal now, so there is nothing left to parse. Retained
-// because both board mains call it in setup() and because a boot-time summary
-// of what the firmware is actually hunting is worth the two lines when you are
-// about to drive around testing a new target set.
+// for two reasons: both board mains call it in setup(), and the boot line tells
+// you which target set you are about to drive around with.
 void precompileOuis() {
   uint16_t per[VENDOR_COUNT] = {0};
   uint16_t laa = 0;
@@ -265,8 +264,8 @@ int IRAM_ATTR matchOuiRaw(const uint8_t* mac) {
   const uint8_t mask = coreVendorMask;
   for (size_t i = 0; i < OUI_COUNT; i++) {
     const OuiEntry& e = oui_table[i];
-    // Prefix compare first: it rejects almost every frame on byte 0, so the
-    // mask test only runs on an actual prefix hit.
+    // Prefix compare first: byte 0 rejects non-target frames, so the mask test
+    // only runs on a prefix hit.
     if (mac[0] != e.b[0] || mac[1] != e.b[1] || mac[2] != e.b[2]) continue;
     if (!(mask & (1u << e.vendor)))                               continue;
     if (e.nibbles == 7 && ((mac[3] ^ e.b[3]) & 0xF0))             continue;
@@ -509,7 +508,7 @@ static int fyAddDetection(const char* mac, const char* method,
   }
   if (fyDetCount >= MAX_DETECTIONS) {
     // Table full: no eviction, no wraparound. Count what we could not record so
-    // the display can say so, because otherwise fyDetCount simply stops moving
+    // the display can say so, because otherwise fyDetCount stops moving
     // and reads as "nothing new out here" rather than "out of room". Repeat
     // hits on MACs already in the table still update above, so this counts
     // distinct devices missed, not frames.
@@ -2012,7 +2011,7 @@ NavAction coreNavApply(NavEvent ev) {
 
   case MENU_NONE:
     switch (ev) {
-      case NAV_UP:      // advance forward through the screens (1 -> 2 -> ... -> 7)
+      case NAV_UP:      // advance forward through the screens (wraps at SCREEN_COUNT)
         coreCurrentScreen = (ScreenId)((coreCurrentScreen + 1) % SCREEN_COUNT);
         return NAV_ACT_REDRAW;
       case NAV_DOWN:    // go back a screen (wraps)
