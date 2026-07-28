@@ -186,7 +186,7 @@ static void displayTick() {
     markOverlayUntil = 0;
     dispDirty = true;                          // force a clean redraw of the screen
   }
-  // The channel hops every CHANNEL_DWELL_MS (~350ms) but the periodic refresh is
+  // The channel hops every CHANNEL_DWELL_MS (~250ms) but the periodic refresh is
   // 2s, so a channel readout would look stuck between refreshes. On the two
   // screens that show the live channel, repaint when it changes so it
   // tracks the hop. Other screens don't show it, so they stay on the 2s cadence.
