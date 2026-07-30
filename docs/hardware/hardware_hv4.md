@@ -5,8 +5,7 @@ MCU: ESP32-S3R2, 16 MB flash, 2 MB PSRAM (quad)
 Schematic: [`Heltec4_Datasheet_WiFi_LoRa_32_V4.2.0.pdf`](../reference/Heltec4_Datasheet_WiFi_LoRa_32_V4.2.0.pdf)
 PIO Env: `heltec_v4`. The platform publishes no V4 board definition, so this
 uses `heltec_wifi_lora_32_V3` and overrides the flash size to 16 MB in
-`platformio.ini`. This is the reference Heltec env, and `heltec_v3` derives
-from it
+`platformio.ini`. `heltec_v3` uses the same board definition at its native 8 MB.
 Board Config: `include/boards/heltecv4/board_config.h`
 
 Throughout this document, `*` marks a strapping pin.
@@ -192,9 +191,9 @@ range.
 |----------|--------|----------------------------------|
 | Flash    | 16 MB  | Overridden in the env, see below |
 | PSRAM    | 2 MB   | Quad, `-DBOARD_HAS_PSRAM`        |
-| SPIFFS   | 3.9 MB | Per `partitions.csv`, `0x3F0000` |
+| SPIFFS   | 3.9 MB | Per `partitions_16mb.csv`, `0x3F0000` |
 
-Partition table: `partitions.csv`
+Partition table: `partitions_16mb.csv`
 
 ## PlatformIO env
 
@@ -210,7 +209,7 @@ build_flags =
 board_build.flash_size = 16MB
 board_upload.flash_size = 16MB
 board_upload.maximum_size = 16777216
-board_build.partitions = partitions.csv
+board_build.partitions = partitions_16mb.csv
 ```
 
 The platform publishes no V4 board definition, so the env borrows the V3 one and
@@ -218,8 +217,8 @@ overrides what differs: the V3 is an 8 MB part, the V4 a 16 MB part.
 `board_upload.maximum_size` must move with the flash size, or the upload size
 check still caps the image at the V3's 8 MB.
 
-This is the reference Heltec env. `heltec_v3` extends it and overrides only the
-board config directory and the flash size.
+`heltec_v3` is a separate env on the same board definition, differing in board
+config directory, flash size, and partition table.
 
 ## Sources
 

@@ -1,4 +1,6 @@
 # Name,   Type, SubType,  Offset,   Size,     Flags
+# 16MB-flash layout: 12MB app0, 3.9MB spiffs, single OTA slot. Use with any
+# board whose module carries a 16MB chip.
 nvs,      data, nvs,     0x9000,   0x5000,
 otadata,  data, ota,     0xe000,   0x2000,
 app0,     app,  ota_0,   0x10000,  0xC00000,

@@ -35,14 +35,6 @@ Original contributions in this repository (added after the fork) are Copyright
 (c) 2026 Lone Crow Design, LLC and licensed under the MIT License.
 
 ----------------------------------------------------------------------------
-Upstream licensing
-----------------------------------------------------------------------------
-The upstream colonelpanichacks/flock-you repository publishes no explicit
-LICENSE file, but its author has confirmed support for this fork. The MIT
-license here is applied to this project's original contributions; the derived
-upstream portions are used under that permission grant.
-
-----------------------------------------------------------------------------
 Third-party dependencies
 ----------------------------------------------------------------------------
 The optional on-device web data portal links the WebConsole library

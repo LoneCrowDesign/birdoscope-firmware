@@ -9,10 +9,10 @@ pins overridden in `platformio.ini` and `board_config.h`
 Board Config: `include/boards/esp32round/board_config.h`
 
 Note: flash size varies between clones. Run `esptool.py --port <port> flash_id`
-before the first flash. If the size differs from 4 MB, rescale `app0` and
-`spiffs` in `partitions_esp32round.csv` proportionally and update
-`board_build.flash_size` and `board_upload.flash_size` in `platformio.ini`.
-Wrong sizes cause a boot loop rather than a clean failure.
+before the first flash. If the size differs from 4 MB, point
+`board_build.partitions` at the table matching the reported size (or add one)
+and update `board_build.flash_size` and `board_upload.flash_size` in
+`platformio.ini`. Wrong sizes cause a boot loop rather than a clean failure.
 
 Throughout this document, `*` marks a strapping pin.
 
@@ -197,10 +197,10 @@ USB-tethered, or confirm a separate power rail before field deployment.
 |----------|---------------|----------------------------------------------------|
 | Flash    | 4 MB (assumed)| Varies by clone, verify with `esptool.py flash_id` |
 | PSRAM    | none          | The TFT back buffer therefore lives in SRAM        |
-| SPIFFS   | 2.4 MB        | Per `partitions_esp32round.csv`, `0x260000`        |
+| SPIFFS   | 2.4 MB        | Per `partitions_4mb.csv`, `0x260000`        |
 
-Partition table: `partitions_esp32round.csv`, with a 1.5 MB `app0`. It is sized
-for a 4 MB part, so rescale it if `flash_id` reports otherwise.
+Partition table: `partitions_4mb.csv`, with a 1.5 MB `app0`. It is sized
+for a 4 MB part, so switch tables if `flash_id` reports otherwise.
 
 The `app0` margin here is the tightest in the fleet: the binary is 1.26 MB
 against the 1.5 MB slot, leaving roughly 240 KB. The TFT build carries
@@ -224,7 +224,7 @@ build_flags =
     ; TFT_eSPI pin and font config, see platformio.ini
 board_build.flash_size = 4MB
 board_upload.flash_size = 4MB
-board_build.partitions = partitions_esp32round.csv
+board_build.partitions = partitions_4mb.csv
 ```
 
 No `esp32round` board definition exists, so the generic `esp32dev` board id is

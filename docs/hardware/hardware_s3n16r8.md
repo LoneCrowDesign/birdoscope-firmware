@@ -219,9 +219,9 @@ defaulted to SPI.
 |----------|--------|-----------------------------------------|
 | Flash    | 16 MB  | Quad SPI                                |
 | PSRAM    | 8 MB   | Octal, with GPIO35–37 tied to it inside the module |
-| SPIFFS   | 3.9 MB | Per `partitions.csv`, `0x3F0000`        |
+| SPIFFS   | 3.9 MB | Per `partitions_16mb.csv`, `0x3F0000`        |
 
-Partition table: `partitions.csv`, with a 12 MB `app0` and a single OTA slot.
+Partition table: `partitions_16mb.csv`, with a 12 MB `app0` and a single OTA slot.
 
 The OPI PSRAM needs `memory_type = qio_opi`. That comes from the platform's own
 board definition, so the env does not set it.
@@ -236,7 +236,7 @@ build_flags =
     ${common.build_flags}
     -I include/boards/esp32s3_devkitc1
     -DBOARD_HAS_PSRAM
-board_build.partitions = partitions.csv
+board_build.partitions = partitions_16mb.csv
 ```
 
 `platform`, `framework`, and `monitor_speed` are inherited from the `[common]`

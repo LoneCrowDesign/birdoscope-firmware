@@ -1,8 +1,8 @@
 # Name,   Type, SubType,  Offset,   Size,     Flags
-# Sized for a 4MB flash classic ESP32-D0WD. If your board turns out to be a
-# different size (check with `esptool.py flash_id` before first flash),
-# rescale app0/spiffs proportionally and update board_build.flash_size in
-# platformio.ini to match — wrong sizes here cause a boot loop.
+# 4MB-flash layout: 1.5MB app0, 2.4MB spiffs, single OTA slot. Confirm the chip
+# really is 4MB (`esptool.py flash_id`) before first flash and keep
+# board_build.flash_size in platformio.ini in sync — a table that overruns the
+# part causes a boot loop.
 nvs,      data, nvs,     0x9000,   0x5000,
 otadata,  data, ota,     0xe000,   0x2000,
 app0,     app,  ota_0,   0x10000,  0x180000,
