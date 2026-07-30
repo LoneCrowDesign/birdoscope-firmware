@@ -68,7 +68,16 @@ static bool      coreLedEnabled    = true;
 #define DEMO_CHANNEL   6
 #define DEMO_OUI       "e4:aa:ea"        // drawn from core.cpp's oui_table[]
 #define DEMO_MAC       DEMO_OUI ":7b:04:19"
-#define DEMO_RSSI      (-58)
+#define DEMO_RSSI      (-80)
+// 0 = Flock in core.h's Vendor enum, matching DEMO_OUI's tag in oui_table[].
+// Spelled as a literal because the enum is not mirrored here; screens.inc
+// indexes its own name table and never names the enumerators.
+#define DEMO_VENDOR    0
+// Metres. Not derived from DEMO_RSSI: the renderer deliberately carries no
+// board_config.h, so there are no path-loss constants here to derive it from.
+// Kept equal to DEMO_DIST_M in src/main_oled.cpp, and consistent with DEMO_RSSI
+// under the default constants, so the frame does not contradict itself.
+#define DEMO_DIST_M    (25.1f)
 
 // Placeholder fix: Point Nemo, the oceanic pole of inaccessibility and the
 // furthest point on earth from any land. Exact rather than approximate, and a
@@ -77,9 +86,10 @@ static bool      coreLedEnabled    = true;
 #define DEMO_LNG       (-123.39335)
 
 static char    dispMac[18] = DEMO_MAC;
-static char    dispOui[9]  = DEMO_OUI;
 static int8_t  dispRssi    = DEMO_RSSI;
 static uint8_t dispCh      = DEMO_CHANNEL;
+static int8_t  dispVendor  = DEMO_VENDOR;
+static float   dispDistM   = DEMO_DIST_M;
 
 static int      fyDetCount     = DEMO_DET_COUNT;
 // Zero so the OVERVIEW and DETECTIONS frames show the normal case. The full-table

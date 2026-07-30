@@ -43,6 +43,33 @@
 #ifndef WIFI_CREDS_FILE
 #define WIFI_CREDS_FILE "/wifi.json"
 #endif
+// Persisted tuning the web console writes. Shared file rather than one per
+// setting, so adding the next knob costs no extra loader.
+#ifndef SETTINGS_FILE
+#define SETTINGS_FILE "/settings.json"
+#endif
+
+// Distance-model tuning. RSSI_AT_1M seeds the runtime reference `calibrate`
+// tunes. See docs/distance_estimation.md and
+// working/distance_estimate/distance_estimate_spec.md.
+#ifndef RSSI_AT_1M
+#define RSSI_AT_1M  -45
+#endif
+#ifndef PATH_LOSS_N
+#define PATH_LOSS_N 2.5f
+#endif
+// Environment Density presets: the path-loss exponent for each setting. Medium
+// defers to PATH_LOSS_N so a board that already tuned that value still gets it,
+// and so the default model is unchanged from before the presets existed.
+#ifndef PATH_LOSS_N_LOW
+#define PATH_LOSS_N_LOW  2.0f    // open ground, near line of sight
+#endif
+#ifndef PATH_LOSS_N_MED
+#define PATH_LOSS_N_MED  PATH_LOSS_N
+#endif
+#ifndef PATH_LOSS_N_HIGH
+#define PATH_LOSS_N_HIGH 3.5f    // dense urban, heavy obstruction
+#endif
 // How long to join the saved network before giving up and timestamping from
 // boot. board_config.h may override, and a few boards already define it.
 #ifndef NTP_JOIN_TIMEOUT_MS
@@ -67,7 +94,7 @@
 // Fusus assignments. The two Fusus ones are MA-M /28 blocks, which is the whole
 // reason the nibbles field exists.
 //
-// DRAM_ATTR is load-bearing, not decoration. matchOuiRaw() is IRAM_ATTR and
+// DRAM_ATTR is functional, not decorative. matchOuiRaw() is IRAM_ATTR and
 // runs from the WiFi promiscuous callback, which must not depend on flash being
 // readable: SPIFFS autosave writes make the flash mapping briefly unavailable,
 // and a fetch from memory-mapped .rodata during that window faults. The
@@ -1330,6 +1357,69 @@ bool coreWifiCredsSave(const char* ssid, const char* pass) {
   return ok;
 }
 
+// ============================================================
+// PERSISTED SETTINGS: web-console tuning that has to survive a power cycle, in
+// one shared JSON file rather than one per setting, so the next knob costs no
+// extra loader.
+//
+// coreSettingsLoad() runs once from setup() after SPIFFS is up, and nothing reads
+// it lazily. Skip that call and the compiled-in defaults quietly stand, while
+// saving and reading back still appear to work within a single boot.
+// ============================================================
+
+void coreSetEnvDensity(uint8_t density) {
+  if (density < DENSITY_COUNT) coreEnvDensity = density;   // ignore, don't clamp
+}
+
+void coreSetRssiAt1mDbm(int8_t dbm) {
+  // Clamped rather than rejected, so a mistyped value cannot produce absurd ranges.
+  if (dbm > RSSI_AT_1M_MAX) dbm = RSSI_AT_1M_MAX;
+  if (dbm < RSSI_AT_1M_MIN) dbm = RSSI_AT_1M_MIN;
+  coreRssiAt1mDbm = dbm;
+}
+
+void coreNudgeRssiAt1mDbm(int8_t db) {
+  // int, not int8_t: a large step wraps and clamps to the wrong end.
+  int v = (int)coreRssiAt1mDbm + (int)db;
+  if (v > RSSI_AT_1M_MAX) v = RSSI_AT_1M_MAX;
+  if (v < RSSI_AT_1M_MIN) v = RSSI_AT_1M_MIN;
+  coreRssiAt1mDbm = (int8_t)v;
+}
+
+bool coreSettingsLoad() {
+  if (!fySpiffsReady || !SPIFFS.exists(SETTINGS_FILE)) return false;
+  File f = SPIFFS.open(SETTINGS_FILE, "r");
+  if (!f) return false;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) {
+    dualPrintf("[bscope] settings parse failed: %s\n", err.c_str());
+    return false;
+  }
+  coreSetEnvDensity((uint8_t)(doc["density"] | (int)DENSITY_MEDIUM));
+  coreSetRssiAt1mDbm((int8_t)(doc["rssi_1m"] | (int)RSSI_AT_1M));
+  dualPrintf("[bscope] settings loaded (density=%s n=%.2f rssi_1m=%ddBm)\n",
+             envDensityName(coreEnvDensity), corePathLossExponent(),
+             (int)coreRssiAt1mDbm);
+  return true;
+}
+
+bool coreSettingsSave() {
+  if (!fySpiffsReady) { dualPrintln("[bscope] settings save: no SPIFFS"); return false; }
+  JsonDocument doc;
+  doc["density"] = (int)coreEnvDensity;
+  doc["rssi_1m"] = (int)coreRssiAt1mDbm;
+  File f = SPIFFS.open(SETTINGS_FILE, "w");
+  if (!f) { dualPrintln("[bscope] settings save: open failed"); return false; }
+  bool ok = serializeJson(doc, f) > 0;
+  f.close();
+  if (ok) dualPrintf("[bscope] settings saved (density=%s rssi_1m=%ddBm)\n",
+                     envDensityName(coreEnvDensity), (int)coreRssiAt1mDbm);
+  else    dualPrintln("[bscope] settings save: write failed");
+  return ok;
+}
+
 void coreWifiCredsClear() {
   if (fySpiffsReady && SPIFFS.exists(WIFI_CREDS_FILE)) {
     SPIFFS.remove(WIFI_CREDS_FILE);
@@ -1649,22 +1739,55 @@ static void emitDetectionJSON(const char* mac, const char* method,
 }
 
 // ============================================================
-// RSSI -> DISTANCE  (log-distance path loss model, non-GPS boards only)
-// ============================================================
+// RSSI -> DISTANCE: log-distance path loss, with Environment Density picking n
+// and coreRssiAt1mDbm as the reference level.
 //
-// Only meaningful for addr2/wildcard-probe hits. addr1 RSSI reflects
-// AP->scanner path loss, not target->scanner, so it's never used here.
+// Callers skip addr1 hits, whose RSSI describes the AP->scanner path rather than
+// target->scanner; coreHandleAlert() already does. Both settings are runtime and
+// persisted, so this is not a pure function of the board config. RSSI_AT_1M and
+// the PATH_LOSS_N_* presets near the top of this file are only the defaults.
+// The model and calibration are documented in docs/distance_estimation.md, and
+// the invariants that fail quietly in
+// working/distance_estimate/distance_estimate_spec.md.
+// ============================================================
 
-#if !HAS_GPS
-static float rssiToDistanceM(int8_t rssi) {
-  return powf(10.0f, ((float)RSSI_AT_1M - (float)rssi) / (10.0f * PATH_LOSS_N));
+volatile uint8_t coreEnvDensity = DENSITY_MEDIUM;
+volatile int8_t  coreRssiAt1mDbm = RSSI_AT_1M;
+
+// Set after the dedupe gate, so it tracks readings the user was actually shown
+// rather than every rate-limited repeat.
+static volatile int8_t lastDetectionRssi = 0;
+
+int8_t coreLastDetectionRssi() { return lastDetectionRssi; }
+
+// Indexed by EnvDensity. Order must match the enum in core.h.
+static const float DENSITY_N[DENSITY_COUNT] = {
+  PATH_LOSS_N_LOW, PATH_LOSS_N_MED, PATH_LOSS_N_HIGH,
+};
+
+float corePathLossExponent() {
+  uint8_t d = coreEnvDensity;
+  return DENSITY_N[(d < DENSITY_COUNT) ? d : DENSITY_MEDIUM];
 }
-#endif
+
+const char* envDensityName(uint8_t density) {
+  switch (density) {
+    case DENSITY_LOW:    return "low";
+    case DENSITY_MEDIUM: return "medium";
+    case DENSITY_HIGH:   return "high";
+    default:             return "unknown";
+  }
+}
+
+float coreRssiToDistanceM(int8_t rssi) {
+  return powf(10.0f, ((float)coreRssiAt1mDbm - (float)rssi)
+                     / (10.0f * corePathLossExponent()));
+}
 
 // Defined further down alongside the rest of the notification module,
 // forward-declared here since coreHandleAlert() calls it directly instead
 // of leaving detection feedback to the board.
-static void notifyDetection(bool chirpWorthy);
+static void notifyDetection(bool chirpWorthy, int8_t vendor);
 
 // ============================================================
 // coreHandleAlert: the shareable middle of drainAlertQueue(), covering detection
@@ -1681,11 +1804,7 @@ CoreAlertResult coreHandleAlert(const AlertEntry& e) {
   char apMacStr[18] = "";
   if (e.type == ALERT_OUI_ADDR1) macToStr(e.mac2, apMacStr, sizeof(apMacStr));
 
-#if HAS_GPS
-  float distM = -1.0f;
-#else
-  float distM = (e.type != ALERT_OUI_ADDR1) ? rssiToDistanceM(e.rssi) : -1.0f;
-#endif
+  float distM = (e.type != ALERT_OUI_ADDR1) ? coreRssiToDistanceM(e.rssi) : -1.0f;
 
   bool chirpWorthy = false;
   int idx = fyAddDetection(r.macStr, method, e.rssi, e.channel,
@@ -1710,12 +1829,16 @@ CoreAlertResult coreHandleAlert(const AlertEntry& e) {
   r.type        = e.type;
   strlcpy(r.frameKind, e.frameKind, sizeof(r.frameKind));
   ouiFromMac(e.mac, r.oui, sizeof(r.oui));
+  // Re-matched rather than carried on the queue, keeping AlertEntry small. -1 for
+  // an ALERT_SSID hit, which matched on name rather than OUI.
+  r.vendor = (int8_t)matchOuiRaw(e.mac);
 
   if (shouldSuppressDuplicate(r.macStr)) {
     r.suppressed = true;
     return r;
   }
   r.suppressed = false;
+  lastDetectionRssi = e.rssi;   // calibration reference; see coreLastDetectionRssi()
 
   if (e.type == ALERT_SSID) {
     dualPrintf("[bscope] DETECT-SSID type=%s mac=%s ssid=\"%s\" rssi=%d ch=%u count=%d\n",
@@ -1728,15 +1851,41 @@ CoreAlertResult coreHandleAlert(const AlertEntry& e) {
 
   emitDetectionJSON(r.macStr, method, e.rssi, e.channel,
                     (e.type == ALERT_SSID) ? e.ssid : "", apMacStr);
-  notifyDetection(r.chirpWorthy);
+  notifyDetection(r.chirpWorthy, r.vendor);
   return r;
 }
 
 // ============================================================
-// NOTIFICATIONS: LED (NeoPixel) and buzzer
+// NOTIFICATIONS: LED (NeoPixel) and buzzer.
+//
+// A detection encodes two facts at once. Colour carries the vendor, so which
+// fleet was seen is readable without looking at the panel, and pulse count
+// carries whether the MAC is new. Trains are stepped from ledTick() rather than
+// blocking, since notifyDetection() runs in the alert drain path. Both the
+// detection and heartbeat paths honour coreLedEnabled and coreBuzzerEnabled; the
+// boot jingle, RGB cycle and on-demand replay hooks do not. See docs/alerts.md.
 // ============================================================
 
-static volatile unsigned long ledOffAt = 0;
+// Per-vendor detection colours, overridable per board alongside the other
+// LED_COLOR_* values. See docs/alerts.md.
+#ifndef LED_COLOR_FLOCK_R
+#define LED_COLOR_FLOCK_R 0
+#define LED_COLOR_FLOCK_G 0
+#define LED_COLOR_FLOCK_B 180
+#endif
+#ifndef LED_COLOR_AXON_R
+#define LED_COLOR_AXON_R  180
+#define LED_COLOR_AXON_G  150
+#define LED_COLOR_AXON_B  0
+#endif
+
+// Blink train state, stepped by ledTick() so a multi-pulse pattern never blocks
+// the alert drain path.
+static unsigned long ledNextAt = 0;   // 0 = idle, no train running
+static uint8_t  ledPulsesLeft = 0;
+static bool     ledLit        = false;
+static uint8_t  ledR = 0, ledG = 0, ledB = 0;
+static unsigned ledPulseMs = 0;
 
 // Runtime alert gates (declared in core.h), flipped live from the Alerts menu.
 // Enabled by default each boot, session-only, and not persisted.
@@ -1755,21 +1904,41 @@ static inline void ledSet(uint8_t r, uint8_t g, uint8_t b) {
 #endif
 }
 
-static void ledFlash(uint8_t r, uint8_t g, uint8_t b, unsigned ms) {
+// Equal on/off intervals of ledPulseMs until ledPulsesLeft is exhausted, then
+// parks the LED off and goes idle. Called from coreNotifyTick() every loop().
+static void ledTick() {
 #if USE_LED
-  ledSet(r, g, b);
-  ledOffAt = millis() + ms;
-  if (ledOffAt == 0) ledOffAt = 1;  // avoid the "off" sentinel
+  if (!ledNextAt) return;                              // idle
+  if ((long)(millis() - ledNextAt) < 0) return;        // interval not up
+  if (ledLit) {
+    ledSet(0, 0, 0);
+    ledLit = false;
+    if (ledPulsesLeft == 0) { ledNextAt = 0; return; } // train finished
+  } else {
+    ledSet(ledR, ledG, ledB);
+    ledLit = true;
+    ledPulsesLeft--;
+  }
+  ledNextAt = millis() + ledPulseMs;
+  if (!ledNextAt) ledNextAt = 1;                       // 0 is the idle sentinel
 #endif
 }
 
-static void ledTick() {
+// Replaces any train still running, so the LED shows the newest detection.
+static void ledBlink(uint8_t r, uint8_t g, uint8_t b, unsigned ms, uint8_t pulses) {
 #if USE_LED
-  if (ledOffAt && (long)(millis() - ledOffAt) >= 0) {
-    ledSet(0, 0, 0);
-    ledOffAt = 0;
-  }
+  if (pulses == 0) return;
+  ledR = r; ledG = g; ledB = b;
+  ledPulseMs = ms;
+  ledPulsesLeft = pulses;
+  ledLit = false;
+  ledNextAt = 1;    // any nonzero past time; the tick below lights pulse one
+  ledTick();        // light it now instead of up to one loop() later
 #endif
+}
+
+static void ledFlash(uint8_t r, uint8_t g, uint8_t b, unsigned ms) {
+  ledBlink(r, g, b, ms, 1);
 }
 
 // Two fast ascending beeps, played on the FIRST sighting of a MAC.
@@ -1824,24 +1993,36 @@ static void heartbeatTick() {
   fyLastHeartbeatAt = now;
 }
 
-// Called from coreHandleAlert() for every non-suppressed detection.
-//   - NEW MAC  → two fast ascending beeps (clearly distinct sound)
-//   - REPEAT   → silent, since the heartbeat tick covers continued presence
-// LED flashes on every emitted detection either way.
-static void notifyDetection(bool chirpWorthy) {
+// Flock blue, Axon yellow. An unmatched vendor (an `ssid_keyword` hit, which has
+// no OUI to attribute) keeps the generic detection colour.
+#if USE_LED
+static void vendorLedColor(int8_t vendor, uint8_t& r, uint8_t& g, uint8_t& b) {
+  switch (vendor) {
+    case VENDOR_FLOCK: r = LED_COLOR_FLOCK_R; g = LED_COLOR_FLOCK_G; b = LED_COLOR_FLOCK_B; break;
+    case VENDOR_AXON:  r = LED_COLOR_AXON_R;  g = LED_COLOR_AXON_G;  b = LED_COLOR_AXON_B;  break;
+    default:           r = LED_COLOR_R;       g = LED_COLOR_G;       b = LED_COLOR_B;       break;
+  }
+}
+#endif
+
+// New MAC chirps and blinks twice; a repeat is silent and blinks once. Colour
+// carries vendor, pulse count carries new-versus-repeat. See docs/alerts.md.
+static void notifyDetection(bool chirpWorthy, int8_t vendor) {
   if (chirpWorthy) {
     if (coreBuzzerEnabled) newDetectChirp();   // Alerts menu: buzzer mute
     // Reset the heartbeat phase so the first follow-up beep lands
     // HB_BEEP_INTERVAL_MS after the initial chirp, not mid-window.
     fyLastHeartbeatAt = millis();
-#if USE_LED
-    if (coreLedEnabled) ledFlash(LED_COLOR_NEW_R, LED_COLOR_NEW_G, LED_COLOR_NEW_B, LED_FLASH_MS);
-#endif
-  } else {
-#if USE_LED
-    if (coreLedEnabled) ledFlash(LED_COLOR_R, LED_COLOR_G, LED_COLOR_B, LED_FLASH_MS);
-#endif
   }
+#if USE_LED
+  if (coreLedEnabled) {
+    uint8_t r, g, b;
+    vendorLedColor(vendor, r, g, b);
+    ledBlink(r, g, b, LED_FLASH_MS, chirpWorthy ? 2 : 1);
+  }
+#else
+  (void)vendor;
+#endif
 }
 
 void coreNotifyBoot() {
@@ -1875,7 +2056,10 @@ void coreLedBlink(uint8_t r, uint8_t g, uint8_t b,
     ledSet(r, g, b);  delay(on_ms);
     ledSet(0, 0, 0);  delay(off_ms);
   }
-  ledOffAt = 0;   // fully off; clear any pending timed flash so ledTick() won't relight
+  // Abandon any train in flight so ledTick() won't relight after this.
+  ledNextAt = 0;
+  ledPulsesLeft = 0;
+  ledLit = false;
 #endif
 }
 

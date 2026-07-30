@@ -173,16 +173,6 @@ This left no path to a camera location better than "somewhere within ~200m of wh
 
 ### The addr2 fix
 
-`addr2` is available in the callback via `hdr->addr2`. It was already being read two lines earlier for the OUI check on all other detection types. The cost of capturing it is:
-- One `memcpy` of 6 bytes into the `AlertEntry.mac2` field in the IRAM-safe callback
-- Six bytes added to `AlertEntry` (no alignment impact; the field follows the existing `mac[6]`)
-- One `snprintf` in the drain loop to format the MAC string
-- Additional characters in the SD CSV row and JSON line
-
-There is no performance impact on the detection path. The callback remains allocation-free and Serial-free; the only new work is in `drainAlertQueue()` in the main loop, which was already doing formatting work for every event.
-
-### What addr2 enables downstream
-
 With `ap_mac` in the log, the analysis pipeline can perform a **backtrace** with companion wardriving data:
 
 1. The logged `ap_mac` identifies exactly which AP sent this probe response
@@ -211,6 +201,16 @@ When a camera MAC has been detected by multiple methods, prefer in this order:
 | 4        | `oui_addr1` centroid only     | Scanner GPS centroid; only useful for confirming approximate area                      |
 
 A camera MAC with only `oui_addr1` hits and no matching AP in `wd3_wifi` falls into priority 4 and should be flagged as `position_quality=low` in output.
+
+---
+
+## Single-Observation Distance Estimate
+
+A single RSSI reading also yields a coarse range, independent of the triangulation above and answering a different question: triangulation places a target on a map from many GPS-anchored observations, whereas this gives a distance from wherever the scanner stood, from one reading.
+
+It applies to `wildcard_probe` and `oui_addr2` hits only, priorities 1 and 2. For `oui_addr1` the RSSI describes the AP link instead, so no distance is reported, for the same reason the solver cannot use those observations.
+
+The model, its two calibration settings, and their accuracy limits are covered in [Distance estimation](distance_estimation.md).
 
 ---
 

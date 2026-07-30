@@ -38,6 +38,23 @@ static void drawMarkOverlay() {
   u8g2.sendBuffer();
 }
 
+// Indexed by dispVendor; order must match the Vendor enum in core.h. Not
+// vendorName(), whose lowercase strings are the stable form for serial and JSON.
+static const char* dispVendorName(int8_t vendor) {
+  static const char* const names[2] = { "Flock", "Axon" };
+  if (vendor < 0 || vendor >= 2) return "--";
+  return names[vendor];
+}
+
+// '~' is part of the value: the number is a coarse guess, not a measurement.
+// Clamps past 999m rather than widening the row.
+static void dispFormatDist(float m, char* buf, size_t len) {
+  if (m < 0.0f)        snprintf(buf, len, "--");
+  else if (m >= 999.0f) snprintf(buf, len, ">999m");
+  else if (m < 10.0f)   snprintf(buf, len, "~%.1fm", m);
+  else                  snprintf(buf, len, "~%.0fm", m);
+}
+
 static void drawScreenHeader(const char* title) {
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawStr(0, 8, title);
@@ -66,14 +83,17 @@ static void drawOverview() {
 #endif
   u8g2.drawStr(0, ROW1, line);
   if (fyDetCount > 0) {
-    snprintf(line, sizeof(line), "last oui:%s", dispOui);
+    snprintf(line, sizeof(line), "typ:%s", dispVendorName(dispVendor));
     u8g2.drawStr(0, ROW2, line);
     snprintf(line, sizeof(line), "rssi:%d ch:%u", (int)dispRssi, dispCh);
     u8g2.drawStr(0, ROW3, line);
+    char dist[10];
+    dispFormatDist(dispDistM, dist, sizeof(dist));
+    snprintf(line, sizeof(line), "dst:%s", dist);
+    u8g2.drawStr(0, ROW4, line);
   } else {
     u8g2.drawStr(0, ROW2, "scanning...");
   }
-  u8g2.drawStr(0, ROW4, "hold Up = mark");   // dedicated always-on gesture (long BTN_1)
 }
 
 static void drawGpsDetail() {

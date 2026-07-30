@@ -75,7 +75,8 @@ typedef struct {
   char      oui[9];
   int8_t    rssi;
   uint8_t   channel;
-  float     distM;         // RSSI-distance estimate, -1 when HAS_GPS or not applicable (addr1 hits)
+  float     distM;         // RSSI-distance estimate in metres, -1 for addr1 hits (see coreRssiToDistanceM)
+  int8_t    vendor;        // matching Vendor, or -1 when the OUI is not a target (SSID / wildcard-probe hits)
   AlertType type;
   char      frameKind[12];
 } CoreAlertResult;
@@ -117,6 +118,58 @@ int coreTargetIndex();
 
 // "flock" / "axon" / "unknown". Stable strings, safe to log.
 const char* vendorName(uint8_t vendor);
+
+// ============================================================
+// DISTANCE ESTIMATE: a log-distance path-loss model with two user controls, one
+// per term.
+//
+//   d = 10 ^ ((RSSI_1m - RSSI_measured) / (10 * n))
+//
+// Environment Density sets n, how fast signal fades with distance.
+// coreRssiAt1mDbm sets the reference level it fades from. Both are directly
+// meaningful, which is the point: the reference is what the radio reads standing
+// a metre from a target, so it can be calibrated by walking up to one and reading
+// the number off the screen. Accuracy stays coarse whatever the settings, since
+// multipath alone swings instantaneous RSSI by 6-10 dB, so the controls remove
+// systematic bias rather than noise. Calibration procedure and ranges are in
+// docs/distance_estimation.md.
+// ============================================================
+
+// Order must match DENSITY_N in core.cpp.
+typedef enum : uint8_t {
+  DENSITY_LOW = 0,      // open ground, near line of sight
+  DENSITY_MEDIUM,       // mixed suburban, scattered obstructions
+  DENSITY_HIGH,         // dense urban, heavy obstruction
+  DENSITY_COUNT
+} EnvDensity;
+
+#define RSSI_AT_1M_MIN -85
+#define RSSI_AT_1M_MAX -20
+
+extern volatile uint8_t coreEnvDensity;    // an EnvDensity; set via coreSetEnvDensity()
+extern volatile int8_t  coreRssiAt1mDbm;   // expected RSSI at 1m; set via coreSetRssiAt1mDbm()
+
+void coreSetEnvDensity(uint8_t density);   // ignores an out-of-range value
+void coreSetRssiAt1mDbm(int8_t dbm);       // clamps to [RSSI_AT_1M_MIN, RSSI_AT_1M_MAX]
+
+// Steps the reference, clamped the same way. Up reads farther.
+void coreNudgeRssiAt1mDbm(int8_t db);
+
+float corePathLossExponent();              // n for the active Density
+const char* envDensityName(uint8_t density);   // "low" / "medium" / "high", safe to log
+
+// Metres. Callers skip ALERT_OUI_ADDR1 hits, whose RSSI is the AP->scanner path;
+// coreHandleAlert() already does, reporting -1 as CoreAlertResult::distM.
+float coreRssiToDistanceM(int8_t rssi);
+
+// Most recent non-suppressed detection's RSSI, or 0 if there has not been one.
+int8_t coreLastDetectionRssi();
+
+// Persisted as {"density":N,"rssi_1m":N}. coreSettingsLoad() must be called from
+// setup() once SPIFFS is mounted. False means absent or unparseable, which is not
+// an error: the defaults stand.
+bool coreSettingsLoad();
+bool coreSettingsSave();
 
 // ============================================================
 // MAC / OUI HELPERS

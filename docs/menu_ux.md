@@ -18,8 +18,9 @@ the round TFT board renders its own UX. See [Board parity](board_parity.md).
 Up and Down cycle through eight screens, wrapping at both ends. Four are
 read-only detail views and four are menus you drill into with Select.
 
-1. Overview: detection count, channel, GPS fix flag (Y/N), and the scanning or
-   last-hit headline. Also surfaces the Mark area-of-interest gesture.
+1. Overview: detection count, channel, GPS fix flag (Y/N), and for the last hit
+   its vendor, RSSI, channel, and a rough distance estimate. Shows `scanning...`
+   until the first detection.
 
    ![Overview screen](../assets/images/carousel_demo/01_overview.png)
 
@@ -156,9 +157,9 @@ uses the usual convention instead, where Up moves the highlight toward the first
 item. The two differ because the visual contexts differ.
 
 Manual mark keeps a dedicated, always-available gesture on long BTN_1 rather
-than an overloaded context press, because it has to work on any screen. The
-Overview screen surfaces it as the natural place to glance before marking.
-Firing it flashes a brief "Saved Manual Record!" overlay for 1.5 seconds.
+than an overloaded context press, because it has to work on any screen. Firing it
+flashes a brief "Saved Manual Record!" overlay for 1.5 seconds, which is the only
+on-screen indication; no screen prints the gesture.
 
 ## Semantic nav layer
 
@@ -221,6 +222,15 @@ everything. Differences on the web side:
   consumed at the next boot. Submitting an empty SSID reports the currently
   saved network, and `wifi-forget` erases it. This is web-only, since it needs a
   form. The password is never echoed back.
+- `calibrate` tunes the distance estimate behind the Overview screen's `dst:` row.
+  It takes an Environment Density preset (low, medium, or high) and `rssi_1m`, the
+  expected RSSI one metre from a target. `rssi_trim` steps that reference instead
+  of replacing it, which is the in-field adjustment when an estimate is visibly
+  wrong. Both settings persist to SPIFFS at `/settings.json` and reload at boot.
+  Submitting nothing reports the active model against the last real detection.
+  Changes apply to the next detection rather than rescaling the estimate already
+  on screen. Web-only, since it needs a form. See
+  [Distance estimation](distance_estimation.md).
 - Pinned buttons in the Controls card are `status`, `wifi`, and `help`, though
   typing `help` still uses the client-side listing. `chirp` and `jingle` are
   unpinned typed verbs.

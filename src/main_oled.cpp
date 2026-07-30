@@ -65,6 +65,10 @@ static char   dispMac[18]  = "--:--:--:--:--:--";
 static char   dispOui[9]   = "-------";
 static int8_t dispRssi     = 0;
 static uint8_t dispCh      = 0;
+static int8_t dispVendor   = -1;   // Vendor enum value, or -1 for no match
+// Metres, straight from CoreAlertResult::distM so the panel and logs agree. -1
+// renders "--". Cached, so recalibrating shows on the next detection.
+static float  dispDistM    = -1.0f;
 static bool   dispDirty    = false;
 static unsigned long dispLastRefresh = 0;
 #define DISPLAY_REFRESH_MS 2000
@@ -86,13 +90,20 @@ static unsigned long dispLastRefresh = 0;
 #define DEMO_CHANNEL   6
 #define DEMO_OUI       "e4:aa:ea"       // drawn from core.cpp's oui_table[]
 #define DEMO_MAC       DEMO_OUI ":7b:04:19"
-#define DEMO_RSSI      (-58)
+#define DEMO_RSSI      (-80)   // mid-range, so the frame shows a plausible distance
+#define DEMO_VENDOR    VENDOR_FLOCK      // DEMO_OUI is a Flock-tagged prefix
+// Stated outright, not derived, so a demo frame is a fixed picture. Kept
+// consistent by hand with DEMO_RSSI under the defaults, and equal to DEMO_DIST_M
+// in tools/screen_render/render.cpp.
+#define DEMO_DIST_M    (25.1f)
 
 static void demoSeedDisplayState() {
   strlcpy(dispMac, DEMO_MAC, sizeof(dispMac));
   strlcpy(dispOui, DEMO_OUI, sizeof(dispOui));
   dispRssi       = DEMO_RSSI;
   dispCh         = DEMO_CHANNEL;
+  dispVendor     = DEMO_VENDOR;
+  dispDistM      = DEMO_DIST_M;
   fyDetCount     = DEMO_DET_COUNT;
   currentChannel = DEMO_CHANNEL;
 #if HAS_GPS
@@ -117,6 +128,8 @@ static void drainAlertQueue() {
     strlcpy(dispOui, r.oui,    sizeof(dispOui));
     dispRssi  = r.rssi;
     dispCh    = r.channel;
+    dispVendor = r.vendor;     // -1 when the OUI is not a target
+    dispDistM  = r.distM;      // already -1 for addr1 hits
     dispDirty = true;
 
 #if STOP_ON_OUI_HIT
@@ -376,6 +389,8 @@ void setup() {
     fySpiffsReady = true;
     dualPrintln("[bscope] SPIFFS ready");
     fyPromotePrevSession();
+    // Before the first detection; nothing reloads it lazily.
+    coreSettingsLoad();
   } else {
     dualPrintln("[bscope] SPIFFS init FAILED - running without persistence");
   }

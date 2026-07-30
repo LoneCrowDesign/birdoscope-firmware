@@ -81,6 +81,25 @@ static String reportStatus() {
   return String("Birdoscope v") + BIRDOSCOPE_VERSION + " – status printed to log";
 }
 
+// Active distance model plus a worked example, which is what makes the numbers
+// checkable against a tape measure.
+static String describeDistanceModel() {
+  char buf[192];
+  int8_t last = coreLastDetectionRssi();
+  if (last != 0) {
+    snprintf(buf, sizeof(buf),   // real reading beats a hypothetical one
+             "density=%s (n=%.1f) rssi_1m=%ddBm; last detection %ddBm reads ~%.1fm",
+             envDensityName(coreEnvDensity), corePathLossExponent(),
+             (int)coreRssiAt1mDbm, (int)last, coreRssiToDistanceM(last));
+  } else {
+    snprintf(buf, sizeof(buf),
+             "density=%s (n=%.1f) rssi_1m=%ddBm; no detection yet, a %ddBm hit would read ~%.1fm",
+             envDensityName(coreEnvDensity), corePathLossExponent(),
+             (int)coreRssiAt1mDbm, -80, coreRssiToDistanceM(-80));
+  }
+  return String(buf);
+}
+
 // Batches log lines into ~900-byte console.log() calls. Streaming a whole log
 // at one WebSocket frame per line overran the socket and dropped the client,
 // which surfaced as disconnect and reconnect churn after a bulk `log`.
@@ -289,6 +308,70 @@ static void ensureRegistered() {
                         return String("saved \"") + ssid + "\" – used for NTP at next boot when GPS is absent";
                       return String("save failed – SPIFFS not ready");
                     }, wifiOpts);
+
+  // Distance-estimate calibration, one field per term of the model. `rssi_trim`
+  // steps the reference rather than replacing it; submitting nothing reports the
+  // current model. See docs/distance_estimation.md.
+  static const jelly::webconsole::Field calibrateArgs[] = {
+    { "density",   "environment density",              jelly::webconsole::FieldType::Enum,   "low,medium,high", false },
+    { "rssi_1m",   "expected RSSI at 1m (dBm)",        jelly::webconsole::FieldType::Number, nullptr, false },
+    { "rssi_trim", "or: step it by (dB, + reads farther)", jelly::webconsole::FieldType::Number, nullptr, false },
+  };
+  jelly::webconsole::CommandOpts calibrateOpts;
+  calibrateOpts.args     = calibrateArgs;
+  calibrateOpts.argCount = 3;
+  calibrateOpts.pinned   = true;
+  console.onCommand("calibrate", "tune the distance estimate: environment density and expected RSSI at 1m",
+                    [](JsonVariantConst a) -> String {
+                      String density = a["density"] | "";
+                      density.trim();
+                      // Absent means unset: WebConsole omits blank inputs.
+                      bool haveRef  = !(a["rssi_1m"].isNull());
+                      bool haveStep = !(a["rssi_trim"].isNull());
+
+                      if (density.length() == 0 && !haveRef && !haveStep)
+                        return describeDistanceModel()
+                             + " \u2013 set a density, an rssi_1m, or an rssi_trim step to change it";
+
+                      if (density.length() > 0) {
+                        if      (density == "low")    coreSetEnvDensity(DENSITY_LOW);
+                        else if (density == "medium") coreSetEnvDensity(DENSITY_MEDIUM);
+                        else if (density == "high")   coreSetEnvDensity(DENSITY_HIGH);
+                        else return String("unknown density \"") + density + "\" \u2013 expected low, medium, or high";
+                      }
+
+                      // Absolute wins over a step. `requested` is kept separately
+                      // from what was applied so the clamp check below is honest.
+                      int before    = (int)coreRssiAt1mDbm;
+                      int requested = before;
+                      if (haveRef) {
+                        requested = (int)(a["rssi_1m"] | before);
+                        // Clamped before the int8_t cast, which would wrap.
+                        int v = requested;
+                        if (v > RSSI_AT_1M_MAX) v = RSSI_AT_1M_MAX;
+                        if (v < RSSI_AT_1M_MIN) v = RSSI_AT_1M_MIN;
+                        coreSetRssiAt1mDbm((int8_t)v);
+                      } else if (haveStep) {
+                        int step = (int)(a["rssi_trim"] | 0);
+                        requested = before + step;
+                        if (step >  127) step =  127;   // int8_t parameter range
+                        if (step < -127) step = -127;
+                        coreNudgeRssiAt1mDbm((int8_t)step);
+                      }
+
+                      // Only when genuinely out of range, not merely unchanged: a
+                      // resent value or a zero step is not a clamp.
+                      int after = (int)coreRssiAt1mDbm;
+                      String note;
+                      if (after != requested)
+                        note = String(" \u2013 ") + requested + " dBm is outside the accepted "
+                             + RSSI_AT_1M_MIN + " to " + RSSI_AT_1M_MAX + " dBm, clamped to " + after;
+
+                      String applied = describeDistanceModel();
+                      if (!coreSettingsSave())
+                        return applied + note + " \u2013 applied for this session, but saving failed, SPIFFS not ready";
+                      return applied + note + " \u2013 saved; applies to the next detection";
+                    }, calibrateOpts);
 
   jelly::webconsole::CommandOpts wifiForgetOpts;
   wifiForgetOpts.confirm = true;   // destructive-ish: wipes the stored network

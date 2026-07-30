@@ -52,6 +52,9 @@ to draw.
 | Runtime alert gates                | yes, core (`coreBuzzerEnabled`, `coreLedEnabled`) | yes  | yes     | 6    |
 | Runtime scan-mode switch           | yes, core (`coreSetScanMode`)                     | yes  | yes     | 7    |
 | Runtime target switch              | yes, core (`coreSetVendorMask`)                   | yes  | n/a     | 8    |
+| RSSI distance estimate             | yes, core (`coreRssiToDistanceM`)                 | yes  | pending | 9    |
+| Distance calibration, persisted    | yes, core (`coreSetEnvDensity`, `coreSetRssiAt1mDbm`) | n/a | pending | 10 |
+| Vendor-colored detection blink     | yes, core (`notifyDetection`)                     | n/a  | n/a     | 11   |
 
 1. The OLED path blinks blue five times and shows "SD Card Not Found / Saving to
    SPIFFS", then blocks until Confirm on a board with buttons so the missing
@@ -78,3 +81,20 @@ to draw.
    it, but only the three-button OLED board has a Targets screen and neither
    board file displays the active target. Held in RAM, resetting to All on
    reboot.
+9. Reported as `CoreAlertResult::distM` for every board and every detection where
+   the geometry is valid, so the behavior is shared even where nothing draws it.
+   The OLED Overview screen shows it as `dst:`; the round TFT has no row for it
+   yet. Only `wildcard_probe` and `oui_addr2` hits get a value, since `oui_addr1`
+   RSSI describes the AP link. See
+   [Distance estimation](distance_estimation.md).
+10. Environment Density and the expected RSSI at 1m, both set from the web
+    console's `calibrate` command. They persist to SPIFFS at `/settings.json`, so
+    unlike the scan-mode and alert gates above they survive a reboot. Deliberately not a screen: they
+    are set once for a site and antenna, not adjusted while walking. Neither board
+    file draws them, hence n/a for the OLED. `main_tft.cpp` is pending only
+    because it never calls `coreSettingsLoad()`, so the saved values are ignored
+    there until the backport. See [Distance estimation](distance_estimation.md).
+11. Blue for Flock, yellow for Axon, with new versus repeat carried by pulse count
+    rather than color. Driven entirely by core's NeoPixel path, so it needs no
+    board rendering; a board without `USE_LED` compiles it out. `esp32round` has
+    no LED at all. See [Alert behavior](alerts.md).
