@@ -21,6 +21,7 @@
 
 #include "board_config.h"
 #include "core.h"
+#include "roost_session.h"
 #include "web_portal.h"
 
 // ============================================================
@@ -251,7 +252,7 @@ static void triggerManualAlert() {
   dispDirty = true;
 
 #if USE_SD
-  sdAppendRow("", "MANUALALERT", "manual", 0, currentChannel, "", "", -1.0f);
+  roostLogOperatorMark();
 #endif
 
   dualPrintln("[bscope] MANUAL ALERT logged (area of interest)");
@@ -308,10 +309,13 @@ static void injectTestDetection() {
 #if USE_SD
 static void dumpSdLog() {
   if (!fySDReady) { dualPrintln("[bscope] dump: SD not ready"); return; }
-  if (sdLog) sdLog.flush();
-  File f = SD.open(SD_LOG_FILE, FILE_READ);
-  if (!f) { dualPrintf("[bscope] dump: cannot open %s\n", SD_LOG_FILE); return; }
-  dualPrintf("[bscope] dump: %s (%u bytes)\n", SD_LOG_FILE, (unsigned)f.size());
+  if (!roostSessionOpen()) { dualPrintln("[bscope] dump: no session open"); return; }
+  char name[48], path[96];
+  roostFileName(name, sizeof(name), ROOST_REC_WIFI_OBS);
+  snprintf(path, sizeof(path), "%s/%s", roostSessionDir(), name);
+  File f = SD.open(path, FILE_READ);
+  if (!f) { dualPrintf("[bscope] dump: cannot open %s\n", path); return; }
+  dualPrintf("[bscope] dump: %s (%u bytes)\n", path, (unsigned)f.size());
   uint8_t buf[256];
   int n;
   while ((n = f.read(buf, sizeof(buf))) > 0) Serial.write(buf, (size_t)n);
@@ -389,8 +393,8 @@ void setup() {
   if (SD.begin(SD_CS_PIN, tft.getSPIinstance())) {
     fySDReady = true;
     dualPrintln("[bscope] SD card ready");
-    sdSetup();
-    sdTryNameLog();
+    roostSessionBegin();
+    roostSessionAnchor();
   } else {
     dualPrintln("[bscope] SD card not found - skipping");
   }

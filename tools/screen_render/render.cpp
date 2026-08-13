@@ -50,13 +50,30 @@ typedef enum {
   SCREEN_COUNT,
 } ScreenId;
 
-typedef enum { MENU_NONE, MENU_LIST, MENU_PICK_CHANNEL } MenuState;
+typedef enum { MENU_NONE, MENU_LIST, MENU_PICK_CHANNEL, MENU_PICK_PROX } MenuState;
 
 static ScreenId  coreCurrentScreen = SCREEN_OVERVIEW;
 static MenuState coreMenuState     = MENU_NONE;
 static int       coreMenuSel       = 0;
 static bool      coreBuzzerEnabled = true;
 static bool      coreLedEnabled    = true;
+
+// Per-device direction counts, mirrored from core.h. Deliberately sum to more
+// than DEMO_DET_COUNT (5), since a camera seen both ways counts in both and the
+// rendered frame should show that rather than hide it.
+static uint16_t coreDirectDeviceCount()   { return 4; }
+static uint16_t coreIndirectDeviceCount() { return 3; }
+
+// Raw sniffer counters, mirrored from core.h. Sized to exercise the k/M
+// abbreviation on the Detections row rather than the bare-integer case.
+static uint32_t coreSeenFrames      = 128400;
+static uint32_t coreCandidateFrames = 96200;
+
+// Proximity ring, mirrored from core.h. No board_config.h here, so the active
+// value is spelled out rather than taken from PROX_RING_M.
+#define PROX_RING_OPTION_COUNT 5
+static const uint8_t PROX_RING_OPTIONS[PROX_RING_OPTION_COUNT] = { 0, 10, 25, 50, 100 };
+static uint8_t       coreProxRingM = 25;
 
 // ============================================================
 // SCENARIO: the sample scan the images depict. Matches the DEMO_MODE values in
@@ -166,6 +183,7 @@ static const Frame FRAMES[] = {
   // The prose list in that doc renumbers on its own.
   { "13_targets",           SCREEN_TARGETS,     MENU_NONE,         0 },
   { "14_targets_open",      SCREEN_TARGETS,     MENU_LIST,         1 },
+  { "15_alerts_prox",       SCREEN_ALERTS,      MENU_PICK_PROX,    2 },
 };
 static const int FRAME_COUNT = sizeof(FRAMES) / sizeof(FRAMES[0]);
 

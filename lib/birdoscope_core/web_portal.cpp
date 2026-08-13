@@ -22,6 +22,7 @@
 // owns only the server. The promiscuous and SoftAP radio handoff lives in the
 // core and board code that calls webPortalStart() and webPortalStop().
 #include "web_portal.h"
+#include "roost_session.h"
 #include "board_config.h"   // must precede core.h so USE_SD/HAS_GPS gate its externs
 #include "core.h"
 
@@ -71,10 +72,29 @@ static bool          everHadClient = false;
 // verb.
 static String reportStatus() {
   unsigned long s = millis() / 1000;
-  console.logf("Birdoscope v%s", BIRDOSCOPE_VERSION);
+  console.logf("Birdoscope %s", coreBuildIdentity());
   console.logf("uptime=%lus ch=%u mode=%s det=%d spiffs=%d sniffing=%d",
                s, (unsigned)currentChannel, channelModeName(), fyDetCount,
                fySpiffsReady ? 1 : 0, sniffingStopped ? 0 : 1);
+  // Two units on purpose: frames say whether the path is alive, devices say
+  // what is out there. Device counts overlap and can sum past det, spec C2.
+  console.logf("frames direct=%u indirect=%u",
+               (unsigned)coreDirectFrames, (unsigned)coreIndirectFrames);
+  console.logf("devices direct=%u indirect=%u (of %d total)",
+               (unsigned)coreDirectDeviceCount(),
+               (unsigned)coreIndirectDeviceCount(), fyDetCount);
+  // Frozen at whatever they held when the portal stopped the sniffer; read
+  // over serial for a live figure.
+  console.logf("sniffer seen=%u cand=%u qdrop=%u",
+               (unsigned)coreSeenFrames, (unsigned)coreCandidateFrames,
+               (unsigned)coreQueueDrops);
+  // From the roost writer, the same source the serial heartbeat reads.
+  uint32_t rw = 0, rd = 0, wf = 0, fx = 0;
+  roostSessionStats(&rw, &rd, &wf, &fx);
+  console.logf("load qmax=%u/%u rows=%u fixes=%u dropped=%u worst_flush=%ums session=%s",
+               (unsigned)coreQueueDepthMax, (unsigned)coreAlertQueueSize(),
+               (unsigned)rw, (unsigned)fx, (unsigned)rd, (unsigned)wf,
+               roostSessionOpen() ? roostSessionDir() : "none");
   console.logf("heap=%u min_free=%u largest_block=%u",
                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
                (unsigned)ESP.getMaxAllocHeap());
@@ -149,15 +169,16 @@ static String streamFileToConsole(fs::FS& fs, const char* path, const char* labe
 // the last 10 rows, held in a RAM-safe rolling window so a log far larger than
 // RAM never loads at once (and only ~11 batched lines hit the WebSocket).
 // full=true streams the whole file, batched and opt-in, and may reconnect on a
-// very large log. Always draws from the currently active log (`sdLog`), which
-// is /log.csv until GPS anchors a timestamped name and then follows the
-// rename.
+// very large log. Draws from the session's wifi_obs file, which lives under a
+// provisional directory until the clock anchors and then follows the rename.
 static const int WEB_LOG_TAIL = 10;
 
 static String dumpSdLog(bool full) {
   if (!fySDReady) { console.log("log: SD not ready"); return String("log: SD not ready"); }
-  sdLog.flush();
-  String path = sdLog.path();
+  if (!roostSessionOpen()) { console.log("log: no session open"); return String("log: no session"); }
+  char name[48];
+  roostFileName(name, sizeof(name), ROOST_REC_WIFI_OBS);
+  String path = String(roostSessionDir()) + "/" + name;
   File f = SD.open(path.c_str(), "r");
   if (!f) { console.logf("log: open failed (%s)", path.c_str()); return String("log: open failed"); }
   console.logf("--- SD log (%s, %u bytes)%s ---", path.c_str(), (unsigned)f.size(),
@@ -456,6 +477,11 @@ static void ensureRegistered() {
                       corePlayDetectChirp();
                       return String("played detection chirp");
                     });
+  console.onCommand("prox", "play the proximity chirp",
+                    [](JsonVariantConst) -> String {
+                      corePlayProximityChirp();
+                      return String("played proximity chirp");
+                    });
   console.onCommand("jingle", "play the boot jingle",
                     [](JsonVariantConst) -> String {
                       corePlayStartupJingle();
@@ -488,7 +514,7 @@ static void ensureRegistered() {
                       h += "  inject   – (Detect only) synthetic detection\n";
                       h += "  nav      – (Detect only) screen-nav event\n";
 #if USE_BUZZER
-                      h += "  chirp / jingle – buzzer tone tests\n";
+                      h += "  chirp / prox / jingle – buzzer tone tests\n";
 #endif
                       h += "  clear    – wipe the log";
                       console.log(h);

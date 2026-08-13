@@ -41,15 +41,17 @@ static void drawMarkOverlay() {
 // Indexed by dispVendor; order must match the Vendor enum in core.h. Not
 // vendorName(), whose lowercase strings are the stable form for serial and JSON.
 static const char* dispVendorName(int8_t vendor) {
-  static const char* const names[2] = { "Flock", "Axon" };
-  if (vendor < 0 || vendor >= 2) return "--";
+  static const char* const names[4] = { "Flock", "Axon", "Axis", "Utility" };
+  if (vendor < 0 || vendor >= (int)(sizeof(names) / sizeof(names[0]))) return "--";
   return names[vendor];
 }
 
 // '~' is part of the value: the number is a coarse guess, not a measurement.
 // Clamps past 999m rather than widening the row.
+// A negative distance is specifically an addr1 hit, not a missing reading.
+// Spec S3.
 static void dispFormatDist(float m, char* buf, size_t len) {
-  if (m < 0.0f)        snprintf(buf, len, "--");
+  if (m < 0.0f)        snprintf(buf, len, "via AP");
   else if (m >= 999.0f) snprintf(buf, len, ">999m");
   else if (m < 10.0f)   snprintf(buf, len, "~%.1fm", m);
   else                  snprintf(buf, len, "~%.0fm", m);
@@ -118,22 +120,43 @@ static void drawGpsDetail() {
 #endif
 }
 
+// Abbreviates a frame count so two fit one 128px row. These answer zero /
+// trickle / thousands, so trailing digits buy nothing.
+static const char* shortCount(uint32_t v, char* buf, size_t cap) {
+  if      (v < 10000)   snprintf(buf, cap, "%u",  (unsigned)v);
+  else if (v < 1000000) snprintf(buf, cap, "%uk", (unsigned)(v / 1000));
+  else                  snprintf(buf, cap, "%uM", (unsigned)(v / 1000000));
+  return buf;
+}
+
 static void drawDetections() {
   char line[22];
   drawScreenHeader("DETECTIONS");
-  snprintf(line, sizeof(line), "count: %d", fyDetCount);
+  snprintf(line, sizeof(line), "devices: %d", fyDetCount);
   u8g2.drawStr(0, ROW1, line);
+  // Cameras, not frames, and overlapping: one seen both ways counts in each,
+  // so dir+ind can exceed the total above. Spec C1-C2. Always drawn.
+  snprintf(line, sizeof(line), "dir:%u ind:%u",
+           (unsigned)coreDirectDeviceCount(), (unsigned)coreIndirectDeviceCount());
+  u8g2.drawStr(0, ROW2, line);
   if (fyDetCount > 0) {
-    u8g2.drawStr(0, ROW2, "last MAC:");
     u8g2.drawStr(0, ROW3, dispMac);
   } else {
-    u8g2.drawStr(0, ROW2, "no detections yet");
+    u8g2.drawStr(0, ROW3, "no detections yet");
   }
-  // Only drawn once the table has actually overflowed, so the row costs nothing
-  // in the normal case. Without it, count: pins at MAX_DETECTIONS and reads as
-  // a quiet area rather than a full table.
+  // ROW4 is shared and the overflow warning wins it, spec S4: without that
+  // line devices: pins at MAX_DETECTIONS and reads as a quiet area.
   if (fyDroppedNew) {
     snprintf(line, sizeof(line), "FULL! missed:%u", (unsigned)fyDroppedNew);
+    u8g2.drawStr(0, ROW4, line);
+  } else {
+    // The one row not in device units, required by spec S2: these count all
+    // traffic, so seen: climbing with zero devices is a quiet area while
+    // seen: flat is a deaf radio.
+    char sn[10], cd[10];
+    snprintf(line, sizeof(line), "seen:%s cand:%s",
+             shortCount(coreSeenFrames, sn, sizeof(sn)),
+             shortCount(coreCandidateFrames, cd, sizeof(cd)));
     u8g2.drawStr(0, ROW4, line);
   }
 }
@@ -192,16 +215,31 @@ static void drawTargets() {
   if (coreMenuState == MENU_NONE) u8g2.drawStr(0, ROW4, "Select to change");
 }
 
-// Alerts menu. Two toggles (Buzzer mute/unmute, LED on/off). Select flips the
-// highlighted row in place (core toggles coreBuzzerEnabled / coreLedEnabled).
-// Rows show the CURRENT state so the toggle is unambiguous.
+// Alerts menu. Two toggles (Buzzer mute/unmute, LED on/off) plus the proximity
+// ring, which drills into a range picker the way Single → channel does. Rows
+// show the CURRENT state so a toggle is unambiguous.
 static void drawAlerts() {
   drawScreenHeader("ALERTS");
   char line[22];
-  const char* rows[2] = { "Buzzer", "LED" };
-  const char* vals[2] = { coreBuzzerEnabled ? "Unmuted" : "Muted",
-                          coreLedEnabled    ? "On"      : "Off" };
-  for (int i = 0; i < 2; i++) {
+  if (coreMenuState == MENU_PICK_PROX) {
+    u8g2.drawStr(0, ROW1, "Chirp at range:");
+    uint8_t m = (coreMenuSel >= 0 && coreMenuSel < PROX_RING_OPTION_COUNT)
+                  ? PROX_RING_OPTIONS[coreMenuSel] : 0;
+    if (m == 0) snprintf(line, sizeof(line), "  Off");
+    else        snprintf(line, sizeof(line), "  %um", (unsigned)m);
+    u8g2.drawStr(0, ROW2, line);
+    u8g2.drawStr(0, ROW3, "Up/Dn: change");
+    u8g2.drawStr(0, ROW4, "Sel: set  hold: back");
+    return;
+  }
+  char prox[10];
+  if (coreProxRingM == 0) snprintf(prox, sizeof(prox), "Off");
+  else                    snprintf(prox, sizeof(prox), "%um", (unsigned)coreProxRingM);
+  const char* rows[3] = { "Buzzer", "LED", "Prox" };
+  const char* vals[3] = { coreBuzzerEnabled ? "Unmuted" : "Muted",
+                          coreLedEnabled    ? "On"      : "Off",
+                          prox };
+  for (int i = 0; i < 3; i++) {
     char cursor = (coreMenuState == MENU_LIST && coreMenuSel == i) ? '>' : ' ';
     snprintf(line, sizeof(line), "%c%s: %s", cursor, rows[i], vals[i]);
     u8g2.drawStr(0, ROW1 + i * 12, line);

@@ -18,9 +18,9 @@ HEIGHT = 64
 
 # Output width in pixels; height follows the panel's 2:1 ratio. Keep this a
 # multiple of 128 so every source pixel maps to the same number of output
-# columns: 384 is a clean 3x, 512 a 4x. An off-multiple width such as 400 still
-# renders, but nearest-neighbour then gives some pixels 3 columns and others 4,
-# which shows up as uneven stroke weights in the text.
+# columns: 384 is a clean 3x, 512 a 4x. A non-multiple width still renders, but
+# nearest-neighbour then maps source pixels to differing column counts, which
+# shows up as uneven stroke weights in the text.
 OUT_WIDTH = 384
 
 

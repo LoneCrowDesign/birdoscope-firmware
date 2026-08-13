@@ -8,8 +8,8 @@ Upstream and prior-work attribution
 
 This firmware is a fork of, and builds on, the work of others. The detection
 engine and several core mechanisms are derived from upstream code and research;
-they retain their original names in the source as a provenance marker (see
-docs/attribution.md for the full map). Credit is due to:
+they retain their original names in the source as a provenance marker. Credit is
+due to:
 
   * colonelpanichacks — "flock-you" firmware (https://github.com/colonelpanichacks/flock-you)
       The firmware this project was forked from. The promiscuous-mode WiFi

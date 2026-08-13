@@ -4,7 +4,11 @@
 #
 # Renders the OLED screen carousel to PNGs on the host. No device needed.
 #
-#   ./tools/screen_render/render.sh [output-dir]
+#   ./tools/screen_render/render.sh <output-dir>
+#
+# The output directory is required rather than defaulted, because the run also
+# leaves .bin intermediates beside the PNGs and so must not be pointed at a
+# tracked directory by accident.
 #
 # u8g2's C sources come from the PlatformIO library dependency, so run a
 # `pio run` for any env at least once first to populate .pio/libdeps.
@@ -12,7 +16,11 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
-out="${1:-$root/working/images/carousel_demo}"
+if [ $# -lt 1 ]; then
+  echo "usage: $(basename "${BASH_SOURCE[0]}") <output-dir>" >&2
+  exit 2
+fi
+out="$1"
 
 u8g2=""
 for d in "$root"/.pio/libdeps/*/U8g2/src/clib; do

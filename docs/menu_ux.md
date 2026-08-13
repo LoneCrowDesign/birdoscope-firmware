@@ -30,7 +30,12 @@ read-only detail views and four are menus you drill into with Select.
 
    ![GPS screen](../assets/images/carousel_demo/02_gps.png)
 
-3. Detections: count and last detection MAC.
+3. Detections: device count, the direct and indirect device counts, the last
+   detection MAC, and a frame baseline. `dir` and `ind` count cameras rather
+   than frames and overlap, so one seen both ways counts in each and their sum
+   can exceed the total. The `seen`/`cand` row counts all traffic rather than
+   matches, which is what separates a quiet area from a deaf radio. See
+   [Detection methods](detection_methods.md).
 
    ![Detections screen](../assets/images/carousel_demo/03_detections.png)
 
@@ -47,7 +52,8 @@ read-only detail views and four are menus you drill into with Select.
 
    ![Targets screen](../assets/images/carousel_demo/13_targets.png)
 
-7. Alerts (menu): Buzzer Muted/Unmuted and LED On/Off, toggled in place.
+7. Alerts (menu): Buzzer Muted/Unmuted and LED On/Off toggled in place, plus the
+   proximity ring, which opens a range picker.
 
    ![Alerts screen](../assets/images/carousel_demo/08_alerts.png)
 
@@ -93,19 +99,29 @@ keep the logs and alerts from one drive attributable to a single vendor.
 
 ### Alerts menu
 
-Toggles the on-device alert feedback live, in RAM, with both defaulting to
-enabled on reboot, the same session-only convention as the scan mode.
+Sets the on-device alert feedback live. The two gates are session-only, both
+defaulting to enabled on reboot, the same convention as the scan mode. The
+proximity ring does persist: it is calibration-class, like the distance
+settings.
 
-Each row shows its current state. Select flips the highlighted row in place and
+Each row shows its current state. Select flips the highlighted gate in place and
 stays in the list, unlike the act-and-close Scan Mode and Web Config menus, so
-both rows can be set before long-Back pops out. The gates live in core
-(`coreBuzzerEnabled`, `coreLedEnabled`), so a board without the Alerts screen
-still honors them.
+both can be set before long-Back pops out. The state lives in core
+(`coreBuzzerEnabled`, `coreLedEnabled`, `coreProxRingM`), so a board without the
+Alerts screen still honors it.
 
-- **Buzzer, Unmuted or Muted**: gates the new-detection chirp. The boot jingle
-  and the on-demand `chirp` and `jingle` verbs are unaffected.
-- **LED, On or Off**: gates the detection and heartbeat LED flashes. The boot
-  RGB cycle and the SD-init blink are unaffected.
+- **Buzzer, Unmuted or Muted**: gates the new-detection and proximity chirps.
+  The boot jingle and the on-demand `chirp`, `prox` and `jingle` verbs are
+  unaffected.
+- **LED, On or Off**: gates the detection and proximity LED flashes. The boot
+  RGB cycle and the SD-init blink are unaffected. The heartbeat pulse does not
+  run on a board with a screen, so this menu never gates it.
+- **Prox, a range or Off**: opens a picker for the proximity ring (Off, 10 m,
+  25 m, 50 m, 100 m), the range at which a target already being tracked chirps
+  again as you close on it. Select applies and saves; long-Back leaves it
+  unchanged. See [Alert behavior](alerts.md).
+
+![Alerts menu, proximity picker](../assets/images/carousel_demo/15_alerts_prox.png)
 
 ### Web Config menu
 
@@ -145,7 +161,7 @@ One grammar applies at both levels: move, confirm, back. On the 3-button board:
 
 | Button | Gesture | Top level                                       | Inside a menu             |
 |--------|---------|-------------------------------------------------|---------------------------|
-| BTN_1  | short   | Up, advance to the next screen (1→2→…→8, wraps) | move highlight up         |
+| BTN_1  | short   | Up, advance to the next screen (wraps)          | move highlight up         |
 | BTN_1  | long    | Mark (area-of-interest)                         | Mark (area-of-interest)   |
 | BTN_2  | short   | Down, back a screen (wraps)                     | move highlight down       |
 | BTN_3  | short   | enter menu (menu screens only)                  | confirm selection         |
@@ -246,6 +262,7 @@ and every board's render code stay as they are.
 The current scheme is `NAV_SCHEME_3BTN`, three buttons distinguished by short
 and long press.
 
-Runtime settings, meaning the scan mode and the Single-mode channel, are
-session-only by design. The device always boots to the board defaults and
-nothing is persisted.
+The scan mode and the Single-mode channel are session-only by design. Both boot
+to the board defaults every time. The alert gates behave the same way. The
+proximity ring and the `calibrate` settings are calibration-class and do
+persist, as noted in the Alerts and Web Config sections above.

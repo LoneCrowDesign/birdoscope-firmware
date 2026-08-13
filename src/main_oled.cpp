@@ -22,6 +22,7 @@
 #include "board_config.h"
 #include "core.h"
 #include "web_portal.h"
+#include "roost_session.h"
 
 static void stopSniffing(const char* reason) {
   if (sniffingStopped) return;
@@ -67,7 +68,8 @@ static int8_t dispRssi     = 0;
 static uint8_t dispCh      = 0;
 static int8_t dispVendor   = -1;   // Vendor enum value, or -1 for no match
 // Metres, straight from CoreAlertResult::distM so the panel and logs agree. -1
-// renders "--". Cached, so recalibrating shows on the next detection.
+// renders "via AP", spec S3. Cached, so recalibrating shows on the next
+// detection.
 static float  dispDistM    = -1.0f;
 static bool   dispDirty    = false;
 static unsigned long dispLastRefresh = 0;
@@ -168,6 +170,14 @@ static void displayInit() {
   u8g2.clearBuffer();
   u8g2.drawStr(0, 12, "birdoscope");
   u8g2.drawStr(0, 28, "starting...");
+  // On the splash rather than a carousel row: wanted when confirming a flash,
+  // not while scanning. Also on the serial banner and in `status`.
+  {
+    char line[22];
+    snprintf(line, sizeof(line), "v%s %s", BIRDOSCOPE_VERSION, coreBuildRev());
+    u8g2.drawStr(0, 44, line);
+    u8g2.drawStr(0, 58, BIRDOSCOPE_GIT_DATE);
+  }
   u8g2.sendBuffer();
 }
 
@@ -250,7 +260,7 @@ static void displayTick() {
 static void triggerManualAlert() {
   fyLastTargetSeen = millis();
 #if USE_SD
-  sdAppendRow("", "MANUALALERT", "manual", 0, currentChannel, "", "", -1.0f);
+  roostLogOperatorMark();
 #endif
   dualPrintln("[bscope] MANUAL ALERT logged (area of interest)");
 #if NAV_SCHEME_3BTN
@@ -308,18 +318,37 @@ static void printStatus() {
   unsigned long ms = millis();
   unsigned long s  = ms / 1000;
   dualPrintf("[bscope] status: uptime=%lus ch=%u mode=%s det=%d spiffs=%d"
-             " heap=%u psram=%u sniffing=%d\n",
+             " heap=%u psram=%u sniffing=%d direct=%u indirect=%u"
+             " seen=%u cand=%u qdrop=%u\n",
              s, currentChannel, channelModeName(), fyDetCount,
              fySpiffsReady ? 1 : 0,
              (unsigned)ESP.getFreeHeap(),
              (unsigned)ESP.getFreePsram(),
-             sniffingStopped ? 0 : 1);
+             sniffingStopped ? 0 : 1,
+             (unsigned)coreDirectFrames, (unsigned)coreIndirectFrames,
+             (unsigned)coreSeenFrames, (unsigned)coreCandidateFrames,
+             (unsigned)coreQueueDrops);
+  // From the roost writer, the same source the serial heartbeat reads.
+  uint32_t rw = 0, rd = 0, wf = 0, fx = 0;
+  roostSessionStats(&rw, &rd, &wf, &fx);
+  dualPrintf("[bscope] load: qmax=%u/%u qdrop=%u rows=%u fixes=%u dropped=%u"
+             " worst_flush=%ums session=%s\n",
+             (unsigned)coreQueueDepthMax, (unsigned)coreAlertQueueSize(),
+             (unsigned)coreQueueDrops,
+             (unsigned)rw, (unsigned)fx, (unsigned)rd, (unsigned)wf,
+             roostSessionOpen() ? roostSessionDir() : "none");
+  dualPrintf("[bscope] build: %s\n", coreBuildIdentity());
 }
 
-// Injects a synthetic addr2 detection through the same alert queue the real
+// Injects a synthetic detection through the same alert queue the real
 // promiscuous callback feeds, so the display, SD, SPIFFS, and JSON path can
 // run without a live camera nearby. Sweeps RSSI across successive calls.
-static void injectTestDetection() {
+//
+// `indirect` builds an addr1 hit instead, carrying a synthetic AP as mac2. It
+// is the only way to reach the addr1 branches without a camera in range: those
+// carry no scanner-to-camera RSSI, so they are what spec A2, C1 and S3 change
+// the behaviour of.
+static void injectTestDetection(bool indirect) {
   static const int8_t sweep[] = { -30, -45, -60, -75, -95 };
   static size_t sweepIdx = 0;
   int8_t rssi = sweep[sweepIdx];
@@ -327,16 +356,32 @@ static void injectTestDetection() {
 
   uint8_t targetOui[3];
   coreGetFirstTargetOui(targetOui);
-  uint8_t fakeMac[6] = { targetOui[0], targetOui[1], targetOui[2], 0xAA, 0xBB, 0xCC };
-  enqueueAlert(ALERT_OUI_ADDR2, fakeMac, nullptr, rssi, currentChannel,
-               nullptr, "test", "test_inject");
-  dualPrintf("[bscope] injected test detection rssi=%d\n", (int)rssi);
+  // A distinct last byte per direction, so an indirect inject lands on its own
+  // row instead of adding a direction to the direct one.
+  uint8_t fakeMac[6] = { targetOui[0], targetOui[1], targetOui[2],
+                         0xAA, 0xBB, (uint8_t)(indirect ? 0xCD : 0xCC) };
+  // Locally administered, and not a target prefix: an AP MAC that cannot
+  // itself match, which is what a real addr1 hit looks like.
+  uint8_t fakeAp[6] = { 0x02, 0x00, 0x5E, 0x11, 0x22, 0x33 };
+  // Addresses by position, as a real frame would carry them: on an indirect
+  // hit the target is the receiver and the AP transmitted.
+  FrameMeta fm = {};
+  if (indirect) { memcpy(fm.addr1, fakeMac, 6); memcpy(fm.addr2, fakeAp, 6); }
+  else          { memcpy(fm.addr2, fakeMac, 6); }
+  memcpy(fm.addr3, fakeAp, 6);
+  fm.frameLen = 128;
+  strcpy(fm.bbFormat, "11g");
+  enqueueAlert(indirect ? ALERT_OUI_ADDR1 : ALERT_OUI_ADDR2,
+               fakeMac, &fm, rssi, currentChannel,
+               nullptr, indirect ? "addr1" : "test", "probe_req");
+  dualPrintf("[bscope] injected %s test detection rssi=%d\n",
+             indirect ? "indirect" : "direct", (int)rssi);
 }
 
 static void printSerialHelp() {
   dualPrintln("[bscope] serial commands (word-based, newline-terminated):");
   dualPrintln("  status            print status");
-  dualPrintln("  inject            inject test detection");
+  dualPrintln("  inject [addr1]    inject a test detection, direct or indirect");
   corePrintSerialHelp();   // core-owned: dump/prev/nav (+ chirp/jingle on buzzer boards)
   dualPrintln("  help              this help (also '?')");
 }
@@ -347,7 +392,7 @@ static void checkSerialCommands() {
   while (coreReadSerialCommand(&verb, &arg)) {
     if (coreHandleSerialCommand(verb, arg)) continue;
     if      (!strcmp(verb, "status")) printStatus();
-    else if (!strcmp(verb, "inject")) injectTestDetection();
+    else if (!strcmp(verb, "inject")) injectTestDetection(arg && !strcmp(arg, "addr1"));
     else if (!strcmp(verb, "help") || !strcmp(verb, "?")) printSerialHelp();
     else if (verb[0]) dualPrintf("[bscope] unknown command: %s (try 'help')\n", verb);
     // blank line silently ignored
@@ -379,6 +424,10 @@ void setup() {
   digitalWrite(BUZZER_PIN, LOW);
 #endif
 
+  // First line of the session's serial log, so a capture carries the build
+  // that made it.
+  dualPrintf("[bscope] %s\n", coreBuildIdentity());
+
   displayInit();
   coreNotifyBoot();    // startup tune + RGB sanity cycle (no-op unless USE_LED/USE_BUZZER)
 
@@ -406,12 +455,15 @@ void setup() {
 #if USE_SD
   // micro SD on SPI2 via SD_SCK/MOSI/MISO/CS_PIN. Non-fatal if absent.
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-  if (SD.begin(SD_CS_PIN)) {
+  // Frequency and mountpoint are the Arduino defaults, restated only because
+  // SD_MAX_OPEN_FILES is positional.
+  if (SD.begin(SD_CS_PIN, SPI, 4000000, "/sd", SD_MAX_OPEN_FILES)) {
     fySDReady = true;
     dualPrintln("[bscope] SD card ready");
-    sdSetup();
-    sdTryNameLog();   // name the log now if time is already anchored (NTP path).
-                      // On the GPS path this no-ops and gpsTick() names it later
+    roostSessionBegin();
+    roostSessionAnchor();   // name the session now if time already anchored (NTP
+                            // path). On the GPS path this no-ops and gpsTick()
+                            // names it once the clock locks.
   } else {
     // No card, which is non-fatal: fall back to onboard SPIFFS. Signal it visibly
     // (5 blue LED flashes + on-screen notice) since boot otherwise looks
@@ -469,13 +521,14 @@ void loop() {
   }
 
   coreTick();           // drain GPS UART bytes into parser, update fix state
+  roostSessionTick();   // manifest snapshot, so a power cut still leaves counters
   updateChannelMode();
   checkSerialCommands();
   if (checkInput()) return;   // Config menu → Admin: portal serviced next loop
   drainAlertQueue();
   displayTick();        // refresh OLED after any queue drain
   autosaveTick();       // periodic SPIFFS write if dirty
-  coreNotifyTick();     // audible heartbeat while a target is in range + LED off-timer
+  coreNotifyTick();     // LED off-timer (heartbeat pulse retired, spec A1)
   printHeartbeat();
   delay(1);
 }

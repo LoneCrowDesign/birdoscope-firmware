@@ -24,7 +24,7 @@
 #define BUZZER_PIN      4
 #define USE_BUZZER 1
 
-// External NeoPixel on a free GPIO since the V4 carries no onboard RGB LED.
+// External NeoPixel. Pin UNVERIFIED.
 #define LED_PIN         41
 #define USE_LED          1
 #define LED_FLASH_MS     120
@@ -45,26 +45,25 @@
 #define LED_COLOR_BOOT_G 255
 #define LED_COLOR_BOOT_B 255
 
-// GPS: Quectel L76 over UART (Serial2), receiving NMEA only. TX is wired but
-// stays unused until config commands are needed. HAS_GPS=1 is safe with no
-// module fitted, because the time chain falls back when no fix arrives. Set to
-// 0 if your board does not have a GPS module
+// GPS over UART, NMEA in. HAS_GPS=1 is safe with no module fitted: the time
+// chain falls back when no fix arrives. Set 0 if no GPS module is present.
+// All GPS pins and control lines below are UNVERIFIED on this board.
 #define HAS_GPS         1
-#define GPS_RX_PIN      44   // ESP RX  ← L76 TXD
-#define GPS_TX_PIN      43   // ESP TX  → L76 RXD
-#define GPS_RST_PIN      42   // GNSS_RST, active LOW, must be driven HIGH
-#define GPS_WAKEUP_PIN   40   // GNSS_Wakeup
-#define GPS_VGNSS_CTRL   34   // GNSS power enable, active LOW (same as VEXT_CTRL)
+#define GPS_RX_PIN      44
+#define GPS_TX_PIN      43
+#define GPS_RST_PIN      42
+#define GPS_WAKEUP_PIN   40
+#define GPS_VGNSS_CTRL   34
 #define GPS_BAUD         9600
 #define GPS_FIX_MAX_AGE_MS 5000
 
-// Built-in SSD1315 OLED on GPIO17/18 I2C with GPIO21 reset. This board leaves
-// no hardware I2C bus free, so OLED_HW_I2C=0 selects a software I2C driver.
+// External I2C OLED on the pins below, hardware I2C. Pins UNVERIFIED.
 #define OLED_SDA        5
 #define OLED_SCL        6
 #define OLED_RST  21
 #define OLED_HW_I2C     1
-// Vext (GPIO36) is active-LOW and drives the OLED power rail
+// UNVERIFIED: the preamble records no Vext rail on this board, so this define
+// is inherited and may not apply.
 #define VEXT_CTRL 36
 
 // No buttons on this board.
@@ -73,17 +72,15 @@
 // BOOT (GPIO0) drives the Admin-mode trigger. See core.h.
 #define BOOT_BTN_PIN 0
 
-// micro SD card on SPI2 (HSPI). The V4 has no onboard slot, so these are the
-// pins this build drives. Wire the card to match, or change them here. CS is
-// the only required define, and MOSI/MISO/SCK can be remapped via SPI.begin().
+// micro SD on SPI. Wire the card to the pins below, or change them here. CS is
+// the only required define; MOSI/MISO/SCK can be remapped via SPI.begin().
+// Pins UNVERIFIED.
 #define USE_SD        1
 #define SD_SELFTEST   0   // set 1 to run wiring verification at boot (independent of USE_SD)
 #define SD_CS_PIN       42
 #define SD_MOSI_PIN     9
 #define SD_MISO_PIN     8
-#define SD_SCK_PIN      7   // GPIO46 is a strapping pin (ROM log enable), but SCK is
-                           // ESP32-driven so the line floats low at boot, which is
-                           // benign. GPIO45 (VDD_SPI) would be worse.
+#define SD_SCK_PIN      7
 
 #define MIRROR_SERIAL   0
 #define MIRROR_TX_PIN    43
@@ -94,8 +91,7 @@
 #define CHANNEL_MODE_SINGLE     2
 
 #define CHANNEL_MODE CHANNEL_MODE_CUSTOM
-// 250ms gives two full 125ms frame-burst windows per visit while keeping the
-// rotation short: 3 channels in 0.75s on Custom, 11 in 2.75s on Full Hop.
+// Dwell must cover at least two of a target's frame-burst windows per visit.
 #define CHANNEL_DWELL_MS 250
 #define SINGLE_CHANNEL 1
 
@@ -114,10 +110,9 @@ static const size_t  fullHopChannelCount = sizeof(fullHopChannels) / sizeof(full
 // (seen within HB_DEVICE_ACTIVE_MS).
 #define HB_DEVICE_ACTIVE_MS    3000
 #define HB_BEEP_INTERVAL_MS    10000
-// A MAC unheard for REDISCOVER_MS counts as a fresh discovery next time it
-// appears, firing the ascending chirp again. Shorter than a Flock's burst-sleep
-// gap would mean false chirps, longer would miss a drive-away and return.
-// 30s sits between the two.
+// A MAC unheard for REDISCOVER_MS counts as a fresh discovery, re-firing the
+// chirp. Set between the target's transmit-burst gap and the time a device
+// would take to leave and return.
 #define REDISCOVER_MS          30000
 #define NEW_CHIRP_LO_HZ        2000
 #define NEW_CHIRP_HI_HZ        2800

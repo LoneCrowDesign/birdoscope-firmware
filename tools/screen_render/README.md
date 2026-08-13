@@ -3,12 +3,15 @@
 Renders the OLED screen carousel to PNGs on the host, with no device attached.
 
 ```
-./tools/screen_render/render.sh [output-dir]
+./tools/screen_render/render.sh <output-dir>
 ```
 
-Default output is `working/images/carousel_demo`. Requires `gcc`, `g++`,
-`python3` with Pillow, and a populated `.pio/libdeps` (run `pio run -e <env>`
-once to fetch u8g2).
+The output directory is required. The run leaves `.bin` intermediates beside the
+PNGs, so point it at a scratch directory rather than at
+`assets/images/carousel_demo`, and copy the PNGs across once they look right.
+
+Requires `gcc`, `g++`, `python3` with Pillow, and a populated `.pio/libdeps`
+(run `pio run -e <env>` once to fetch u8g2).
 
 ## How it works
 
@@ -17,7 +20,8 @@ compiles it against u8g2's plain-C sources built natively. It supplies stubs for
 everything the firmware would otherwise provide: the `u8g2` object, display
 state, core's screen and menu state, and the board macros. u8g2 does no I/O, so
 each frame is read straight out of the display buffer and handed to `to_png.py`,
-which maps the page-major buffer to pixels and upscales 6x.
+which maps the page-major buffer to pixels and upscales it (see `OUT_WIDTH` in
+`to_png.py`).
 
 Sharing the draw code is the point: a rendered frame cannot drift from what the
 panel shows.

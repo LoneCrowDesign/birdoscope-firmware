@@ -1,0 +1,3 @@
+[submodule "vendor/jellybeans"]
+	path = vendor/jellybeans
+	url = https://github.com/LoneCrowDesign/jellybeans.git

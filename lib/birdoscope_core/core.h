@@ -18,6 +18,82 @@
 #define BIRDOSCOPE_VERSION "0.1.0"
 #endif
 
+// ============================================================
+// BUILD IDENTITY: which commit this binary was built from, since the semantic
+// version above is bumped by hand and says nothing about what is on a device
+// between releases. Stamped by tools/git_version.py, wired in from [common] in
+// platformio.ini. A dirty tree reports a `-dirty` suffix and a build with no
+// git reports "unknown". See the README.
+// ============================================================
+
+#ifndef BIRDOSCOPE_GIT_REV
+#define BIRDOSCOPE_GIT_REV "unknown"
+#endif
+#ifndef BIRDOSCOPE_GIT_DATE
+#define BIRDOSCOPE_GIT_DATE "unknown"
+#endif
+#ifndef BIRDOSCOPE_BUILD_TS
+#define BIRDOSCOPE_BUILD_TS "unknown"
+#endif
+
+// One line naming version, commit and build time. Static storage.
+const char* coreBuildIdentity();
+
+// Just the git rev, for a display row with no space for the rest.
+const char* coreBuildRev();
+
+// ============================================================
+// DETECTION TALLIES: matching frames handled, split by whether the target
+// itself transmitted (direct) or an AP answered its probe (indirect, the
+// addr1 hits that read `dst:via AP`). Frames, not chirps and not devices,
+// incremented ahead of the repeat-suppression gate and independent of every
+// alert setting, so they say whether the detection path is alive on a drive
+// that produced few alerts. Both saturate at 0xFFFF. See
+// docs/detection_methods.md.
+// ============================================================
+
+extern uint16_t coreDirectFrames;
+extern uint16_t coreIndirectFrames;
+
+// Cameras observed each way, in devices rather than frames, spec C1-C3. Not
+// exclusive: a camera seen both ways counts in both, so the sum can exceed
+// fyDetCount. Both walk the table, so call per display refresh, not per frame.
+uint16_t coreDirectDeviceCount();
+uint16_t coreIndirectDeviceCount();
+
+// ============================================================
+// RAW SNIFFER COUNTERS: count non-matching traffic too, so they distinguish a
+// dead radio from a quiet one where the tallies above cannot. coreSeenFrames is
+// everything the driver hands up; coreCandidateFrames is what survives the
+// type, length and RSSI_MIN guards. Spec S2. Written from the promiscuous
+// callback and read from loop(), hence volatile, and allowed to wrap.
+// ============================================================
+
+extern volatile uint32_t coreSeenFrames;
+extern volatile uint32_t coreCandidateFrames;
+
+// Management frames by subtype, indexed by the 802.11 subtype nibble (4 is a
+// probe request, 5 a probe response, 8 a beacon). `Seen` counts every one the
+// driver delivered, ahead of the RSSI gate; `Matched` counts those whose addr2
+// carried a target OUI. Every other counter in this firmware records a match,
+// so a subtype that never arrives and one that arrives and is never matched
+// are indistinguishable without these two.
+#define CORE_MGMT_SUBTYPE_COUNT 16
+extern volatile uint32_t coreMgmtSeen[CORE_MGMT_SUBTYPE_COUNT];
+extern volatile uint32_t coreMgmtMatched[CORE_MGMT_SUBTYPE_COUNT];
+
+// Matched frames the alert queue had no room for, so they never reached the
+// log. Non-zero means the capture is incomplete by this much.
+extern volatile uint32_t coreQueueDrops;
+
+// Load baselines for sizing the roost queue and flush policy against measured
+// behaviour rather than an estimate. See docs/roost_logging.md, "Capture
+// performance baselines". coreQueueDepthMax is the deepest the alert ring has
+// been; write and flush figures come from the roost writer via
+// roostSessionStats().
+extern volatile uint8_t  coreQueueDepthMax;
+uint8_t coreAlertQueueSize();   // denominator for coreQueueDepthMax
+
 // board_config.h must already be included before this header (both
 // main_*.cpp do `#include "board_config.h"` then `#include "core.h"`).
 // These guards keep core.h safe to parse standalone, for IDE tooling.
@@ -30,6 +106,36 @@
 #ifndef HAS_BUTTONS
 #define HAS_BUTTONS 0
 #endif
+// The Arduino SD default. A board holding more files open than this must raise
+// it in its own config; a roost session needs six.
+#ifndef SD_MAX_OPEN_FILES
+#define SD_MAX_OPEN_FILES 5
+#endif
+
+// The fleet logging contract, pulled in after the board's capability and
+// component declarations. Not optional and not guarded: a board that has not
+// declared them fails to build here, which is the point.
+#include "roost_registry.h"
+// The fleet's buffered session writer. Header-only and platform-free; the
+// Arduino SD backend is supplied in core.cpp.
+#include "roost_sdlog.h"
+// The fleet's manifest renderer, on the same terms: it produces bytes and this
+// device decides where they go. No key name, timestamp format or counter is
+// spelled per device.
+#include "roost_manifest.h"
+// The clock anchor arithmetic, including the pre-anchor case that must not be
+// computed at all. See roost_time.h.
+#include "roost_time.h"
+// The fleet's 802.11 management-body walker. Parsing bytes off the air with
+// pointer arithmetic is the code that must not live only on a device, so it is
+// here and host-tested rather than reimplemented per board.
+#include "roost_ie.h"
+// The channel-to-band derivation. `band` is a computed column, so the fleet has
+// one computation of it rather than a range test per device. See spec 3.1.
+#include "roost_channel.h"
+// The `list` and `map` value encodings. A registry key's declared type fixes
+// its rendering, so the device builds values here rather than joining its own.
+#include "roost_value.h"
 // GPIO for the BOOT button used by the Admin-mode trigger. GPIO0, the
 // strapping/BOOT button, on every current board. Override per board.
 #ifndef BOOT_BTN_PIN
@@ -47,18 +153,84 @@ typedef enum : uint8_t {
   ALERT_OUI_ADDR3       = 2,
   ALERT_SSID            = 3,   // only ever enqueued when ENABLE_SSID_MATCH=1
   ALERT_WILDCARD_PROBE  = 4,
+  // A probe request from a target OUI carrying a non-empty SSID. Direct, like
+  // every type but ALERT_OUI_ADDR1, and split from ALERT_OUI_ADDR2 so the
+  // probed name survives to the log.
+  ALERT_DIRECTED_PROBE  = 5,
 } AlertType;
+
+// Frame facts recorded by POSITION, never by role. A role name varies per
+// frame, so it cannot be a column; the pipeline derives roles from type and
+// subtype. Filled in the promiscuous callback, where the frame still exists.
+typedef struct {
+  uint8_t  addr1[6], addr2[6], addr3[6];
+  uint16_t seq;
+  uint16_t fcFlags;
+  uint16_t frameLen;
+  char     bbFormat[8];   // a roost bb_format value, or empty
+} FrameMeta;
 
 typedef struct {
   AlertType type;
-  uint8_t   mac[6];
-  uint8_t   mac2[6];    // addr2 for ALERT_OUI_ADDR1: AP that sent the probe response; zeros otherwise
+  uint8_t   mac[6];       // the matched device
+  uint8_t   addr1[6], addr2[6], addr3[6];
+  uint16_t  seq;
+  uint16_t  fcFlags;
+  uint16_t  frameLen;
+  // When the frame was received, not when the row was written. The queue is
+  // drained from loop() and can run arbitrarily far behind under load.
+  uint32_t  uptimeMs;
   int8_t    rssi;
   uint8_t   channel;
-  char      ssid[33];
+  char      bbFormat[8];
+  // The walker's result carried whole, not a bare string: an SSID is arbitrary
+  // octets, so its length and whether the element was there at all cannot be
+  // recovered from the bytes. See RoostSsid in roost_ie.h.
+  RoostSsid ssid;
   char      frameKind[12];
   char      frameSubtype[16];
 } AlertEntry;
+
+// One GPS fix, flattened out of TinyGPS++ so the session writer needs no
+// parser. Each `has*` is false when the module did not report the field, which
+// keeps its column empty rather than carrying a zero.
+typedef struct {
+  bool   valid;
+  double lat, lon;
+  float  altM, speedMps, courseDeg, hdop;
+  uint8_t sats;
+  uint32_t ageMs;
+  bool   hasAlt, hasSpeed, hasCourse, hasHdop, hasSats;
+  const char* source;    // a roost position_source value
+  const char* fixType;   // a roost fix_type value
+} CoreGpsFix;
+void coreGpsFix(CoreGpsFix* out);
+
+// Clock anchor triple for the manifest. Returns a roost clock_source value and
+// fills the pair that makes every pre-anchor row retroactively placeable as
+// anchor_unix + (uptime_ms - anchor_uptime_ms).
+const char* coreClockAnchor(uint32_t* anchorUnix, uint32_t* anchorUptimeMs);
+void coreUnixToIso(uint32_t unix, char* buf, size_t len);
+// ISO-8601 for a row observed at `uptimeMs`. False when the clock has never
+// anchored, in which case the column is left empty rather than filled.
+bool coreTimestampAt(uint32_t uptimeMs, char* buf, size_t len);
+
+// Session identity and provenance for the manifest.
+// Fills buf with the next free /bscope-M-D-YY-N. False when the day's 99
+// names are all taken: the session then keeps its boot name rather than
+// being renamed onto an existing directory.
+bool     coreSessionDirName(char* buf, size_t len);
+uint32_t coreSessionSequence();
+uint32_t coreBootCount();
+uint32_t coreOuiTableHash();     // captures either side of a table change are not comparable
+const char* coreDeviceSerial();
+const char* coreOwnMac();
+const char* coreCountryCode();
+// Both render a registry `list` for config_change and return false when the
+// value did not fit, which the caller must not confuse with an empty value.
+bool coreChannelListRoost(char* buf, size_t len);
+bool coreVendorMaskStr(char* buf, size_t len);
+void coreChannelListJson(char* buf, size_t len);
 
 // Result of coreHandleAlert(). Carries everything a board needs to update its own
 // display state and fire board-specific feedback (LED/buzzer/chirp), without
@@ -93,12 +265,15 @@ void dualPrintln(const char* str);
 // reports which vendor hit rather than a bare yes/no. `coreVendorMask` selects
 // which vendors the matcher accepts, one bit per Vendor, and is what the
 // Targets menu switches. A single aligned byte store is atomic on Xtensa, so it
-// can change live without stopping the sniffer.
+// can change live without stopping the sniffer. VENDOR_COUNT must stay <= 8:
+// coreVendorMask is one byte.
 // ============================================================
 
 typedef enum : uint8_t {
-  VENDOR_FLOCK = 0,
-  VENDOR_AXON  = 1,
+  VENDOR_FLOCK   = 0,
+  VENDOR_AXON    = 1,
+  VENDOR_AXIS    = 2,
+  VENDOR_UTILITY = 3,
   VENDOR_COUNT
 } Vendor;
 
@@ -113,10 +288,11 @@ void coreSetVendorMask(uint8_t mask);
 
 // Active target set as the Targets menu's list index: 0=Flock, 1=Axon, 2=All.
 // Returns -1 for any other mask, so the menu shows no active marker rather than
-// mislabelling a combination it has no row for.
+// mislabelling a combination it has no row for. Axis and Utility have no row of
+// their own and are reachable only through All, which is the boot default.
 int coreTargetIndex();
 
-// "flock" / "axon" / "unknown". Stable strings, safe to log.
+// Lowercase vendor slug, or "unknown". Stable strings, safe to log.
 const char* vendorName(uint8_t vendor);
 
 // ============================================================
@@ -221,9 +397,10 @@ extern volatile bool sniffingStopped;
 
 // Exposed for the board `inject` command, which pushes a synthetic alert
 // through the real queue.
+// `fm` may be null, for a synthesised alert with no frame behind it.
 void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t* mac,
-                             const uint8_t* mac2, int8_t rssi, uint8_t ch,
-                             const char* ssid, const char* kind,
+                             const FrameMeta* fm, int8_t rssi, uint8_t ch,
+                             const RoostSsid* ssid, const char* kind,
                              const char* fsubtype);
 
 // ============================================================
@@ -257,13 +434,6 @@ extern bool fySpiffsReady;
 
 #if USE_SD
 #include <SD.h>
-void sdSetup();
-void sdTryNameLog();
-// Exposed for board-specific manual-log rows, such as the MANUALALERT marker,
-// that bypass the detection table.
-void sdAppendRow(const char* mac, const char* method, const char* frameSubtype,
-                  int8_t rssi, uint8_t channel, const char* ssid,
-                  const char* apMac, float distM = -1.0f);
 extern bool fySDReady;
 extern File sdLog;
 #endif
@@ -360,8 +530,8 @@ void corePrintSerialHelp();
 // NOTIFICATIONS: LED (NeoPixel) and buzzer feedback, gated on USE_LED/
 // USE_BUZZER. coreHandleAlert() calls the detection half internally, so boards
 // only need coreNotifyBoot() (once in setup(), after display init) and
-// coreNotifyTick() (once per loop(), turns off the LED after LED_FLASH_MS
-// and plays the audible heartbeat while a target is still in range).
+// coreNotifyTick() (once per loop(), turns off the LED after LED_FLASH_MS).
+// The in-range heartbeat pulse is retained in core.cpp but uncalled, spec A1.
 // ============================================================
 
 void coreNotifyBoot();
@@ -370,7 +540,7 @@ void coreNotifyTick();
 // Runtime alert gates, toggled live from the on-device Alerts menu (SCREEN_
 // ALERTS). Session-only, enabled by default every boot and not persisted, which
 // matches the runtime scan mode. coreBuzzerEnabled gates the new-detection
-// chirp and coreLedEnabled gates the detection and heartbeat LED flashes. The
+// chirp and coreLedEnabled gates the detection LED flashes. The
 // boot jingle, RGB cycle, and the chirp/jingle hooks all run unconditionally.
 // Boards may also read these to render the current state.
 extern bool coreBuzzerEnabled;
@@ -389,6 +559,29 @@ void coreLedBlink(uint8_t r, uint8_t g, uint8_t b,
 // board with no buzzer, gated on USE_BUZZER inside.
 void corePlayDetectChirp();
 void corePlayStartupJingle();
+void corePlayProximityChirp();
+
+// ============================================================
+// PROXIMITY ALERT: a second chirp when a tracked target crosses inside a range
+// ring, since the new-detection chirp fires once per MAC per REDISCOVER_MS and
+// reads no RSSI. The ring is in metres rather than dBm, so `rssi_trim` stays
+// the one calibration loop for both it and the `dst:` readout. Per-MAC state is
+// a smoothed RSSI and a latch that clears only outside PROX_HYST_PCT of the
+// ring. Adds a sound, never a log row. See docs/alerts.md.
+// ============================================================
+
+// Selectable rings, in metres. 0 is off. Order is the picker's row order.
+#define PROX_RING_OPTION_COUNT 5
+extern const uint8_t PROX_RING_OPTIONS[PROX_RING_OPTION_COUNT];
+
+// Active ring in metres, 0 when off. Persisted as {"prox_m":N}. Set through
+// coreSetProxRingM(), which also clears every latch.
+extern volatile uint8_t coreProxRingM;
+void coreSetProxRingM(uint8_t metres);
+
+// Index into PROX_RING_OPTIONS for the active ring, or -1 when it matches no
+// row.
+int coreProxRingIndex();
 
 // ============================================================
 // INPUT: plain debounced buttons. Gated on HAS_BUTTONS, and always returns
@@ -481,14 +674,15 @@ typedef enum {
 // coreCurrentScreen and returns the side effect (if any) for the board to run.
 NavAction coreNavApply(NavEvent ev);
 
-// Menu drill-in state for the two menu screens (SCAN_MODES / CONFIG):
+// Menu drill-in state for the menu screens (SCAN_MODES / ALERTS / CONFIG):
 //   MENU_NONE          browsing the carousel, where Up/Down move screens
 //   MENU_LIST          an option list is open, coreMenuSel = highlighted index
 //   MENU_PICK_CHANNEL  Single-mode channel picker, coreMenuSel = channel dialed
+//   MENU_PICK_PROX     proximity-ring picker, coreMenuSel = PROX_RING_OPTIONS index
 // Boards read these to render the cursor and edit state. While the state is not
 // MENU_NONE the carousel is frozen, with Up/Down moving the highlight instead,
 // and long-Back pops out.
-typedef enum { MENU_NONE, MENU_LIST, MENU_PICK_CHANNEL } MenuState;
+typedef enum { MENU_NONE, MENU_LIST, MENU_PICK_CHANNEL, MENU_PICK_PROX } MenuState;
 extern MenuState coreMenuState;
 extern int       coreMenuSel;
 

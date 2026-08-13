@@ -134,3 +134,29 @@ static const size_t  fullHopChannelCount = sizeof(fullHopChannels) / sizeof(full
 #define SD_LOG_FILE          "/log.csv"
 // Canonical post-anchor SD log filename: /bscope-M-D-YY-N.csv
 #define LOG_PREFIX            "bscope-"
+
+// ── Roost logging contract ─────────────────────────────────────────────────
+//
+// core.h includes the generated registry header, which hard-errors on any
+// capability or component left undeclared here. A capability answers what this
+// build can produce, never what the silicon could.
+// Rationale: vendor/jellybeans/roost_logging/registry/capabilities.toml.
+#define ROOST_CAP_GNSS             HAS_GPS
+#define ROOST_CAP_STORAGE          USE_SD
+#define ROOST_CAP_WIFI             1
+#define ROOST_CAP_WIFI_PROMISCUOUS 1
+#define ROOST_CAP_WIFI_SCAN        0
+#define ROOST_CAP_IE_PARSE         1
+#define ROOST_CAP_BLE              0
+#define ROOST_CAP_BLE_PROMISCUOUS  0
+#define ROOST_CAP_TARGET_MATCH     1
+#define ROOST_CAP_OPERATOR_MARK    HAS_BUTTONS
+
+#define ROOST_COMPONENTS(X)                                                    \
+  X(WIFI0, "wifi0", WIFI, "ESP32-S3", ROOST_BAND_REACH_2_4)                       \
+  X(GNSS0, "gnss0", GNSS, "ATGM336", 0)                                        \
+  X(SYS,   "sys",   SYSTEM, NULL, 0)
+
+// auth_mode has no producer in this build. Excluded rather than emitted empty,
+// so the manifest records that it is not captured. Migration S2.
+#define ROOST_WIFI_OBS_EXCLUDE (ROOST_F(ROOST_WIFI_OBS_AUTH_MODE))

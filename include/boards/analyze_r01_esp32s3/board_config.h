@@ -89,6 +89,14 @@
 // micro SD card on its own SPI bus.
 #define USE_SD        1
 #define SD_SELFTEST   0
+// VFS open-file limit, passed to SD.begin(). Two buffered files stay open,
+// wifi_obs and gps_track, plus one transient for the manifest or a
+// write-through record, and spares.
+//
+// Not a free number to raise. The VFS allocates per open file from internal
+// heap, and SD.open() throws std::bad_alloc rather than returning an error on a
+// toolchain built without exceptions, which aborts the firmware.
+#define SD_MAX_OPEN_FILES 6
 #define SD_CS_PIN     5
 #define SD_MOSI_PIN   11
 #define SD_MISO_PIN   13
@@ -109,14 +117,20 @@
 #define CHANNEL_DWELL_MS 250
 #define SINGLE_CHANNEL 1
 
-static const uint8_t customChannels[]  = {1, 6, 11};
+// Descending, counter-rotating against a station's usual ascending 1->11 scan
+// so the two sweeps cross rather than risk a stable unfavourable phase. Order
+// only, coverage and dwell are unchanged.
+static const uint8_t customChannels[]  = {11, 6, 1};
 static const size_t  customChannelCount = sizeof(customChannels) / sizeof(customChannels[0]);
 
 static const uint8_t fullHopChannels[] = {1,2,3,4,5,6,7,8,9,10,11};
 static const size_t  fullHopChannelCount = sizeof(fullHopChannels) / sizeof(fullHopChannels[0]);
 
 #define HEARTBEAT_MS    30000
-#define RSSI_MIN        -95
+// Set below the radio's usable floor on purpose: a threshold at the floor clips
+// the marginal tail of real detections. Costs additional noise frames.
+// See docs/detection_methods.md, receiver sensitivity floor.
+#define RSSI_MIN        -100
 #define ALERT_COOLDOWN_MS 5000
 
 #define HB_DEVICE_ACTIVE_MS    3000
@@ -137,6 +151,9 @@ static const size_t  fullHopChannelCount = sizeof(fullHopChannels) / sizeof(full
 #define HB_BEEP_NOTE_MS        70
 #define HB_BEEP_GAP_MS         70
 
+// Off: keyword matching needs names we have observed, and we have none. A
+// directed probe from a target OUI already logs its SSID without this (see
+// wifiSniffer), which is how the list would get populated.
 #define ENABLE_SSID_MATCH 0
 #define CHECK_ADDR1 1   // dst/rx, catches Flock STAs receiving probe responses
 #define CHECK_ADDR3 0   // bssid fallback for randomised addr2
@@ -145,6 +162,49 @@ static const size_t  fullHopChannelCount = sizeof(fullHopChannels) / sizeof(full
 #define STOP_ON_OUI_HIT  0
 #define PROCESS_MGMT_FRAMES 1
 #define PROCESS_DATA_FRAMES 1
+
+// ── Roost logging contract ─────────────────────────────────────────────────
+//
+// core.h includes the generated registry header, which hard-errors on any
+// capability or component left undeclared below. A capability answers what this
+// build can produce, never what the silicon could.
+// Rationale: vendor/jellybeans/roost_logging/registry/capabilities.toml.
+#define ROOST_CAP_GNSS             HAS_GPS
+#define ROOST_CAP_STORAGE          USE_SD
+#define ROOST_CAP_WIFI             1
+#define ROOST_CAP_WIFI_PROMISCUOUS 1
+#define ROOST_CAP_WIFI_SCAN        0
+#define ROOST_CAP_IE_PARSE         1
+#define ROOST_CAP_BLE              0
+#define ROOST_CAP_BLE_PROMISCUOUS  0
+#define ROOST_CAP_TARGET_MATCH     1
+#define ROOST_CAP_OPERATOR_MARK    HAS_BUTTONS
+
+// One entry per physical capture component; every row's cap_component names
+// one of these and the manifest is rendered from the list. `bands` is immutable
+// reach, not the channel plan in effect, and is what makes "no 5 GHz rows"
+// readable as a hardware limit rather than an absence of devices.
+#define ROOST_COMPONENTS(X)                                                    \
+  X(WIFI0, "wifi0", WIFI, "ESP32-S3", ROOST_BAND_REACH_2_4)                    \
+  X(GNSS0, "gnss0", GNSS, "ATGM336", 0)                                        \
+  X(SYS,   "sys",   SYSTEM, NULL, 0)
+
+// Reachable through ie_parse, no producer in this build. Declared here rather
+// than left empty, so the manifest reads "this build does not record it"
+// instead of "the radio had nothing to report" (spec 7.1). Migration S2.
+//
+// auth_mode: no RSN element parser exists in this build.
+//
+// The IE fingerprint four: the walker exists in roost_ie.h, but carrying its
+// output from the promiscuous callback to the queue drain widens every alert
+// entry, so it needs a queue-sizing decision first. Migration P5. Remove from
+// this list when the producers are wired.
+#define ROOST_WIFI_OBS_EXCLUDE          \
+  (ROOST_F(ROOST_WIFI_OBS_AUTH_MODE)    \
+   | ROOST_F(ROOST_WIFI_OBS_CAP_INFO)          \
+   | ROOST_F(ROOST_WIFI_OBS_BEACON_INTERVAL)   \
+   | ROOST_F(ROOST_WIFI_OBS_IE_IDS)            \
+   | ROOST_F(ROOST_WIFI_OBS_VENDOR_IES))
 
 // Persistence
 #define MAX_DETECTIONS       200

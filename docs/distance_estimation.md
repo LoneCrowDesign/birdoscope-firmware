@@ -64,3 +64,40 @@ Persisted to SPIFFS at `/settings.json` as `{"density":N,"rssi_1m":N}`, loaded b
 `RSSI_AT_1M` in `board_config.h` seeds the default reference, and `PATH_LOSS_N_LOW`, `PATH_LOSS_N_MED`, and `PATH_LOSS_N_HIGH` override the density presets. `PATH_LOSS_N_MED` defers to `PATH_LOSS_N`, so a board that already tuned that value keeps it.
 
 `main_tft.cpp` does not call `coreSettingsLoad()`, so saved settings are ignored on the round TFT board until that is backported. Core still computes the estimate there. See [Board parity](board_parity.md).
+
+### Invariants
+
+These constraints are not apparent from reading the surrounding code, and
+breaking any of them fails quietly rather than raising an error.
+
+1. **The enqueued address must be the address the sniffer matched.** The alert
+   handler re-runs the OUI match on that address to resolve the vendor, which
+   drives the LED colour. Enqueuing a different address than the one that
+   matched yields the wrong vendor with no error. Each detection method has one
+   correct address field, and an SSID match resolves no vendor at all, so it
+   falls back to the generic colour by design.
+
+2. **The density preset table is not interrupt-safe.** It carries no attribute
+   placing it in RAM, so it is safe only because nothing that reads it runs from
+   the sniffer interrupt. A flash read from interrupt context faults. Adding a
+   read of it to the sniffer path, directly or through a helper, is the way this
+   breaks.
+
+3. **Settings must be loaded from `setup()`.** There is no lazy read path. Skip
+   the load and the compiled-in defaults stand, which presents as a setting that
+   resets on every boot while saving and reading back correctly within one boot.
+
+4. **The blink train cannot block.** The multi-pulse pattern is stepped from the
+   LED tick rather than looped, because it runs in the alert drain path. A delay
+   loop there stalls packet handling for the length of the pattern.
+
+5. **Reference nudges must clamp in a wider type than they are stored in.**
+   Stepping a stored 8-bit value past its range wraps rather than saturating, so
+   a clamp applied after the wrap pins the value to the opposite end of the range
+   from the one intended.
+
+6. **Calibration relies on the console omitting untouched fields.** Blank inputs
+   are skipped, so an absent argument means unset. If that behaviour changes,
+   every submission arrives with both numbers at zero: setting only the density
+   would drive the reference to its floor, and the report-only branch would stop
+   firing.
