@@ -99,7 +99,7 @@ static void openSession(void) {
   roostSdInit(&g_log, &kIo);
   roostSdAttachBuffer(&g_log, ROOST_REC_WIFI_OBS,  g_bufWifi,  sizeof(g_bufWifi));
   roostSdAttachBuffer(&g_log, ROOST_REC_GPS_TRACK, g_bufTrack, sizeof(g_bufTrack));
-  TEST_ASSERT_TRUE(roostSdOpenSession(&g_log, "/bscope-8-8-26-1", decls, declCount));
+  TEST_ASSERT_TRUE(roostSdOpenSession(&g_log, "/bscope-0001-260808-1", decls, declCount));
 }
 
 static int fileFor(const char* suffix) {
@@ -257,7 +257,7 @@ void test_reopen_after_rename_keeps_earlier_rows(void) {
   TEST_ASSERT_TRUE(afterClose > 0);
 
   // Same paths, as a rename to the same fixture would leave them.
-  TEST_ASSERT_TRUE(roostSdOpenSession(&g_log, "/bscope-8-8-26-1", decls, declCount));
+  TEST_ASSERT_TRUE(roostSdOpenSession(&g_log, "/bscope-0001-260808-1", decls, declCount));
   TEST_ASSERT_EQUAL_UINT(afterClose, g_fake.len[h]);       // nothing truncated
   TEST_ASSERT_TRUE(strstr(g_fake.data[h], "before,the,anchor") != NULL);
 

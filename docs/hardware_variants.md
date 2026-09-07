@@ -50,11 +50,22 @@ pins to modify the firmware or add peripherals.
 | plus            | x      | x    | x   | x   | x    | o    |
 | full            | x      | x    | x   | x   | x    | x    |
 
-The Analyze r0.1 (ESP32-S3) is the initial carrier board for this model. It
+The Analyze r0.1 (ESP32-S3) is the proto carrier board for this model. It
 covers the basic and plus tiers and has no second radio. The footprint takes
 either an N8R2 or an N16R8 module, so flash `env:analyze_r01_n8r2` or
 `env:analyze_r01_n16r8` to match the populated module. See
 [Analyze r0.1 hardware](hardware/hardware_analyze_r01_esp32s3.md).
+
+The Analyze r0.2 is a major redesign to r0.1 and available for both dev boards
+like the r0.1 or a bare ESP32-S3-WROOM-1U.
+
+Both versions use a combined display and four-button module, and the bare implementation moves the regulator, USB-C, UART0 header and the BOOT and RESET buttons onto the PCG. 
+
+They are built by `env:analyze_r02_n16r8_dev` but can also accept an N8R2. See
+[Analyze r0.2 hardware](hardware/hardware_analyze_r02_esp32s3.md).
+
+The bare ESP32-S3-WROOM-1U is built by `env:analyze_r02_n16r8_bare`.
+See [Analyze r0.2 bare hardware](hardware/hardware_analyze_r02_bare_esp32s3.md).
 
 The N16R8 and N8R2 are functionally interchangeable, current code and features
 fit comfortably on the N8R2, but the Full tier may require an N16R8 to handle

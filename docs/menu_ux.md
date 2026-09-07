@@ -7,9 +7,10 @@ behind a semantic nav layer, so a later board revision can swap the buttons for
 an encoder, a 4-button pad, or a 5-way switch without touching this logic. See
 [Input hardware](#input-hardware).
 
-The carousel and menus below are wired today on the Birdoscope Analyze r0.1
-(ESP32-S3), which has three buttons and `NAV_SCHEME_3BTN`. Flash it with
-`analyze_r01_n8r2` or `analyze_r01_n16r8`. Boards with two buttons keep the
+The carousel and menus below are wired today on the Birdoscope Analyze boards
+(ESP32-S3). r0.1 has three buttons and `NAV_SCHEME_3BTN`, flashed with
+`analyze_r01_n8r2` or `analyze_r01_n16r8`. r0.2 has four and `NAV_SCHEME_4BTN`,
+flashed with `analyze_r02_n16r8_dev`. Boards with two buttons keep the
 older toggle and mark input (`coreInputTick`) and their single status view, and
 the round TFT board renders its own UX. See [Board parity](board_parity.md).
 
@@ -128,8 +129,13 @@ Alerts screen still honors it.
 Starts and stops the Admin-mode web portal:
 
 - **On (Admin)**: enters the software access point (SoftAP) web portal, which
-  pauses scanning. This is the Admin gesture for a board with controls. The BOOT
-  double-press remains the universal enter and exit escape on every board.
+  pauses scanning. This is the Admin gesture for a board with controls.
+- **Leaving Admin**: hold Back for `NAV_EXIT_HOLD_MS`, 3 seconds by default. A
+  click does not exit, so the portal cannot be dropped by a stray press while
+  the board is stowed. The web console command and the idle timeout still
+  release it, and on a board with `BOOT_ADMIN_TRIGGER` set the BOOT
+  double-press is a further escape. Analyze r0.2 clears that flag, leaving the
+  hold as its only button route out.
 - **Off**: closes the menu and returns to the resting Detect state.
 
 ## Round TFT screens (esp32round)
@@ -211,6 +217,7 @@ newline-terminated. Core owns the shared verbs and each board adds its own.
 | `prev`                               | core          | dump previous session (JSON) |
 | `nav <up\|down\|select\|back\|mark>` | core          | inject a nav event           |
 | `chirp` / `jingle`                   | core (buzzer) | play a tone                  |
+| `crow` / `hawk`                      | core (buzzer) | play either boot call        |
 | `help` / `?`                         | board         | list commands                |
 
 ### Web console parity
@@ -248,8 +255,11 @@ everything. Differences on the web side:
   on screen. Web-only, since it needs a form. See
   [Distance estimation](distance_estimation.md).
 - Pinned buttons in the Controls card are `status`, `wifi`, and `help`, though
-  typing `help` still uses the client-side listing. `chirp` and `jingle` are
-  unpinned typed verbs.
+  typing `help` still uses the client-side listing. The tone tests `chirp`,
+  `prox`, `jingle`, `crow` and `hawk` are unpinned typed verbs, present on both
+  consoles. A board with no buzzer reports them as unknown rather than accepting
+  them and doing nothing. Each acknowledges on the console, so the verb is
+  distinguishable from a silent failure.
 - `session`, `prev_session`, and the SD CSVs are also one-click downloads.
 
 ## Input hardware
@@ -259,8 +269,23 @@ adding a `NAV_SCHEME_*` implementation in `coreNavTick()` that emits the same
 events. Nothing downstream changes: the screen carousel, the menu state machine,
 and every board's render code stay as they are.
 
-The current scheme is `NAV_SCHEME_3BTN`, three buttons distinguished by short
-and long press.
+Two schemes exist. `NAV_SCHEME_3BTN` uses three buttons distinguished by short
+and long press. `NAV_SCHEME_4BTN` is the same grammar with Back moved to a
+fourth button as a short press, so Confirm no longer carries a long press. Both
+emit identical events, and a board picks one in its `board_config.h`.
+
+| Button | `NAV_SCHEME_3BTN` | `NAV_SCHEME_4BTN` |
+|--------|-------------------|-------------------|
+| 1      | short Up, long Mark | short Up, long Mark |
+| 2      | short Down        | short Down        |
+| 3      | short Confirm, long Back | short Confirm |
+| 4      | not present       | short Back        |
+
+Holding Back for 3 seconds emits `NAV_BACK_HOLD` on either scheme, meaning long
+button 3 on the three-button boards and long button 4 on the four-button ones.
+Only the Admin screen consumes it. On four buttons the hold cancels the click
+that release would otherwise send. On three buttons Back has already fired at
+the 500 ms mark, which Admin discards.
 
 The scan mode and the Single-mode channel are session-only by design. Both boot
 to the board defaults every time. The alert gates behave the same way. The

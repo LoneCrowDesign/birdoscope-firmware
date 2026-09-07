@@ -482,10 +482,20 @@ static void ensureRegistered() {
                       corePlayProximityChirp();
                       return String("played proximity chirp");
                     });
-  console.onCommand("jingle", "play the boot jingle",
+  console.onCommand("jingle", "play the boot sound",
                     [](JsonVariantConst) -> String {
                       corePlayStartupJingle();
-                      return String("played boot jingle");
+                      return String("played boot sound");
+                    });
+  console.onCommand("crow", "play the crow call",
+                    [](JsonVariantConst) -> String {
+                      corePlayCrowCall();
+                      return String("played crow call");
+                    });
+  console.onCommand("hawk", "play the hawk call",
+                    [](JsonVariantConst) -> String {
+                      corePlayHawkCall();
+                      return String("played hawk call");
                     });
 #endif
 
@@ -515,6 +525,7 @@ static void ensureRegistered() {
                       h += "  nav      – (Detect only) screen-nav event\n";
 #if USE_BUZZER
                       h += "  chirp / prox / jingle – buzzer tone tests\n";
+                      h += "  crow / hawk – play either boot call\n";
 #endif
                       h += "  clear    – wipe the log";
                       console.log(h);

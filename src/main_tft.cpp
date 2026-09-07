@@ -240,12 +240,12 @@ static void displayTick() {
 
 // Manual "area of interest" marker. Simulates a detection on the scan screen,
 // using the same red background and ring pointer a real hit would trigger, and
-// writes one MANUALALERT row to the SD log. It never touches the real detection
-// table or SPIFFS, since no camera was seen and the count must not be inflated.
-// The row carries only real data, the timestamp and the current channel.
-// mac/ssid/ap_mac/dist_m stay blank rather than fabricated, and
-// method="MANUALALERT" flags the row as operator-generated to anything parsing
-// the log later.
+// writes one operator_mark row to the SD log. It never touches the real
+// detection table or SPIFFS, since no camera was seen and the count must not be
+// inflated. The row carries only real data, the timestamp and the current
+// channel; mac/ssid/ap_mac/dist_m stay blank rather than fabricated.
+//
+// The mark is written before the survey window opens, per spec O1.
 static void triggerManualAlert() {
   fyLastTargetSeen = millis();   // drives the scan screen's red/ring window
   dispRssi  = RSSI_MAX;          // pointer parks at the gauge's near end
@@ -256,6 +256,7 @@ static void triggerManualAlert() {
 #endif
 
   dualPrintln("[bscope] MANUAL ALERT logged (area of interest)");
+  coreSurveyStart();
 }
 
 // Switching screens only changes what is drawn. Scanning, logging, and
@@ -279,12 +280,13 @@ static void printStatus() {
   unsigned long ms = millis();
   unsigned long s  = ms / 1000;
   dualPrintf("[bscope] status: uptime=%lus ch=%u mode=%s det=%d spiffs=%d"
-             " heap=%u sniffing=%d ntp_time=%d\n",
+             " heap=%u sniffing=%d ntp_time=%d survey=%us\n",
              s, currentChannel, channelModeName(), fyDetCount,
              fySpiffsReady ? 1 : 0,
              (unsigned)ESP.getFreeHeap(),
              sniffingStopped ? 0 : 1,
-             coreTimeAnchored() ? 1 : 0);
+             coreTimeAnchored() ? 1 : 0,
+             (unsigned)(coreSurveyRemainingMs() / 1000));   // 0 when no window is open
 }
 
 // Injects a synthetic addr2 detection through the same alert queue the real
@@ -436,6 +438,7 @@ void loop() {
   updateChannelMode();
   checkSerialCommands();
   checkInput();
+  coreSurveyTick();     // closes an operator survey window once it has elapsed
   drainAlertQueue();
   displayTick();
   autosaveTick();

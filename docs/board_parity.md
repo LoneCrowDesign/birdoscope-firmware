@@ -63,9 +63,9 @@ to draw.
 2. Audio and LED only, so neither board file renders anything.
 3. `nav`, `dump`, and `prev` live in core. `status`, `inject`, `log`, and `help`
    are per board file.
-4. Gated on `NAV_SCHEME_3BTN`, so only the three-button Analyze r0.1 reads
-   physical buttons through it. The serial injector works on every board, and
-   boards with two buttons keep `coreInputTick()`.
+4. Gated on `NAV_BTN_COUNT`, so only an Analyze board running `NAV_SCHEME_3BTN`
+   or `NAV_SCHEME_4BTN` reads physical buttons through it. The serial injector
+   works on every board, and boards with two buttons keep `coreInputTick()`.
 5. Covers menu drill-in: Scan Mode with its channel picker, Targets, Alerts, and
    Web Config. The round TFT board shares the core screen and menu state but
    renders its own round-screen UX, which is divergent by design rather than
@@ -82,7 +82,7 @@ to draw.
    board file displays the active target. Held in RAM, resetting to All on
    reboot.
 9. Reported as `CoreAlertResult::distM` for every board and every detection where
-   the geometry is valid, so the behavior is shared even where nothing draws it.
+   the geometry is valid.
    The OLED Overview screen shows it as `dst:`; the round TFT has no row for it
    yet. Only `wildcard_probe` and `oui_addr2` hits get a value, since `oui_addr1`
    RSSI describes the AP link. See

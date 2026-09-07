@@ -82,7 +82,8 @@ static RoostSdLog  g_log;
 static bool        g_open      = false;
 static uint32_t    g_fixSeq    = 0;
 static uint32_t    g_lastManifestMs = 0;
-static char        g_dir[32]   = "";
+// 40, not 32: /bscope-TAG-boot-BOOT-K fills 32 exactly at a u32 boot_count.
+static char        g_dir[40]   = "";
 static bool        g_named     = false;
 static bool        g_ended     = false;
 
@@ -96,7 +97,7 @@ static bool        g_inStorageError    = false;
 
 // A session opens under its boot number, because rows precede the clock anchor
 // and the dated name is not knowable at first write. It is renamed to
-// /bscope-M-D-YY-N once time anchors.
+// /bscope-TAG-YYMMDD-N once time anchors.
 //
 // Keyed by boot, not a fixed name: a fixed provisional name lets successive
 // boots append to one directory, which makes their rows unattributable and
@@ -105,7 +106,9 @@ static bool        g_inStorageError    = false;
 //
 // This is a final name, not a placeholder. An unanchored session has no date to
 // be given, so it keeps this one and says clock_source=none in its manifest.
-#define ROOST_DIR_BOOT "/bscope-boot"
+// The tag sits between the shortcode and "boot": boot_count counts per device,
+// so two units collide on it alone. An empty tag gives /bscope-boot-N. Spec 6.2.
+#define ROOST_DIR_BOOT_PREFIX "/" LOG_PREFIX
 #define MANIFEST_SNAPSHOT_MS 15000
 
 bool roostSessionOpen()      { return g_open; }
@@ -288,10 +291,14 @@ bool roostSessionBegin() {
   // merge two captures under one manifest - the defect this key exists to
   // prevent.
   const unsigned boot = (unsigned)coreBootCount();
+  const char* tag = coreDeviceTag();
+  const char* sep = tag[0] ? "-" : "";
   bool free_ = false;
   for (unsigned k = 0; k < 100 && !free_; k++) {
-    if (k) snprintf(g_dir, sizeof(g_dir), ROOST_DIR_BOOT "-%u-%u", boot, k);
-    else   snprintf(g_dir, sizeof(g_dir), ROOST_DIR_BOOT "-%u", boot);
+    if (k) snprintf(g_dir, sizeof(g_dir), ROOST_DIR_BOOT_PREFIX "%s%sboot-%u-%u",
+                    tag, sep, boot, k);
+    else   snprintf(g_dir, sizeof(g_dir), ROOST_DIR_BOOT_PREFIX "%s%sboot-%u",
+                    tag, sep, boot);
     free_ = !SD.exists(g_dir);
   }
   // Refuse rather than fall back to a name already in use. Sharing a container
@@ -326,7 +333,7 @@ void roostSessionAnchor() {
   coreClockAnchor(&anchorUnix, &anchorUptime);
   roostLogDeviceEvent(ROOST_COMP_GNSS0, "clock_anchored", anchorUnix, nullptr);
 
-  char want[32];
+  char want[40];
   if (!coreSessionDirName(want, sizeof(want))) {
     // The day's names are used up. Keep the boot name: a failed rename is not a
     // failed capture, and the manifest carries the anchor either way, so the

@@ -106,7 +106,7 @@ const char* coreBuildRev() { return BIRDOSCOPE_GIT_REV; }
 const char* coreBuildIdentity() {
   static char buf[96];
   if (buf[0] == '\0') {
-    snprintf(buf, sizeof(buf), "v%s %s (%s) built %s",
+    snprintf(buf, sizeof(buf), "v%s %s committed %s, built %s",
              BIRDOSCOPE_VERSION, BIRDOSCOPE_GIT_REV, BIRDOSCOPE_GIT_DATE,
              BIRDOSCOPE_BUILD_TS);
   }
@@ -619,6 +619,7 @@ static const char* alertTypeToMethod(AlertType t) {
     case ALERT_SSID:           return "ssid_match";
     case ALERT_WILDCARD_PROBE: return "wildcard_probe";
     case ALERT_DIRECTED_PROBE: return "directed_probe";
+    case ALERT_SURVEY:         return "operator_survey";   // spec O3
     // The vocabulary's word for "no target matched". "unknown" is not in
     // detection_method's allowed set, so it would fail to resolve, empty a
     // column and raise vocabulary_error. Unreachable today; the default arm is
@@ -1008,9 +1009,21 @@ static void gpsEchoFor(uint32_t ms);
 bool coreHandleSerialCommand(const char* verb, const char* arg) {
   if (!strcmp(verb, "dump")) { dumpCurrentSession(); return true; }
   if (!strcmp(verb, "prev")) { dumpSpiffsFile(FY_PREV_FILE); return true; }
-  if (!strcmp(verb, "chirp"))  { corePlayDetectChirp();    return true; }  // tone test
-  if (!strcmp(verb, "prox"))   { corePlayProximityChirp(); return true; }  // tone test
-  if (!strcmp(verb, "jingle")) { corePlayStartupJingle();  return true; }  // tone test
+  // Tone tests, each acknowledged on the console so the verb is distinguishable
+  // from a silent failure. Gated with the help listing, so a board without a
+  // buzzer reports them as unknown rather than accepting them silently.
+#if USE_BUZZER
+  if (!strcmp(verb, "chirp"))  {
+    dualPrintln("[bscope] playing detection chirp"); corePlayDetectChirp();    return true; }
+  if (!strcmp(verb, "prox"))   {
+    dualPrintln("[bscope] playing proximity chirp"); corePlayProximityChirp(); return true; }
+  if (!strcmp(verb, "jingle")) {
+    dualPrintln("[bscope] playing boot sound");      corePlayStartupJingle();  return true; }
+  if (!strcmp(verb, "crow"))   {
+    dualPrintln("[bscope] playing crow call");       corePlayCrowCall();       return true; }
+  if (!strcmp(verb, "hawk"))   {
+    dualPrintln("[bscope] playing hawk call");       corePlayHawkCall();       return true; }
+#endif
 #if DEBUG_OUI_CENSUS
   if (!strcmp(verb, "census")) { censusDump(); return true; }
 #endif
@@ -1062,7 +1075,9 @@ void corePrintSerialHelp() {
 #if USE_BUZZER
   dualPrintln("  chirp             play detection chirp (tone test)");
   dualPrintln("  prox              play proximity chirp (tone test)");
-  dualPrintln("  jingle            play boot jingle (tone test)");
+  dualPrintln("  jingle            play boot sound (tone test)");
+  dualPrintln("  crow              play the crow call (tone test)");
+  dualPrintln("  hawk              play the hawk call (tone test)");
 #endif
 }
 
@@ -1142,6 +1157,150 @@ void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t* mac,
   uint8_t depth = (uint8_t)((alertHead + ALERT_QUEUE_SIZE - alertTail) % ALERT_QUEUE_SIZE);
   if (depth > coreQueueDepthMax) coreQueueDepthMax = depth;
   portEXIT_CRITICAL_ISR(&queueMux);
+}
+
+// ============================================================
+// OPERATOR SURVEY WINDOW. Contract in core.h, rules in spec O1-O7 [D9]. The
+// flag is read by the promiscuous callback and written only from loop().
+// ============================================================
+
+const uint16_t SURVEY_OPTIONS_S[SURVEY_OPTION_COUNT] = { 10, 20, 30 };
+volatile uint16_t coreSurveySecs = SURVEY_OPTIONS_S[0];
+
+// ---- Per-MAC rate limit -----------------------------------------------------
+//
+// One row per MAC per SURVEY_DEDUPE_MS, time-windowed rather than log-once,
+// applied before a frame reaches the queue. Matched frames never reach this;
+// they are logged in full by their own path. Spec O6 [D9].
+#ifndef SURVEY_DEDUPE_SLOTS
+#define SURVEY_DEDUPE_SLOTS 256
+#endif
+#ifndef SURVEY_DEDUPE_MS
+#define SURVEY_DEDUPE_MS 2000
+#endif
+
+static DRAM_ATTR uint8_t  surveySeenMac[SURVEY_DEDUPE_SLOTS][6];
+static DRAM_ATTR uint32_t surveySeenAt[SURVEY_DEDUPE_SLOTS];
+static DRAM_ATTR uint8_t  surveySeenUsed[SURVEY_DEDUPE_SLOTS];
+volatile uint32_t coreSurveyEvictions = 0;
+
+// Spreads the low three bytes, the ones that vary within a vendor.
+static inline size_t IRAM_ATTR surveyHash(const uint8_t* mac) {
+  uint32_t h = ((uint32_t)mac[3] << 16) | ((uint32_t)mac[4] << 8) | mac[5];
+  h ^= (uint32_t)mac[0] << 7;
+  h *= 2654435761u;
+  return (size_t)(h % SURVEY_DEDUPE_SLOTS);
+}
+
+// Wrap-safe: millis() rolls over about every 49 days and a capture outlives it.
+static inline bool IRAM_ATTR surveyElapsed(uint32_t now, uint32_t then, uint32_t span) {
+  return (uint32_t)(now - then) >= span;
+}
+
+// True when this MAC is due a row. Bounded probe from the hash: scanning the
+// table per frame would cost more than the parse it is protecting.
+static bool IRAM_ATTR surveyAllow(const uint8_t* mac, uint32_t nowMs) {
+  const size_t start = surveyHash(mac);
+  const size_t kProbe = 8;
+
+  size_t   freeIdx   = SURVEY_DEDUPE_SLOTS;
+  size_t   oldestIdx = start;
+  uint32_t oldestAge = 0;
+
+  for (size_t i = 0; i < kProbe; i++) {
+    const size_t idx = (start + i) % SURVEY_DEDUPE_SLOTS;
+    if (!surveySeenUsed[idx]) {
+      if (freeIdx == SURVEY_DEDUPE_SLOTS) freeIdx = idx;
+      continue;
+    }
+    if (memcmp(surveySeenMac[idx], mac, 6) == 0) {
+      if (surveyElapsed(nowMs, surveySeenAt[idx], SURVEY_DEDUPE_MS)) {
+        surveySeenAt[idx] = nowMs;
+        return true;
+      }
+      return false;
+    }
+    const uint32_t age = (uint32_t)(nowMs - surveySeenAt[idx]);
+    if (age >= oldestAge) { oldestAge = age; oldestIdx = idx; }
+  }
+
+  size_t idx;
+  if (freeIdx != SURVEY_DEDUPE_SLOTS) {
+    idx = freeIdx;
+  } else {
+    // Least-recently-seen, so a full table logs more often than the cap says
+    // rather than going silent. Only an eviction if the victim was still
+    // inside its window; replacing an expired entry costs nothing.
+    idx = oldestIdx;
+    if (!surveyElapsed(nowMs, surveySeenAt[idx], SURVEY_DEDUPE_MS)) {
+      coreSurveyEvictions = coreSurveyEvictions + 1;
+    }
+  }
+  memcpy(surveySeenMac[idx], mac, 6);
+  surveySeenAt[idx]   = nowMs;
+  surveySeenUsed[idx] = 1;
+  return true;
+}
+
+static volatile bool     surveyActive  = false;
+static unsigned long     surveyEndsAt  = 0;
+// Captured at the window's start so the report is the window's own delta and
+// not a session total. coreQueueDrops counts frames that never reached the log.
+static uint32_t          surveyDropsAt = 0;
+volatile uint32_t        coreSurveyRows = 0;
+volatile uint32_t        coreSurveySuppressed = 0;
+
+bool coreSurveyActive() { return surveyActive; }
+
+uint32_t coreSurveyRemainingMs() {
+  if (!surveyActive) return 0;
+  unsigned long now = millis();
+  return (surveyEndsAt > now) ? (uint32_t)(surveyEndsAt - now) : 0;
+}
+
+void coreSurveyStart() {
+  // No SD log means no sink for survey rows, so no window opens (spec O1). A
+  // plain condition rather than #if, so both arms compile on every board.
+  if (!USE_SD) {
+    dualPrintln("[bscope] SURVEY unavailable: no SD log on this board");
+    return;
+  }
+  // A press during an open window extends it to a full duration rather than
+  // stacking a second one, so the operator's last press decides when it ends.
+  if (!surveyActive) {
+    surveyDropsAt        = coreQueueDrops;
+    coreSurveyRows       = 0;
+    coreSurveySuppressed = 0;
+    coreSurveyEvictions  = 0;
+    // Cleared per window, so a device seen at an earlier mark still yields a
+    // first row here (spec O6). Unlocked: this clear must complete before
+    // surveyActive is set, since that flag gates surveyAllow() in the callback.
+    memset(surveySeenUsed, 0, sizeof(surveySeenUsed));
+  }
+  surveyEndsAt = millis() + (unsigned long)coreSurveySecs * 1000UL;
+  surveyActive = true;   // must stay after the reset above
+  dualPrintf("[bscope] SURVEY open: unfiltered capture for %us\n",
+             (unsigned)coreSurveySecs);
+}
+
+void coreSurveyTick() {
+  if (!surveyActive) return;
+  if ((long)(millis() - surveyEndsAt) < 0) return;
+  surveyActive = false;
+
+  uint32_t drops = coreQueueDrops - surveyDropsAt;
+  // Drops are every frame the queue refused during the window, matched ones
+  // included, so this bounds what the window missed rather than attributing
+  // each loss to it. Spec O7.
+  dualPrintf("[bscope] SURVEY closed: %u rows, %u frames rate-limited,"
+             " %u dropped (queue full), %u evictions\n",
+             (unsigned)coreSurveyRows, (unsigned)coreSurveySuppressed,
+             (unsigned)drops, (unsigned)coreSurveyEvictions);
+#if USE_SD
+  if (drops) {
+    roostLogDeviceEvent(ROOST_COMP_WIFI0, "buffer_full", drops, "during_survey");
+  }
+#endif
 }
 
 bool coreDequeueAlert(AlertEntry& out) {
@@ -1363,6 +1522,12 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   //
   // Non-probe frames from the same OUI still emit the broad ADDR2 alert.
   // See: https://github.com/DeflockJoplin/flock-you
+
+  // Set beside every enqueue below, not per branch: a survey row is only
+  // written for a frame no matcher claimed, so an open window never doubles a
+  // matched frame's rows.
+  bool anyAlert = false;
+
   if (matchOuiRaw(hdr->addr2) >= 0) {
     // Counted here, after the match and before the branch below decides what
     // kind of alert it is. A subtype that appears in coreMgmtSeen, appears
@@ -1381,17 +1546,20 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
           enqueueAlert(ALERT_WILDCARD_PROBE, hdr->addr2, &fm, rssi, ch,
                        &ssid, "probe_req", fsub);
           emitted = true;
+          anyAlert = true;
         } else if (ssid.present) {
           // Directed probe: the probed name identifies configured backhaul
           // networks, which is the field a target's SSID list is built from.
           enqueueAlert(ALERT_DIRECTED_PROBE, hdr->addr2, &fm, rssi, ch,
                        &ssid, "probe_req", fsub);
           emitted = true;
+          anyAlert = true;
         }
       }
     }
     if (!emitted) {
       enqueueAlert(ALERT_OUI_ADDR2, hdr->addr2, &fm, rssi, ch, &ssid, "addr2", fsub);
+      anyAlert = true;
     }
   }
 
@@ -1407,6 +1575,7 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   // camera→scanner, so it can't be used for triangulation directly.
   if (!isMulticast(hdr->addr1) && matchOuiRaw(hdr->addr1) >= 0) {
     enqueueAlert(ALERT_OUI_ADDR1, hdr->addr1, &fm, rssi, ch, &ssid, "addr1", fsub);
+    anyAlert = true;
   }
 #endif
 
@@ -1415,6 +1584,7 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   // carries the real BSSID OUI (management frames only).
   if (type == WIFI_PKT_MGMT && matchOuiRaw(hdr->addr3) >= 0) {
     enqueueAlert(ALERT_OUI_ADDR3, hdr->addr3, &fm, rssi, ch, &ssid, "addr3", fsub);
+    anyAlert = true;
   }
 #endif
 
@@ -1428,8 +1598,20 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
                           : (subtype == 4)   ? "probe_req"
                                              : "mgmt";
     enqueueAlert(ALERT_SSID, hdr->addr2, &fm, rssi, ch, &ssid, frameKind, fsub);
+    anyAlert = true;
   }
 #endif
+
+  // Survey window: frames no matcher claimed, keyed on addr2, which is both the
+  // row's identity and what the per-MAC cap counts. Spec O3, O6.
+  if (surveyActive && !anyAlert) {
+    if (surveyAllow(hdr->addr2, millis())) {
+      enqueueAlert(ALERT_SURVEY, hdr->addr2, &fm, rssi, ch, &ssid, "survey", fsub);
+      coreSurveyRows = coreSurveyRows + 1;
+    } else {
+      coreSurveySuppressed = coreSurveySuppressed + 1;
+    }
+  }
 }
 
 // ============================================================
@@ -2105,6 +2287,19 @@ CoreAlertResult coreHandleAlert(const AlertEntry& e) {
   macToStr(e.mac, r.macStr, sizeof(r.macStr));
   const char* method = alertTypeToMethod(e.type);
 
+  // Log-only, so this returns ahead of the detection table, the tallies,
+  // fyLastTargetSeen, the dedupe slots and every output path (spec O4).
+  // `suppressed` already tells a board not to update its display from a row.
+  if (e.type == ALERT_SURVEY) {
+#if USE_SD
+    roostLogWifiObs(e, method);
+#endif
+    r.detIdx     = -1;
+    r.suppressed = true;
+    r.type       = e.type;
+    return r;
+  }
+
   char apMacStr[18] = "";
   if (e.type == ALERT_OUI_ADDR1) macToStr(e.addr2, apMacStr, sizeof(apMacStr));
 
@@ -2327,7 +2522,63 @@ static void heartbeatBeep() {
 #endif
 }
 
-static void startupBeep() {
+// ---- Boot call --------------------------------------------------------------
+//
+// Bird calls approximated on a single-square-wave element by cadence and pitch
+// glide, with a frequency wobble standing in for rasp. Tones are transposed
+// into the element's efficient band rather than set at a call's true pitch.
+// Spec A5; see docs/alerts.md for the acoustics and the tuning knobs.
+#define BOOT_SOUND_JINGLE 0   // six-note descending motif, the original
+#define BOOT_SOUND_CROW   1   // "ca-CAW ca-CAW"
+#define BOOT_SOUND_HAWK   2   // "kee-ahrrr", a single descending scream
+
+#ifndef BOOT_SOUND
+#define BOOT_SOUND BOOT_SOUND_CROW
+#endif
+// Wobble depth as a percentage of the current frequency, and the sweep step.
+// The step doubles as the wobble period, so halving it doubles the rasp rate.
+#ifndef BIRD_RASP_PCT
+#define BIRD_RASP_PCT 7
+#endif
+#ifndef BIRD_STEP_MS
+#define BIRD_STEP_MS  6
+#endif
+
+// One syllable: glides f0 to f1 over ms, roughened by raspPct. Blocking, like
+// every other player here, and boot/serial context is the only caller.
+static void birdSyllable(uint16_t f0, uint16_t f1, uint16_t ms, uint8_t raspPct) {
+#if USE_BUZZER
+  const uint16_t steps = ms / BIRD_STEP_MS;
+  if (!steps) return;
+  for (uint16_t i = 0; i < steps; i++) {
+    int32_t f = (int32_t)f0 + (((int32_t)f1 - (int32_t)f0) * (int32_t)i) / (int32_t)steps;
+    if (raspPct && (i & 1)) f -= (f * (int32_t)raspPct) / 100;
+    tone(BUZZER_PIN, (unsigned)f);
+    delay(BIRD_STEP_MS);
+  }
+  noTone(BUZZER_PIN);
+#endif
+}
+
+// A clipped grace note into a longer accented one that falls away, twice. The
+// repeat is what reads as a call rather than as two unrelated beeps.
+static void crowCall() {
+  for (int i = 0; i < 2; i++) {
+    birdSyllable(1450, 1330,  60, BIRD_RASP_PCT);   // "ca"
+    delay(30);
+    birdSyllable(2000, 1500, 190, BIRD_RASP_PCT);   // "CAW"
+    if (i == 0) delay(170);
+  }
+}
+
+// A thin rising attack breaking into a long descending scream. Closer to a pure
+// glide than a caw, so it survives the element with less distortion.
+static void hawkCall() {
+  birdSyllable(2300, 2650,  90, 0);
+  birdSyllable(2650, 1500, 420, BIRD_RASP_PCT / 2);
+}
+
+static void legacyJingle() {
 #if USE_BUZZER
   // First 6 notes of SMB World 1-2 (underground). Koji Kondo's descending
   // pattern: C5 → C4 → A4 → A3 → G#4 → G#3 (alternating-octave pairs).
@@ -2341,12 +2592,24 @@ static void startupBeep() {
 #endif
 }
 
+static void startupBeep() {
+#if BOOT_SOUND == BOOT_SOUND_CROW
+  crowCall();
+#elif BOOT_SOUND == BOOT_SOUND_HAWK
+  hawkCall();
+#else
+  legacyJingle();
+#endif
+}
+
 // Public hooks (declared in core.h) that let serial and web commands replay the
 // buzzer sounds on demand for tone tuning. Thin wrappers over the static
 // players above. Both no-op on a board without a buzzer.
 void corePlayDetectChirp()    { newDetectChirp(); }
 void corePlayStartupJingle()  { startupBeep(); }
 void corePlayProximityChirp() { proximityChirp(); }
+void corePlayCrowCall()       { crowCall(); }
+void corePlayHawkCall()       { hawkCall(); }
 
 // Uncalled on any board with a display, per spec A1. Retained for display-less
 // boards: call heartbeatTick() from coreNotifyTick() to re-enable.
@@ -2523,30 +2786,39 @@ static NavEvent navQPop() {
 }
 
 NavEvent coreNavTick() {
-#if NAV_SCHEME_3BTN
-  // Per-button edge + long-press tracker. Index 0/1/2 = BTN_1/2/3. A short
-  // press fires on release, so it can be distinguished from a long. A long
-  // press fires the moment it crosses NAV_LONG_PRESS_MS while still held, so
+#if NAV_BTN_COUNT
+  // Per-button edge + long-press tracker. Index i = BTN_(i+1). A short press
+  // fires on release, so it can be distinguished from a long. A long press
+  // fires the moment it crosses NAV_LONG_PRESS_MS while still held, so
   // MARK/BACK feel immediate. Buttons are active-LOW (INPUT_PULLUP).
   static bool          initialized = false;
-  static bool          last[3];
-  static unsigned long changedAt[3];
-  static unsigned long pressedAt[3];
-  static bool          longFired[3];
+  static bool          last[NAV_BTN_COUNT];
+  static unsigned long changedAt[NAV_BTN_COUNT];
+  static unsigned long pressedAt[NAV_BTN_COUNT];
+  static bool          longFired[NAV_BTN_COUNT];
+  static bool          holdFired[NAV_BTN_COUNT];
+#if NAV_SCHEME_4BTN
+  // A dedicated BACK button frees BTN_3 of its long press.
+  static const uint8_t  pins[4]    = { BTN_PIN_1, BTN_PIN_2, BTN_PIN_3, BTN_PIN_4 };
+  static const NavEvent shortEv[4] = { NAV_UP,   NAV_DOWN, NAV_SELECT, NAV_BACK };
+  static const NavEvent longEv[4]  = { NAV_MARK, NAV_NONE, NAV_NONE,   NAV_NONE };  // NAV_NONE = no long action
+#else
   static const uint8_t  pins[3]    = { BTN_PIN_1, BTN_PIN_2, BTN_PIN_3 };
   static const NavEvent shortEv[3] = { NAV_UP,   NAV_DOWN, NAV_SELECT };
   static const NavEvent longEv[3]  = { NAV_MARK, NAV_NONE, NAV_BACK   };  // NAV_NONE = no long action
+#endif
 
   if (!initialized) {
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < NAV_BTN_COUNT; i++) {
       pinMode(pins[i], INPUT_PULLUP);
-      last[i] = HIGH; changedAt[i] = 0; pressedAt[i] = 0; longFired[i] = false;
+      last[i] = HIGH; changedAt[i] = 0; pressedAt[i] = 0;
+      longFired[i] = false; holdFired[i] = false;
     }
     initialized = true;
   }
 
   unsigned long now = millis();
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < NAV_BTN_COUNT; i++) {
     bool lvl = digitalRead(pins[i]);
     if (lvl != last[i] && now - changedAt[i] > BTN_DEBOUNCE_MS) {   // debounced edge
       changedAt[i] = now;
@@ -2554,6 +2826,7 @@ NavEvent coreNavTick() {
       if (lvl == LOW) {                         // press
         pressedAt[i] = now;
         longFired[i] = false;
+        holdFired[i] = false;
       } else if (!longFired[i]) {               // release without a prior long → short
         coreInjectNav(shortEv[i]);
       }
@@ -2562,6 +2835,17 @@ NavEvent coreNavTick() {
     if (last[i] == LOW && !longFired[i] && longEv[i] != NAV_NONE
         && now - pressedAt[i] >= NAV_LONG_PRESS_MS) {
       coreInjectNav(longEv[i]);
+      longFired[i] = true;
+    }
+    // Whichever button carries BACK, on either scheme, also emits NAV_BACK_HOLD
+    // once held this long. Setting longFired suppresses the short-press BACK on
+    // release, so a 4-button hold is never also a click. A 3-button BACK has
+    // already fired by this point and is discarded by the only consumer.
+    if (last[i] == LOW && !holdFired[i]
+        && (shortEv[i] == NAV_BACK || longEv[i] == NAV_BACK)
+        && now - pressedAt[i] >= NAV_EXIT_HOLD_MS) {
+      coreInjectNav(NAV_BACK_HOLD);
+      holdFired[i] = true;
       longFired[i] = true;
     }
   }
@@ -2736,6 +3020,9 @@ NavAction coreNavApply(NavEvent ev) {
 // time (not a post-boot window) so Detect↔Admin can be hopped repeatedly. BOOT
 // is active-LOW (INPUT_PULLUP, idles HIGH).
 bool coreAdminTriggerCheck() {
+#if !BOOT_ADMIN_TRIGGER
+  return false;
+#else
   const unsigned long kDebounceMs = 40;
   static bool          armed       = false;   // first-call pin init done
   static int           lastLvl     = HIGH;
@@ -2764,6 +3051,7 @@ bool coreAdminTriggerCheck() {
   // Expire a lone first press so it can't pair with a much-later press.
   if (lastPressMs != 0 && now - lastPressMs > BOOT_DOUBLE_PRESS_MS) lastPressMs = 0;
   return false;
+#endif
 }
 
 // Raw-IDF promiscuous capture bring-up, described in core.h. Factored out of every
@@ -2889,6 +3177,21 @@ uint32_t coreBootCount() {
 static uint32_t g_sessionSeq = 1;
 uint32_t coreSessionSequence() { return g_sessionSeq; }
 
+// The last four hex digits of coreDeviceSerial(), naming the unit in a session
+// directory name. Empty where the hardware has no serial. Spec 6.2 and 7.
+const char* coreDeviceTag() {
+  static char tag[5] = "";
+  static bool done = false;
+  if (!done) {
+    done = true;
+    const char* sn = coreDeviceSerial();
+    const size_t n = sn ? strlen(sn) : 0;
+    if (n >= 4) snprintf(tag, sizeof(tag), "%s", sn + n - 4);
+    else if (n)  snprintf(tag, sizeof(tag), "%s", sn);
+  }
+  return tag;
+}
+
 bool coreSessionDirName(char* buf, size_t len) {
   uint8_t mo = 1, dy = 1, yr = 70;
 #if HAS_GPS
@@ -2906,8 +3209,14 @@ bool coreSessionDirName(char* buf, size_t len) {
     dy = (uint8_t)t.tm_mday;
     yr = (uint8_t)((t.tm_year + 1900) % 100);
   }
+  // YYMMDD so a listing sorts chronologically. The tag precedes it, so probing
+  // settles the sequence within one unit. Spec 7.
+  const char* tag = coreDeviceTag();
   for (uint8_t n = 1; n <= 99; n++) {
-    snprintf(buf, len, "/" LOG_PREFIX "%u-%u-%02u-%u", mo, dy, yr, n);
+    if (tag[0]) snprintf(buf, len, "/" LOG_PREFIX "%s-%02u%02u%02u-%u",
+                         tag, yr, mo, dy, n);
+    else        snprintf(buf, len, "/" LOG_PREFIX "%02u%02u%02u-%u",
+                         yr, mo, dy, n);
     if (!SD.exists(buf)) { g_sessionSeq = n; return true; }
   }
   // Refuse rather than hand back a name the loop just proved exists. Renaming

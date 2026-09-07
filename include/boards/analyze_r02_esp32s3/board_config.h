@@ -1,26 +1,25 @@
 // Copyright (C) 2026 Lone Crow Design, LLC
 // Licensed under the MIT License. See LICENSE.
 //
-// Board config for the Birdoscope Analyze r0.1 (ESP32-S3), a custom carrier
-// board that takes an ESP32-S3 DevKitC-1 module. Built by env:analyze_r01_n8r2
-// or env:analyze_r01_n16r8, which differ only in the populated module's flash
-// and PSRAM. Notable features:
-//   * SH1106 OLED, mounted upside-down, requiring OLED_SH1106 lib
-//     plus a flip in code: OLED_ROTATION = U8G2_R2 (180°)
-//   * Three onboard buttons, driving the semantic nav scheme.
+// Board config for the Birdoscope Analyze r0.2 (ESP32-S3), a custom carrier
+// board that takes an ESP32-S3 DevKitC-1 N16R8 module. Built by
+// env:analyze_r02_n16r8_dev. Notable features:
+//   * A combined SH1106 + four-button module, sharing the I2C bus. The panel
+//     needs the OLED_SH1106 driver and, unlike r0.1, mounts the right way up.
 //
-// docs/hardware/hardware_analyze_r01_esp32s3.md carries the full PCB pinout from
-// the schematic as manufactured.
+// Against r0.1 the only pin change is the button row, which shifts down one
+// GPIO to make room for a fourth button. Every other peripheral keeps its r0.1
+// pin. See docs/hardware/hardware_analyze_r02_esp32s3.md.
 //
-// Selected via the -I include/boards/analyze_r01_esp32s3 build flag in
+// Selected via the -I include/boards/analyze_r02_esp32s3 build flag in
 // platformio.ini.
 #pragma once
 
 #define BUZZER_PIN 4
 #define USE_BUZZER 1
 
-// External WS2812B RGB LED on GPIO2. The r0.1 PCB drives an external pixel
-// rather than the module's onboard GPIO48 one.
+// External WS2812B RGB LED on GPIO2. The r0.1 and r0.2 PCBs both drive an
+// external pixel rather than the module's onboard GPIO48 one, on the same GPIO.
 #define LED_PIN          2
 #define USE_LED          1
 #define LED_FLASH_MS     120
@@ -58,28 +57,33 @@
 
 // I2C OLED with an SH1106 controller (u8g2-compatible). OLED_SH1106 selects a
 // driver that applies the 2px RAM column offset this controller needs. 
-// Mounted upside-down, so OLED_ROTATION applies a 180 flip.
+// No 180 flip required.
 
 #define OLED_SDA     8
 #define OLED_SCL     9
 #define OLED_RST     10
 #define OLED_HW_I2C  1
 #define OLED_SH1106  1
-#define OLED_ROTATION U8G2_R2
+// The serial log lists every device answering on the bus at boot. Set 
+// this to what it finds.
 
-// 3BTN nav scheme. Back is a long press on K3.
-// K1 - Up K2 - Down K3 - Confirm/Back
+#define OLED_I2C_ADDR 0x3C
+#define OLED_ROTATION U8G2_R0
+
+// Retires the 3BTN nav scheme for 4BTN with dedicated back button.
+// K1 - Up K2 - Down K3 - Confirm K4 - Back
 
 #define HAS_BUTTONS     1
-#define NAV_SCHEME_3BTN 1
-#define BTN_PIN_1       40
-#define BTN_PIN_2       41
-#define BTN_PIN_3       42
+#define NAV_SCHEME_4BTN 1
+#define BTN_PIN_1       39
+#define BTN_PIN_2       40
+#define BTN_PIN_3       41
+#define BTN_PIN_4       42
 #define BTN_DEBOUNCE_MS 50
 
-// BOOT (GPIO0) drives the Admin-mode trigger, retained until BTN_PIN_3 takes
-// over the gesture on this controls-equipped board.
-#define BOOT_BTN_PIN    0
+// No button-bound Admin trigger (inaccessible). Admin is entered from the 
+// Web Config screen
+#define BOOT_ADMIN_TRIGGER 0
 
 // micro SD card on its own SPI bus.
 #define USE_SD        1

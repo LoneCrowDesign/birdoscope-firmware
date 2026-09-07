@@ -16,15 +16,15 @@ lets you mute and unmute:
 
 Both default to enabled every boot. They are session-only and not persisted.
 
-The gates cover only the automatic detection feedback below. The boot jingle,
-the boot RGB cycle, the SD-init blink, and the on-demand `chirp`, `prox` and
-`jingle` verbs all run regardless.
+The gates cover only the automatic detection feedback below. The boot sound,
+the boot RGB cycle, the SD-init blink, and the on-demand `chirp`, `prox`,
+`jingle`, `crow` and `hawk` verbs all run regardless.
 
 ## Alert glossary
 
 | Situation              | LED                              | Buzzer                 |
 |------------------------|----------------------------------|------------------------|
-| Boot                   | White, after an R/G/B cycle      | Six-note jingle        |
+| Boot                   | White, after an R/G/B cycle      | Boot call              |
 | SD card not found      | Blue, five flashes               | Silent                 |
 | New MAC or rediscovery | Vendor color, two pulses         | Two ascending beeps    |
 | Repeat within cooldown | None                             | Silent                 |
@@ -60,12 +60,28 @@ network name, so it yields no OUI to attribute to a vendor. See
 
 ## Startup
 
-| Event | LED                                                         | Buzzer                    |
-|-------|-------------------------------------------------------------|---------------------------|
-| Boot  | R, G, B cycle at 200 ms each, then a white flash for 200 ms | Six-note descending motif |
+| Event | LED                                                         | Buzzer    |
+|-------|-------------------------------------------------------------|-----------|
+| Boot  | R, G, B cycle at 200 ms each, then a white flash for 200 ms | Crow call |
 
 The RGB cycle is a hardware sanity check that exposes a dead or miswired channel
 at boot.
+
+`BOOT_SOUND` selects the call: `BOOT_SOUND_CROW` (default), `BOOT_SOUND_HAWK`, or
+`BOOT_SOUND_JINGLE` for a six-note descending motif. The `crow` and `hawk` verbs
+play both calls regardless of the selection, so the two can be compared on the
+real element without a reflash.
+
+A piezo emits one square wave, so neither call is a reproduction. A corvid caw is
+broadband, and its fundamental falls below the range a bending-disc element
+radiates usefully.
+
+The tones reproduce the cadence and the pitch glide within each syllable
+instead, which is what identifies a call to a listener, and a fast frequency
+wobble substitutes for the rasp. Frequencies stay within the element's efficient
+band rather than at the call's true pitch, trading realism for audibility. The
+hawk call is closer to a pure descending glide, so less of it is lost to the
+element.
 
 ## SD card init
 
@@ -238,6 +254,9 @@ from `coreNotifyTick()`; `HB_BEEP_INTERVAL_MS`, `HB_DEVICE_ACTIVE_MS` and
 | `PROX_HYST_PCT`                            | percent of the ring the latch clears beyond                |
 | `PROX_EMA_SHIFT`                           | RSSI smoothing, alpha = 1 / 2^shift                        |
 | `ALERT_COOLDOWN_MS`                        | repeat-suppression window                                  |
+| `BOOT_SOUND`                               | which boot call plays: crow, hawk, or the legacy jingle    |
+| `BIRD_RASP_PCT`                            | bird-call wobble depth, the stand-in for rasp              |
+| `BIRD_STEP_MS`                             | bird-call sweep step, which also sets the wobble rate      |
 | `REDISCOVER_MS`                            | silence after which a known MAC counts as new again        |
 | `HB_BEEP_INTERVAL_MS`                      | heartbeat pulse interval                                   |
 | `HB_DEVICE_ACTIVE_MS`                      | how long a target counts as still in range                 |

@@ -33,7 +33,7 @@ static void baseInfo(RoostSessionInfo* info, RoostFileDecl* decls,
   info->ownMacs = kMacs;
   info->numOwnMacs = 1;
   info->gnssCepM = 2.5f;
-  info->sessionId = "bscope-8-8-26-5";
+  info->sessionId = "bscope-2233-260808-5";
   info->sequence = 5;
   info->bootCount = 6;
   info->clockAnchored = 1;

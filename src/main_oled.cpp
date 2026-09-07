@@ -162,6 +162,23 @@ static void displayInit() {
   delay(50);
 #else
   Wire.begin(OLED_SDA, OLED_SCL);
+
+  // OLED_I2C_ADDR is the panel's 7-bit address, set by boards whose
+  // module does not answer on u8g2's default. A board that sets the address
+  // also gets a boot-time probe naming every device on the bus, so a blank
+  // screen says whether it is a wrong address or no panel.
+#ifdef OLED_I2C_ADDR
+  u8g2.setI2CAddress(OLED_I2C_ADDR << 1);
+  Wire.beginTransmission(OLED_I2C_ADDR);
+  if (Wire.endTransmission() != 0) {
+    dualPrintf("[bscope] oled: no ack at 0x%02X on SDA=%d SCL=%d\n",
+               OLED_I2C_ADDR, OLED_SDA, OLED_SCL);
+    for (uint8_t a = 0x08; a < 0x78; a++) {
+      Wire.beginTransmission(a);
+      if (Wire.endTransmission() == 0) dualPrintf("[bscope] oled: i2c device at 0x%02X\n", a);
+    }
+  }
+#endif
 #endif
 
   u8g2.begin();
@@ -176,7 +193,7 @@ static void displayInit() {
     char line[22];
     snprintf(line, sizeof(line), "v%s %s", BIRDOSCOPE_VERSION, coreBuildRev());
     u8g2.drawStr(0, 44, line);
-    u8g2.drawStr(0, 58, BIRDOSCOPE_GIT_DATE);
+    u8g2.drawStr(0, 58, BIRDOSCOPE_BUILD_DATE);
   }
   u8g2.sendBuffer();
 }
@@ -190,20 +207,20 @@ static void displayMessage(const char* line1, const char* line2) {
   u8g2.sendBuffer();
 }
 
-#if NAV_SCHEME_3BTN
+#if NAV_BTN_COUNT
 #include "screens.inc"
-#endif  // NAV_SCHEME_3BTN
+#endif  // NAV_BTN_COUNT
 
 static void displayTick() {
 #if DEMO_MODE
   // Before the hop check below, so the pinned channel never reads as a change
   // and never forces an extra repaint.
   demoSeedDisplayState();
-#if NAV_SCHEME_3BTN
+#if NAV_BTN_COUNT
   coreCurrentScreen = SCREEN_OVERVIEW;
 #endif
 #endif
-#if NAV_SCHEME_3BTN
+#if NAV_BTN_COUNT
   if (markOverlayUntil) {
     if (millis() < markOverlayUntil) return;   // hold the mark overlay
     markOverlayUntil = 0;
@@ -225,7 +242,7 @@ static void displayTick() {
   dispDirty = false;
   dispLastRefresh = now;
 
-#if NAV_SCHEME_3BTN
+#if NAV_BTN_COUNT
   displayScreen();
 #else
   char line[22];
@@ -251,19 +268,21 @@ static void displayTick() {
   u8g2.drawStr(0, 58, line);
 #endif
   u8g2.sendBuffer();
-#endif  // NAV_SCHEME_3BTN
+#endif  // NAV_BTN_COUNT
 }
 
 // Manual "area of interest" marker. On the 3-button scheme it's the dedicated
 // long-press of BTN_1 (NAV_MARK, available regardless of screen). On the
 // 2-button scheme it is BTN_PIN_2 (INPUT_MANUAL_MARK).
+// The mark is written before the survey window opens, per spec O1.
 static void triggerManualAlert() {
   fyLastTargetSeen = millis();
 #if USE_SD
   roostLogOperatorMark();
 #endif
   dualPrintln("[bscope] MANUAL ALERT logged (area of interest)");
-#if NAV_SCHEME_3BTN
+  coreSurveyStart();
+#if NAV_BTN_COUNT
   drawMarkOverlay();                            // brief "Saved Manual Record!" flash
   markOverlayUntil = millis() + MARK_OVERLAY_MS;
 #endif
@@ -275,7 +294,7 @@ static void displayAdmin();   // defined below. checkInput() shows it on Admin e
 // out before displayTick() repaints over the Admin screen (mirrors the BOOT
 // double-press path). Only ever true on the 3-button scheme.
 static bool checkInput() {
-#if NAV_SCHEME_3BTN
+#if NAV_BTN_COUNT
   // Drain every pending nav event this tick (physical buttons + serial injector).
   NavEvent ev;
   while ((ev = coreNavTick()) != NAV_NONE) {
@@ -319,7 +338,7 @@ static void printStatus() {
   unsigned long s  = ms / 1000;
   dualPrintf("[bscope] status: uptime=%lus ch=%u mode=%s det=%d spiffs=%d"
              " heap=%u psram=%u sniffing=%d direct=%u indirect=%u"
-             " seen=%u cand=%u qdrop=%u\n",
+             " seen=%u cand=%u qdrop=%u survey=%us\n",
              s, currentChannel, channelModeName(), fyDetCount,
              fySpiffsReady ? 1 : 0,
              (unsigned)ESP.getFreeHeap(),
@@ -327,7 +346,8 @@ static void printStatus() {
              sniffingStopped ? 0 : 1,
              (unsigned)coreDirectFrames, (unsigned)coreIndirectFrames,
              (unsigned)coreSeenFrames, (unsigned)coreCandidateFrames,
-             (unsigned)coreQueueDrops);
+             (unsigned)coreQueueDrops,
+             (unsigned)(coreSurveyRemainingMs() / 1000));   // 0 when no window is open
   // From the roost writer, the same source the serial heartbeat reads.
   uint32_t rw = 0, rd = 0, wf = 0, fx = 0;
   roostSessionStats(&rw, &rd, &wf, &fx);
@@ -470,7 +490,7 @@ void setup() {
     // silent. Runs before loop()/coreInputTick(), so the LED pin is still ours.
     dualPrintln("[bscope] SD card not found - saving to SPIFFS");
     coreLedBlink(0, 0, 255, 5, 150, 150);
-#if NAV_SCHEME_3BTN
+#if NAV_BTN_COUNT
     // A board with a Confirm button blocks here until the operator
     // acknowledges, so a missing card cannot pass unnoticed at boot.
     // coreNavTick() self-inits the button pins on first call. A board without
@@ -506,7 +526,14 @@ void loop() {
   // so this is not a latch. Detect and Admin can alternate freely.
   if (webPortalActive()) {
     webPortalTick();                                             // may release (web / idle timeout)
-    if (webPortalActive() && coreAdminTriggerCheck()) webPortalStop();   // BOOT double-press also exits
+#if NAV_BTN_COUNT
+    const NavEvent adminEv = coreNavTick();   // drained every loop so the queue cannot stale
+#else
+    const NavEvent adminEv = NAV_NONE;
+#endif
+    // Buttons are otherwise inert in Admin. Only the sustained Back hold acts,
+    // so a stray press cannot drop the portal mid-session.
+    if (webPortalActive() && (adminEv == NAV_BACK_HOLD || coreAdminTriggerCheck())) webPortalStop();
     wasAdmin = true;
     delay(2);
     return;
@@ -525,6 +552,7 @@ void loop() {
   updateChannelMode();
   checkSerialCommands();
   if (checkInput()) return;   // Config menu → Admin: portal serviced next loop
+  coreSurveyTick();     // closes an operator survey window once it has elapsed
   drainAlertQueue();
   displayTick();        // refresh OLED after any queue drain
   autosaveTick();       // periodic SPIFFS write if dirty

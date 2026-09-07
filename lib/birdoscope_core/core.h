@@ -32,6 +32,9 @@
 #ifndef BIRDOSCOPE_GIT_DATE
 #define BIRDOSCOPE_GIT_DATE "unknown"
 #endif
+#ifndef BIRDOSCOPE_BUILD_DATE
+#define BIRDOSCOPE_BUILD_DATE "unknown"
+#endif
 #ifndef BIRDOSCOPE_BUILD_TS
 #define BIRDOSCOPE_BUILD_TS "unknown"
 #endif
@@ -157,6 +160,10 @@ typedef enum : uint8_t {
   // every type but ALERT_OUI_ADDR1, and split from ALERT_OUI_ADDR2 so the
   // probed name survives to the log.
   ALERT_DIRECTED_PROBE  = 5,
+  // A frame that matched no target, captured only while an operator survey
+  // window is open. It reaches the log and nothing else: no detection table
+  // entry, no counter, no display or notification. See coreSurveyStart().
+  ALERT_SURVEY          = 6,
 } AlertType;
 
 // Frame facts recorded by POSITION, never by role. A role name varies per
@@ -216,7 +223,7 @@ void coreUnixToIso(uint32_t unix, char* buf, size_t len);
 bool coreTimestampAt(uint32_t uptimeMs, char* buf, size_t len);
 
 // Session identity and provenance for the manifest.
-// Fills buf with the next free /bscope-M-D-YY-N. False when the day's 99
+// Fills buf with the next free /bscope-TAG-YYMMDD-N. False when the day's 99
 // names are all taken: the session then keeps its boot name rather than
 // being renamed onto an existing directory.
 bool     coreSessionDirName(char* buf, size_t len);
@@ -224,6 +231,9 @@ uint32_t coreSessionSequence();
 uint32_t coreBootCount();
 uint32_t coreOuiTableHash();     // captures either side of a table change are not comparable
 const char* coreDeviceSerial();
+// The last four hex digits of the serial, naming the unit in a session
+// directory name. Empty where the hardware has no serial. Spec 6.2.
+const char* coreDeviceTag();
 const char* coreOwnMac();
 const char* coreCountryCode();
 // Both render a registry `list` for config_change and return false when the
@@ -410,6 +420,45 @@ void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t* mac,
 // ============================================================
 
 CoreAlertResult coreHandleAlert(const AlertEntry& e);
+
+// ============================================================
+// OPERATOR SURVEY WINDOW: a bounded interval during which every frame the
+// radio delivers is logged, not only frames matching the target table.
+//
+// Rows go to wifi_obs carrying detection_method=operator_survey, capped per
+// device rather than per frame. Frames still pass the frame-type and RSSI_MIN
+// gates, and no radio setting changes for the window's duration.
+//
+// Spec O1-O7 [D9] govern this. A board reads it as: call coreSurveyStart() on
+// an operator mark and coreSurveyTick() once per loop().
+// ============================================================
+
+// Duration options in seconds, for a settings screen. Index 0 is the default.
+#define SURVEY_OPTION_COUNT 3
+extern const uint16_t SURVEY_OPTIONS_S[SURVEY_OPTION_COUNT];
+extern volatile uint16_t coreSurveySecs;
+
+// Opens the window, or extends it to a full duration if one is already open.
+void coreSurveyStart();
+
+// Closes the window once its duration has elapsed and reports what it caught.
+// Boards call this once per loop(); it does nothing while no window is open.
+void coreSurveyTick();
+
+bool coreSurveyActive();
+
+// Window accounting, reset when a window opens, reported on close per spec O7.
+// `Rows` is survey frames offered to the queue, `Suppressed` is frames the
+// per-MAC cap held back, and `Evictions` counts a new MAC displacing a slot
+// still inside its window, meaning the table is undersized for the environment.
+extern volatile uint32_t coreSurveyRows;
+extern volatile uint32_t coreSurveySuppressed;
+extern volatile uint32_t coreSurveyEvictions;
+
+// Milliseconds left in the open window, 0 when none is open. For a board that
+// wants to show the window running.
+uint32_t coreSurveyRemainingMs();
+
 extern int  fyDetCount;
 extern unsigned long fyLastTargetSeen;
 
@@ -561,6 +610,11 @@ void corePlayDetectChirp();
 void corePlayStartupJingle();
 void corePlayProximityChirp();
 
+// The two bird calls, playable whichever one BOOT_SOUND selects, per spec A5.
+// Back the "crow" and "hawk" verbs. See docs/alerts.md for the tuning knobs.
+void corePlayCrowCall();
+void corePlayHawkCall();
+
 // ============================================================
 // PROXIMITY ALERT: a second chirp when a tracked target crosses inside a range
 // ring, since the new-detection chirp fires once per MAC per REDISCOVER_MS and
@@ -605,19 +659,48 @@ InputEvent coreInputTick();
 // screen logic. Events also arrive from the serial nav injector
 // (coreInjectNav), so the screen and menu machine can be driven over serial
 // with no physical input. coreNavTick() reads the physical buttons only under
-// NAV_SCHEME_3BTN. A 2-button board uses coreInputTick() instead. The injector
+// a NAV_SCHEME. A 2-button board uses coreInputTick() instead. The injector
 // works on any board.
 //
-// 3-button map: BTN_1 short=UP / long=MARK · BTN_2 short=DOWN · BTN_3
-// short=SELECT / long=BACK. Manual-mark keeps a dedicated, always-available
-// gesture on long BTN_1 rather than an overloaded context press.
+// 3-button map: BTN_1 short=UP / long=MARK, BTN_2 short=DOWN, BTN_3
+// short=SELECT / long=BACK.
+// 4-button map: as above, with BACK moved to BTN_4 short, so SELECT no longer
+// carries a long press.
+// Manual-mark keeps a dedicated, always-available gesture on long BTN_1 rather
+// than an overloaded context press, under both schemes.
+//
+// Whichever button carries BACK also emits NAV_BACK_HOLD once it has been held
+// for NAV_EXIT_HOLD_MS. Only the Admin screen consumes it, so leaving the web
+// portal takes a deliberate hold rather than a reachable click. Under the
+// 4-button scheme the hold cancels the short BACK that release would emit.
+// Under the 3-button scheme BACK has already fired at NAV_LONG_PRESS_MS, and
+// Admin ignores it.
 // ============================================================
 
 #ifndef NAV_SCHEME_3BTN
 #define NAV_SCHEME_3BTN 0
 #endif
+#ifndef NAV_SCHEME_4BTN
+#define NAV_SCHEME_4BTN 0
+#endif
+#if NAV_SCHEME_3BTN && NAV_SCHEME_4BTN
+#error "NAV_SCHEME_3BTN and NAV_SCHEME_4BTN are mutually exclusive"
+#endif
+
+// Physical buttons feeding coreNavTick(), and the flag the screen and menu code
+// gates on. 0 means the board has no semantic nav and uses coreInputTick().
+#if NAV_SCHEME_4BTN
+#define NAV_BTN_COUNT 4
+#elif NAV_SCHEME_3BTN
+#define NAV_BTN_COUNT 3
+#else
+#define NAV_BTN_COUNT 0
+#endif
 #ifndef NAV_LONG_PRESS_MS
 #define NAV_LONG_PRESS_MS 500   // hold >= this many ms = long press (BACK / MARK)
+#endif
+#ifndef NAV_EXIT_HOLD_MS
+#define NAV_EXIT_HOLD_MS 3000   // hold >= this many ms on Back = NAV_BACK_HOLD
 #endif
 
 typedef enum {
@@ -627,10 +710,11 @@ typedef enum {
   NAV_SELECT,  // enter menu / confirm selection
   NAV_BACK,    // exit menu (no change)
   NAV_MARK,    // manual "area of interest" marker (always available)
+  NAV_BACK_HOLD,  // sustained hold of the Back button: leave Admin
 } NavEvent;
 
 // Returns the next pending nav event, taking serial-injected events first and
-// then the physical buttons under NAV_SCHEME_3BTN, or NAV_NONE. Self-inits its
+// then the physical buttons under a NAV_SCHEME, or NAV_NONE. Self-inits its
 // pins on first call. Poll once per loop, like coreInputTick().
 NavEvent coreNavTick();
 
@@ -699,6 +783,11 @@ extern int       coreMenuSel;
 
 #ifndef BOOT_DOUBLE_PRESS_MS
 #define BOOT_DOUBLE_PRESS_MS 600   // max gap between the two presses
+#endif
+// A board that reaches Admin from its menus sets this to 0. The check then
+// always returns false and never claims BOOT_BTN_PIN.
+#ifndef BOOT_ADMIN_TRIGGER
+#define BOOT_ADMIN_TRIGGER 1
 #endif
 bool coreAdminTriggerCheck();
 

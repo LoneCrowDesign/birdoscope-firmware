@@ -125,33 +125,24 @@ those scripts do and the bring-up gotchas they exist to work around.
 
 ### Knowing which build is on a device
 
-Every build stamps itself with its git identity, so a device in the field can
-say which commit it is running rather than leaving it to be reconstructed from
-file timestamps afterwards. It appears in four places:
+Every build stamps itself with its git identity, so you can easily identify what version it's running. It appears in four places:
 
-- The boot splash on OLED boards, for the few seconds after a flash.
+- The boot splash on OLED boards, for the few seconds after a flash. Space is
+  tight there, so it carries the commit hash and the build date only.
 - The first line of the boot serial log, so it appears in any captured session.
 - `status`, on both the serial and web consoles.
 - The session manifest and the `boot` event, so a capture carries the build that
   produced it.
 
+Everywhere else the string carries both dates, labelled `committed` and
+`built`, and depends on individual versioning, etc.
+
 The build time also serves as a clock floor. A GPS fix reporting a time earlier
 than the build cannot be correct, so it is refused and the session stays
 unanchored rather than adopting a wrong time.
 
-A build from a tree with uncommitted changes reports a `-dirty` suffix, which
-is the case that is otherwise impossible to pin down later. A build with no git
-available reports `unknown` rather than claiming an identity it does not have.
+The commit hash names the checked-out commit, a build with no git available reports `unknown`.
 
-Two limits on how far to trust the string:
-
-- `-dirty` covers modified tracked files only, so a tree holding a brand-new
-  untracked source file still reports clean.
-- The stamp is computed when the build runs, not when the binary is linked, so
-  a tree that is edited, built, reverted and built again can relink from cache
-  and report the earlier answer.
-
-Neither applies to the ordinary case of flashing whatever is checked out.
 
 `tools/git_version.py` does the stamping, wired in from `[common]` in
 `platformio.ini`, so every environment inherits it.
@@ -183,12 +174,9 @@ marker, so the source itself records where a mechanism came from. See `NOTICE`.
 
 ## Use of AI
 
-I leaned heavily on AI to implement several parts of this project. If you consider
-all AI-assisted or fully-generated code to be suspect or outright garbage, I get
-it, but there are better places to debate it. The point of this project is to find
-surveillance infrastructure so that people can have informed conversations about it.
-Please feel free to take from the many all-human elements of the project and build
-to your taste.
+I leaned heavily on AI to implement many parts of this project. If that is an issue
+for you, this is your warning. I welcome any contributions or improvements you have
+to offer, there is a lot of work left to do on this.
 
 ## Documentation
 
