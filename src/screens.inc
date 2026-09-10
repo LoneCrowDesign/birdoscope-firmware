@@ -261,8 +261,59 @@ static void drawConfig() {
   if (coreMenuState == MENU_NONE) u8g2.drawStr(0, ROW4, "Select to enter");
 }
 
+// Device-wipe menu. Both rows arm the three-press confirmation rather than
+// acting, so the scope is chosen before anything is irreversible. See core.h.
+
+#define WIPE_ROW1    33
+#define WIPE_ROW_GAP 13
+static void drawWipe() {
+  drawScreenHeader("DEVICE WIPE");
+  static const char* const opts[2] = { "Wipe Device", "Wipe Device + Card" };
+  for (int i = 0; i < 2; i++) {
+    char line[22];
+    char cursor = (coreMenuState == MENU_LIST && coreMenuSel == i) ? '>' : ' ';
+    snprintf(line, sizeof(line), "%c%s", cursor, opts[i]);
+    u8g2.drawStr(0, WIPE_ROW1 + i * WIPE_ROW_GAP, line);
+  }
+}
+
+// Wipe confirmation, drawn in place of the carousel while coreMenuState is
+// MENU_CONFIRM_WIPE. Names the scope as well as the count, so the card is never
+// erased by a gesture the operator thought applied to the device alone.
+static void drawWipeConfirm() {
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawFrame(2, 8, 124, 52);
+
+  const char* scope = (coreWipeSelectedScope() == WIPE_DEVICE_AND_CARD)
+                        ? "Wipe Device + Card" : "Wipe Device";
+  u8g2.drawStr((128 - u8g2.getStrWidth(scope)) / 2, 22, scope);
+
+  char prompt[22];
+  snprintf(prompt, sizeof(prompt), "Press Confirm %dx", WIPE_CONFIRM_PRESSES);
+  u8g2.drawStr((128 - u8g2.getStrWidth(prompt)) / 2, 36, prompt);
+
+  // One star per press landed, in a larger face so the count reads at a glance.
+  char stars[WIPE_CONFIRM_PRESSES * 2] = "";
+  int n = 0;
+  for (int i = 0; i < coreWipeConfirmCount && i < WIPE_CONFIRM_PRESSES; i++) {
+    if (i) stars[n++] = ' ';
+    stars[n++] = '*';
+  }
+  stars[n] = '\0';
+  u8g2.setFont(u8g2_font_10x20_tf);
+  u8g2.drawStr((128 - u8g2.getStrWidth(stars)) / 2, 56, stars);
+  u8g2.setFont(u8g2_font_6x10_tf);
+}
+
 static void displayScreen() {
   u8g2.clearBuffer();
+  // The confirmation is modal: it replaces the carousel rather than overlaying
+  // a screen, so no other reading can be mistaken for the thing being armed.
+  if (coreMenuState == MENU_CONFIRM_WIPE) {
+    drawWipeConfirm();
+    u8g2.sendBuffer();
+    return;
+  }
   switch (coreCurrentScreen) {
     case SCREEN_OVERVIEW:    drawOverview();    break;
     case SCREEN_GPS:         drawGpsDetail();   break;
@@ -272,6 +323,7 @@ static void displayScreen() {
     case SCREEN_TARGETS:     drawTargets();     break;
     case SCREEN_ALERTS:      drawAlerts();      break;
     case SCREEN_CONFIG:      drawConfig();      break;
+    case SCREEN_WIPE:        drawWipe();        break;
     default: break;
   }
   u8g2.sendBuffer();

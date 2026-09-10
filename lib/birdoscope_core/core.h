@@ -739,6 +739,7 @@ typedef enum {
   SCREEN_TARGETS,       // menu: which vendors to match (Flock / Axon / All)
   SCREEN_ALERTS,        // menu: Buzzer mute/unmute + LED on/off (toggle in place)
   SCREEN_CONFIG,        // menu: web console On / Off (Admin entry)
+  SCREEN_WIPE,          // menu: device wipe, device only or device + card
   SCREEN_COUNT,
 } ScreenId;
 
@@ -752,6 +753,7 @@ typedef enum {
   NAV_ACT_REDRAW,   // screen/menu state changed, board should redraw
   NAV_ACT_MARK,     // run the manual area-of-interest marker
   NAV_ACT_ADMIN,    // enter Admin (web portal), Config menu confirmed "On"
+  NAV_ACT_WIPE,     // device wipe confirmed, board runs coreDeviceWipe()
 } NavAction;
 
 // Feed one NavEvent into the screen/menu state machine. Updates
@@ -763,10 +765,14 @@ NavAction coreNavApply(NavEvent ev);
 //   MENU_LIST          an option list is open, coreMenuSel = highlighted index
 //   MENU_PICK_CHANNEL  Single-mode channel picker, coreMenuSel = channel dialed
 //   MENU_PICK_PROX     proximity-ring picker, coreMenuSel = PROX_RING_OPTIONS index
+//   MENU_CONFIRM_WIPE  device-wipe confirmation, coreWipeConfirmCount = presses
 // Boards read these to render the cursor and edit state. While the state is not
 // MENU_NONE the carousel is frozen, with Up/Down moving the highlight instead,
-// and long-Back pops out.
-typedef enum { MENU_NONE, MENU_LIST, MENU_PICK_CHANNEL, MENU_PICK_PROX } MenuState;
+// and long-Back pops out. MENU_CONFIRM_WIPE additionally ignores Up/Down and
+// the manual mark, so only Select and Back reach an armed wipe.
+typedef enum {
+  MENU_NONE, MENU_LIST, MENU_PICK_CHANNEL, MENU_PICK_PROX, MENU_CONFIRM_WIPE
+} MenuState;
 extern MenuState coreMenuState;
 extern int       coreMenuSel;
 
@@ -802,3 +808,63 @@ bool coreAdminTriggerCheck();
 // ============================================================
 
 void coreWifiSnifferStart();
+
+// ============================================================
+// DEVICE WIPE: erases everything that identifies a unit or the places it has
+// been, so a device can be sold, donated, or handed on. Reached from
+// SCREEN_WIPE, and confirmed by three deliberate Select presses.
+//
+// WIPE_DEVICE clears onboard state only, for the case where the
+// card is pulled and replaced. WIPE_DEVICE_AND_CARD also empties the card's
+// root. What goes in either case:
+//   RAM     the detection table, zeroed before anything is written
+//   SPIFFS  formatted, so a file added later needs no edit here to be caught
+//   NVS     erased whole, taking boot_count and the WiFi driver's own store
+//   SD      every root entry, recursively, under WIPE_DEVICE_AND_CARD
+//
+// Unerasable: the eFuse MAC and serial, which coreDeviceTag()
+// derives session directory names from. Copies of a session taken off the
+// device before a wipe still name the unit that made them.
+//
+// A card delete frees FAT entries; it does not overwrite the sectors. Treat it
+// as tidying, not sanitization, and destroy or host-format a card whose
+// contents matter.
+//
+// Interruption: the scope is written to NVS first and the NVS erase runs last,
+// so a power cut mid-wipe leaves the record of what was asked for. Boards call
+// coreWipePending() in setup() and finish the job before the sniffer starts.
+// There is no partial state a device can boot into and keep logging from.
+// ============================================================
+
+typedef enum {
+  WIPE_NONE = 0,
+  WIPE_DEVICE = 1,            // RAM + SPIFFS + NVS
+  WIPE_DEVICE_AND_CARD = 2,   // the above, plus the SD card root
+} WipeScope;
+
+// Runs the erase and returns. The caller shows its own completion frame and
+// then calls corePowerOff(). Stops the sniffer and closes the roost session
+// before touching storage, so nothing rewrites a file that was just removed.
+// Blocks for as long as the card takes.
+void coreDeviceWipe(WipeScope scope);
+
+// The scope of a wipe that was interrupted, WIPE_NONE if none. Call once from
+// setup() after SPIFFS and SD are mounted and before coreWifiSnifferStart(),
+// and pass a non-WIPE_NONE result straight back to coreDeviceWipe().
+WipeScope coreWipePending();
+
+// Blanks the LED and buzzer and enters deep sleep with every wake source
+// disabled. The board has no software-accessible power latch, so this is as 
+// good as it gets. Only reset or a power cycle brings it back, no wakeup
+// functionality defined so that wipe completion is forced.
+void corePowerOff();
+
+// Scope highlighted on SCREEN_WIPE and carried into the confirmation, and the
+// Select presses landed so far (0 to 3). Boards read both to draw the
+// confirmation overlay.
+WipeScope coreWipeSelectedScope();
+extern int coreWipeConfirmCount;
+
+// Select number of presses required to arm a wipe. Prevents accidental wipes or
+// interruptible time-based confirmation.
+#define WIPE_CONFIRM_PRESSES 3

@@ -16,8 +16,8 @@ the round TFT board renders its own UX. See [Board parity](board_parity.md).
 
 ## Top-level screens (carousel)
 
-Up and Down cycle through eight screens, wrapping at both ends. Four are
-read-only detail views and four are menus you drill into with Select.
+Up and Down cycle through nine screens, wrapping at both ends. Four are
+read-only detail views and five are menus you drill into with Select.
 
 1. Overview: detection count, channel, GPS fix flag (Y/N), and for the last hit
    its vendor, RSSI, channel, and a rough distance estimate. Shows `scanning...`
@@ -62,15 +62,15 @@ read-only detail views and four are menus you drill into with Select.
 
    ![Web Config screen](../assets/images/carousel_demo/10_web_config.png)
 
-Screens are rendered from the firmware's own drawing code by
-`tools/screen_render`, not photographed, so they track the display exactly. The
-sample values are a stand-in scan, not a real capture. Image filenames follow the
-renderer's frame order rather than the carousel positions above, so that adding a
-screen does not rename the existing files.
+9. Device Wipe (menu): Wipe Device or Wipe Device + Card, each behind a
+   three-press confirmation.
+
+   ![Device Wipe screen](../assets/images/carousel_demo/16_wipe.png)
+
 
 ### Scan Mode menu
 
-Switches the channel strategy live, in RAM, resetting to the board default of
+Switches the channel strategy live, and resets to the board default of
 Custom on reboot. The active mode is marked `*` and the cursor is `>`.
 
 - **Custom Scan**: hop the board's custom list (1, 6, 11) at the default dwell.
@@ -106,10 +106,9 @@ proximity ring does persist: it is calibration-class, like the distance
 settings.
 
 Each row shows its current state. Select flips the highlighted gate in place and
-stays in the list, unlike the act-and-close Scan Mode and Web Config menus, so
-both can be set before long-Back pops out. The state lives in core
+stays in the list. The state lives in core
 (`coreBuzzerEnabled`, `coreLedEnabled`, `coreProxRingM`), so a board without the
-Alerts screen still honors it.
+Alerts screen can use it as well.
 
 - **Buzzer, Unmuted or Muted**: gates the new-detection and proximity chirps.
   The boot jingle and the on-demand `chirp`, `prox` and `jingle` verbs are
@@ -137,6 +136,20 @@ Starts and stops the Admin-mode web portal:
   double-press is a further escape. Analyze r0.2 clears that flag, leaving the
   hold as its only button route out.
 - **Off**: closes the menu and returns to the resting Detect state.
+
+### Device Wipe menu
+
+Erases the unit so it can be sold, donated, or handed on. Selecting either wipe option prompts a confirmation screen to avoid accidental data loss. After the wipe function finishes running, the device is put into deep sleep and must be power cycled to start fresh.
+
+- **Wipe Device**: onboard state only. The detection table is zeroed, SPIFFS is
+  formatted, and the NVS partition is erased whole. For the usual case, where
+  the card is pulled and replaced rather than cleaned.
+- **Wipe Device + Card**: the above, plus every entry in the card's root,
+  removed recursively.
+
+![Device Wipe menu, drilled in](../assets/images/carousel_demo/17_wipe_open.png)
+
+
 
 ## Round TFT screens (esp32round)
 

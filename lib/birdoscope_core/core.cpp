@@ -22,6 +22,8 @@
 #include <Preferences.h>   // boot_count, which must survive a power cut
 #include "esp_mac.h"       // esp_read_mac() for own_macs and device_serial
 #include "esp_event.h"
+#include "nvs_flash.h"     // whole-partition erase, in coreDeviceWipe()
+#include "esp_sleep.h"     // deep sleep, in corePowerOff()
 
 #ifndef MIRROR_SERIAL
 #define MIRROR_SERIAL 0
@@ -2864,8 +2866,15 @@ ScreenId  coreCurrentScreen = SCREEN_OVERVIEW;
 MenuState coreMenuState      = MENU_NONE;
 int       coreMenuSel        = 0;
 
+int              coreWipeConfirmCount = 0;
+static WipeScope g_wipeScope          = WIPE_NONE;
+WipeScope coreWipeSelectedScope() { return g_wipeScope; }
+
 NavAction coreNavApply(NavEvent ev) {
-  if (ev == NAV_MARK) return NAV_ACT_MARK;   // always available, any screen/menu
+  // Available on every screen and menu except an armed wipe, where only Select
+  // and Back are live and a mark would write a row about to be erased.
+  if (ev == NAV_MARK)
+    return (coreMenuState == MENU_CONFIRM_WIPE) ? NAV_ACT_NONE : NAV_ACT_MARK;
 
   switch (coreMenuState) {
 
@@ -2899,6 +2908,11 @@ NavAction coreNavApply(NavEvent ev) {
           coreMenuSel   = 1;                          // Off, the portal is closed while browsing Detect
           return NAV_ACT_REDRAW;
         }
+        if (coreCurrentScreen == SCREEN_WIPE) {
+          coreMenuState = MENU_LIST;
+          coreMenuSel   = 0;                          // the narrower scope, device only
+          return NAV_ACT_REDRAW;
+        }
         return NAV_ACT_NONE;                           // info screens: nothing to select
       default:
         return NAV_ACT_NONE;                           // BACK at top level: nothing
@@ -2911,7 +2925,7 @@ NavAction coreNavApply(NavEvent ev) {
       case SCREEN_SCAN_MODES: n = 3; break;
       case SCREEN_TARGETS:    n = 3; break;
       case SCREEN_ALERTS:     n = 3; break;   // Buzzer / LED / Proximity
-      default:                n = 2; break;   // CONFIG
+      default:                n = 2; break;   // CONFIG / WIPE
     }
     switch (ev) {
       case NAV_UP:   coreMenuSel = (coreMenuSel + n - 1) % n; return NAV_ACT_REDRAW;
@@ -2955,6 +2969,14 @@ NavAction coreNavApply(NavEvent ev) {
           }
           return NAV_ACT_REDRAW;
         }
+        if (coreCurrentScreen == SCREEN_WIPE) {
+          // Selecting a scope only arms the confirmation; nothing is erased
+          // until WIPE_CONFIRM_PRESSES more Selects land.
+          g_wipeScope          = (coreMenuSel == 1) ? WIPE_DEVICE_AND_CARD : WIPE_DEVICE;
+          coreWipeConfirmCount = 0;
+          coreMenuState        = MENU_CONFIRM_WIPE;
+          return NAV_ACT_REDRAW;
+        }
         // CONFIG
         coreMenuState = MENU_NONE;
         if (coreMenuSel == 0) return NAV_ACT_ADMIN;    // On → enter Admin
@@ -2963,6 +2985,21 @@ NavAction coreNavApply(NavEvent ev) {
         return NAV_ACT_NONE;
     }
   }
+
+  case MENU_CONFIRM_WIPE:
+    switch (ev) {
+      case NAV_SELECT:
+        if (++coreWipeConfirmCount >= WIPE_CONFIRM_PRESSES) return NAV_ACT_WIPE;
+        return NAV_ACT_REDRAW;
+      case NAV_BACK:
+        // Any Back abandons the whole gesture rather than dropping one press,
+        // so a cancel is never one press short of a wipe.
+        coreWipeConfirmCount = 0;
+        coreMenuState        = MENU_LIST;
+        return NAV_ACT_REDRAW;
+      default:
+        return NAV_ACT_NONE;   // Up/Down inert: an armed wipe takes no navigation
+    }
 
   case MENU_PICK_PROX:
     switch (ev) {
@@ -3329,4 +3366,152 @@ bool coreVendorMaskStr(char* buf, size_t len) {
   for (int i = 0; i < VENDOR_COUNT; i++)
     if (coreVendorMask & (1u << i)) roostValueAddText(&v, kNames[i]);
   return roostValueDone(&v) != 0;
+}
+
+// ============================================================
+// DEVICE WIPE (see core.h): scope to NVS first, NVS erased last, so the only
+// two states a boot can find are "nothing asked for" and "asked for, run it".
+// ============================================================
+
+#define WIPE_NVS_NAMESPACE "bscope"
+#define WIPE_NVS_KEY       "wipe"
+
+#if USE_SD
+// Recursion limit. Session directories sit one level below the root, so this is
+// slack rather than a working depth; anything deeper is reported and left.
+#define WIPE_SD_MAX_DEPTH 3
+// Names held per pass, and the room each gets. Both are bounded because these
+// buffers are stack-resident at every level of the recursion.
+#define WIPE_SD_BATCH    6
+#define WIPE_SD_PATH_MAX 96
+
+// Empties `path` and removes it, returning false if anything survived.
+//
+// Names are read in batches and deleted after the listing is closed, never
+// through an open iterator, whose position is undefined across a removal. A
+// pass that removes nothing ends the walk, so an entry that refuses to unlink
+// costs the rest of the card nothing and cannot spin.
+static bool wipeSdPurge(const char* path, uint8_t depth) {
+  if (depth > WIPE_SD_MAX_DEPTH) {
+    dualPrintf("[bscope] wipe: %s below depth %u, left in place\n",
+               path, (unsigned)WIPE_SD_MAX_DEPTH);
+    return false;
+  }
+  bool ok = true;
+  for (;;) {
+    char names[WIPE_SD_BATCH][WIPE_SD_PATH_MAX];
+    bool isDir[WIPE_SD_BATCH];
+    int  n = 0;
+
+    File dir = SD.open(path);
+    if (!dir) return false;
+    if (!dir.isDirectory()) { dir.close(); return SD.remove(path); }
+    for (File e = dir.openNextFile(); e && n < WIPE_SD_BATCH; e = dir.openNextFile()) {
+      snprintf(names[n], WIPE_SD_PATH_MAX, "%s", e.path());
+      isDir[n] = e.isDirectory();
+      e.close();
+      n++;
+    }
+    dir.close();
+    if (n == 0) break;                                // emptied
+
+    int removed = 0;
+    for (int i = 0; i < n; i++) {
+      if (isDir[i] ? wipeSdPurge(names[i], depth + 1) : SD.remove(names[i])) {
+        removed++;
+      } else {
+        dualPrintf("[bscope] wipe: cannot remove %s\n", names[i]);
+        ok = false;
+      }
+    }
+    if (removed == 0) break;
+  }
+  if (strcmp(path, "/") == 0) return ok;              // the mount point itself stays
+  return SD.rmdir(path) && ok;
+}
+#endif
+
+static void wipeScopeRecord(WipeScope scope) {
+  Preferences p;
+  if (!p.begin(WIPE_NVS_NAMESPACE, false)) {
+    dualPrintln("[bscope] wipe: NVS unavailable, no resume record");
+    return;
+  }
+  p.putUChar(WIPE_NVS_KEY, (uint8_t)scope);
+  p.end();
+}
+
+WipeScope coreWipePending() {
+  Preferences p;
+  if (!p.begin(WIPE_NVS_NAMESPACE, true)) return WIPE_NONE;
+  const uint8_t v = p.getUChar(WIPE_NVS_KEY, (uint8_t)WIPE_NONE);
+  p.end();
+  if (v == (uint8_t)WIPE_DEVICE || v == (uint8_t)WIPE_DEVICE_AND_CARD)
+    return (WipeScope)v;
+  return WIPE_NONE;
+}
+
+void coreDeviceWipe(WipeScope scope) {
+  if (scope != WIPE_DEVICE && scope != WIPE_DEVICE_AND_CARD) return;
+  dualPrintf("[bscope] DEVICE WIPE starting (scope=%s)\n",
+             scope == WIPE_DEVICE_AND_CARD ? "device+card" : "device");
+
+  wipeScopeRecord(scope);
+
+  // Silence every writer before removing what they write, or the next autosave
+  // and manifest snapshot recreate files that were just deleted.
+  esp_wifi_set_promiscuous(false);
+  sniffingStopped = true;
+  memset(fyDet, 0, sizeof(fyDet));
+  fyDetCount      = 0;
+  fyLastSaveCount = 0;
+  fyDroppedNew    = 0;
+  fyDirty         = false;
+#if USE_SD
+  roostSessionEnd();   // closes the open row files; a no-op if none are open
+#endif
+
+#if USE_SD
+  if (scope == WIPE_DEVICE_AND_CARD) {
+    if (fySDReady) {
+      dualPrintln("[bscope] wipe: emptying SD root");
+      if (!wipeSdPurge("/", 0)) dualPrintln("[bscope] wipe: SD pass incomplete");
+      else                      dualPrintln("[bscope] wipe: SD root emptied");
+    } else {
+      dualPrintln("[bscope] wipe: no SD card mounted, card skipped");
+    }
+  }
+#endif
+
+  // Format rather than a list of paths to unlink: the list would need editing
+  // every time a file is added, and a missed one is a leak that looks like a
+  // clean device.
+  fySpiffsReady = false;
+  SPIFFS.end();
+  if (SPIFFS.format()) dualPrintln("[bscope] wipe: SPIFFS formatted");
+  else                 dualPrintln("[bscope] wipe: SPIFFS format FAILED");
+
+  // Last, and the step that clears the resume record. Also drops the WiFi
+  // driver's own NVS entries, so the radio comes up from cold on the next boot.
+  // The driver has to be down first: it holds handles into this partition.
+  esp_wifi_stop();
+  esp_wifi_deinit();
+  nvs_flash_deinit();
+  const esp_err_t err = nvs_flash_erase();
+  if (err == ESP_OK) dualPrintln("[bscope] wipe: NVS erased");
+  else               dualPrintf("[bscope] wipe: NVS erase FAILED (%d)\n", (int)err);
+  nvs_flash_init();
+
+  dualPrintln("[bscope] DEVICE WIPE complete");
+}
+
+void corePowerOff() {
+  ledSet(0, 0, 0);
+#if USE_BUZZER
+  digitalWrite(BUZZER_PIN, LOW);
+#endif
+  dualPrintln("[bscope] powering off (deep sleep, reset to wake)");
+  Serial.flush();
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  esp_deep_sleep_start();
 }

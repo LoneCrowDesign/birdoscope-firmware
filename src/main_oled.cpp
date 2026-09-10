@@ -290,6 +290,40 @@ static void triggerManualAlert() {
 
 static void displayAdmin();   // defined below. checkInput() shows it on Admin entry
 
+// Runs a confirmed or resumed device wipe and powers the board down. Never
+// returns. The erase itself is in core, this owns the two frames around it and
+// the warning not to cut power.
+
+static void displayCenteredMessage(const char* l1, const char* l2, const char* l3) {
+  const int w   = u8g2.getDisplayWidth();
+  const int n   = l3 ? 3 : 2;
+  const int gap = 13;
+  int y = (u8g2.getDisplayHeight() - ((n - 1) * gap + 9)) / 2 + 7;
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  const char* lines[3] = { l1, l2, l3 };
+  for (int i = 0; i < n; i++, y += gap)
+    u8g2.drawStr((w - u8g2.getStrWidth(lines[i])) / 2, y, lines[i]);
+  u8g2.sendBuffer();
+}
+
+static void runDeviceWipe(WipeScope scope) {
+  // A card scope with no card reports what it could not do rather than showing
+  // the same completion frame as a wipe that reached everything.
+#if USE_SD
+  const bool cardMissed = (scope == WIPE_DEVICE_AND_CARD) && !fySDReady;
+#else
+  const bool cardMissed = (scope == WIPE_DEVICE_AND_CARD);
+#endif
+  displayCenteredMessage("DEVICE WIPE", "Erasing, do not", "power off");
+  coreDeviceWipe(scope);
+  displayCenteredMessage(cardMissed ? "WIPED, NO CARD" : "WIPE COMPLETE",
+                         "Powering off", nullptr);
+  delay(2000);
+  u8g2.setPowerSave(1);        // blank the panel, so the board reads as off
+  corePowerOff();
+}
+
 // Returns true if a nav action entered Admin mode this tick, so loop() can bail
 // out before displayTick() repaints over the Admin screen (mirrors the BOOT
 // double-press path). Only ever true on the 3-button scheme.
@@ -305,6 +339,8 @@ static bool checkInput() {
       webPortalStart(WEB_PORTAL_AP_SSID, WEB_PORTAL_AP_PASSWORD);
       displayAdmin();
       return true;
+    } else if (act == NAV_ACT_WIPE) {   // Device Wipe, third Confirm landed
+      runDeviceWipe(coreWipeSelectedScope());
     } else if (act == NAV_ACT_REDRAW) {
       dispDirty = true;                  // repaint on next displayTick
     }
@@ -508,6 +544,16 @@ void setup() {
 #endif
   }
 #endif
+
+  // A wipe cut short by a power loss finishes here, with both filesystems
+  // mounted and before the sniffer can write anything new. Never returns.
+  {
+    const WipeScope pending = coreWipePending();
+    if (pending != WIPE_NONE) {
+      dualPrintln("[bscope] interrupted device wipe found, resuming");
+      runDeviceWipe(pending);
+    }
+  }
 
   // Raw-IDF promiscuous capture bring-up (Detect mode). Shared with
   // webPortalStop()'s resume path. See coreWifiSnifferStart() in core.

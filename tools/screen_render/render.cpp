@@ -47,14 +47,25 @@ typedef enum {
   SCREEN_TARGETS,
   SCREEN_ALERTS,
   SCREEN_CONFIG,
+  SCREEN_WIPE,
   SCREEN_COUNT,
 } ScreenId;
 
-typedef enum { MENU_NONE, MENU_LIST, MENU_PICK_CHANNEL, MENU_PICK_PROX } MenuState;
+typedef enum {
+  MENU_NONE, MENU_LIST, MENU_PICK_CHANNEL, MENU_PICK_PROX, MENU_CONFIRM_WIPE
+} MenuState;
+
+typedef enum { WIPE_NONE = 0, WIPE_DEVICE = 1, WIPE_DEVICE_AND_CARD = 2 } WipeScope;
+#define WIPE_CONFIRM_PRESSES 3
 
 static ScreenId  coreCurrentScreen = SCREEN_OVERVIEW;
 static MenuState coreMenuState     = MENU_NONE;
 static int       coreMenuSel       = 0;
+// The wipe confirmation reads a scope and a press count rather than coreMenuSel,
+// so the renderer carries both. Set per frame.
+static int       coreWipeConfirmCount = 0;
+static WipeScope dispWipeScope        = WIPE_DEVICE;
+static WipeScope coreWipeSelectedScope() { return dispWipeScope; }
 static bool      coreBuzzerEnabled = true;
 static bool      coreLedEnabled    = true;
 
@@ -161,6 +172,10 @@ struct Frame {
   ScreenId    screen;
   MenuState   menu;
   int         sel;
+  // Wipe confirmation only, where `sel` names no row: the presses landed and
+  // the scope they apply to.
+  int         wipePresses;
+  WipeScope   wipeScope;
 };
 
 // More frames than there are ScreenIds: the menu screens each look different
@@ -184,6 +199,10 @@ static const Frame FRAMES[] = {
   { "13_targets",           SCREEN_TARGETS,     MENU_NONE,         0 },
   { "14_targets_open",      SCREEN_TARGETS,     MENU_LIST,         1 },
   { "15_alerts_prox",       SCREEN_ALERTS,      MENU_PICK_PROX,    2 },
+  { "16_wipe",              SCREEN_WIPE,        MENU_NONE,         0 },
+  { "17_wipe_open",         SCREEN_WIPE,        MENU_LIST,         1 },
+  { "18_wipe_confirm",      SCREEN_WIPE,        MENU_CONFIRM_WIPE, 0, 2,
+                                                WIPE_DEVICE_AND_CARD },
 };
 static const int FRAME_COUNT = sizeof(FRAMES) / sizeof(FRAMES[0]);
 
@@ -218,6 +237,8 @@ int main(int argc, char** argv) {
     coreCurrentScreen = FRAMES[i].screen;
     coreMenuState     = FRAMES[i].menu;
     coreMenuSel       = FRAMES[i].sel;
+    coreWipeConfirmCount = FRAMES[i].wipePresses;
+    dispWipeScope        = FRAMES[i].wipeScope;
     displayScreen();
     if (!dumpBuffer(outDir, FRAMES[i].name)) return 1;
     printf("%s\n", FRAMES[i].name);

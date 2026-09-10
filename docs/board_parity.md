@@ -47,7 +47,7 @@ to draw.
 | Admin (SoftAP) mode screen         | yes, core hop logic                               | yes  | yes     |      |
 | Word-based serial commands         | yes, core tokenizer plus per-board verbs          | yes  | yes     | 3    |
 | Semantic nav layer (`NavEvent`)    | yes, core                                         | yes  | n/a     | 4    |
-| Eight-screen carousel, four menus  | yes, core state (`ScreenId`, `MenuState`)         | yes  | n/a     | 5    |
+| Nine-screen carousel, five menus   | yes, core state (`ScreenId`, `MenuState`)         | yes  | n/a     | 5    |
 | Runtime alert gates                | yes, core (`coreBuzzerEnabled`, `coreLedEnabled`) | yes  | yes     | 6    |
 | Runtime scan-mode switch           | yes, core (`coreSetScanMode`)                     | yes  | yes     | 7    |
 | Runtime target switch              | yes, core (`coreSetVendorMask`)                   | yes  | n/a     | 8    |
@@ -55,6 +55,7 @@ to draw.
 | Distance calibration, persisted    | yes, core (`coreSetEnvDensity`, `coreSetRssiAt1mDbm`) | n/a | pending | 10 |
 | Vendor-colored detection blink     | yes, core (`notifyDetection`)                     | n/a  | n/a     | 11   |
 | Proximity ring, persisted          | yes, core (`coreSetProxRingM`)                    | yes  | pending | 12   |
+| Device wipe and power off          | yes, core (`coreDeviceWipe`, `corePowerOff`)      | yes  | pending | 13   |
 
 1. The OLED path blinks blue five times and shows "SD Card Not Found / Saving to
    SPIFFS", then blocks until Confirm on a board with buttons so the missing
@@ -66,8 +67,8 @@ to draw.
 4. Gated on `NAV_BTN_COUNT`, so only an Analyze board running `NAV_SCHEME_3BTN`
    or `NAV_SCHEME_4BTN` reads physical buttons through it. The serial injector
    works on every board, and boards with two buttons keep `coreInputTick()`.
-5. Covers menu drill-in: Scan Mode with its channel picker, Targets, Alerts, and
-   Web Config. The round TFT board shares the core screen and menu state but
+5. Covers menu drill-in: Scan Mode with its channel picker, Targets, Alerts,
+   Web Config, and Device Wipe with its confirmation. The round TFT board shares the core screen and menu state but
    renders its own round-screen UX, which is divergent by design rather than
    pending work. Other OLED boards show the single status view until they gain
    controls. See [Menu UX](menu_ux.md).
@@ -108,3 +109,8 @@ to draw.
     same reason as note 10: it never calls `coreSettingsLoad()`, so the persisted
     range is ignored there and the compiled-in `PROX_RING_M` stands. See
     [Alert behavior](alerts.md).
+13. The erase itself is core's and board-independent, but only `main_oled.cpp`
+    reaches it: the menu row lives on the shared carousel, and the interrupted
+    wipe check runs in that board's `setup()`. `main_tft.cpp` renders its own UX
+    with no carousel, so it can neither start a wipe nor resume one. See
+    [Menu UX](menu_ux.md).
