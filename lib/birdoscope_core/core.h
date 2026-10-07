@@ -1,29 +1,28 @@
 // Copyright (C) 2026 Lone Crow Design, LLC
 // Licensed under the MIT License. See LICENSE.
 //
-// Shared detection engine for all birdoscope board targets. Compiled once
-// per env (PlatformIO auto-links everything under lib/ to every env) against
-// that board's include/boards/<name>/board_config.h, included via -I before
-// this header is reachable. Board-specific peripherals (display, buzzer/LED,
-// buttons) and setup()/loop() orchestration stay in each board's
-// src/main_<board>.cpp.
+// Shared detection engine for all birdoscope board targets. PlatformIO links
+// everything under lib/ into every env, so each env compiles this once against
+// its include/boards/<name>/board_config.h, which the env's -I flag reaches.
+// Board peripherals (display, buzzer/LED, buttons) and setup()/loop() live in
+// the display family's src/main_*.cpp.
 #pragma once
 
 #include <Arduino.h>
 #include "esp_wifi.h"
 
-// Firmware version, surfaced by the web portal's `status` command and any
-// board that wants to print it. Bump on release.
+// Firmware version. Bump on release.
 #ifndef BIRDOSCOPE_VERSION
 #define BIRDOSCOPE_VERSION "0.1.0"
 #endif
 
 // ============================================================
-// BUILD IDENTITY: which commit this binary was built from, since the semantic
-// version above is bumped by hand and says nothing about what is on a device
-// between releases. Stamped by tools/git_version.py, wired in from [common] in
-// platformio.ini. A dirty tree reports a `-dirty` suffix and a build with no
-// git reports "unknown". See the README.
+// BUILD IDENTITY
+//
+// The commit this binary came from. Someone bumps the version above by hand,
+// so it says nothing about what a device runs between releases.
+// tools/git_version.py stamps these, from [common] in platformio.ini. A build
+// with no git reports "unknown". See tools/git_version.py for the rev format.
 // ============================================================
 
 #ifndef BIRDOSCOPE_GIT_REV
@@ -46,30 +45,34 @@ const char* coreBuildIdentity();
 const char* coreBuildRev();
 
 // ============================================================
-// DETECTION TALLIES: matching frames handled, split by whether the target
-// itself transmitted (direct) or an AP answered its probe (indirect, the
-// addr1 hits that read `dst:via AP`). Frames, not chirps and not devices,
-// incremented ahead of the repeat-suppression gate and independent of every
-// alert setting, so they say whether the detection path is alive on a drive
-// that produced few alerts. Both saturate at 0xFFFF. See
+// DETECTION TALLIES
+//
+// Matching frames, split by whether the target itself transmitted (direct) or
+// an AP answered its probe (indirect, the addr1 hits that read `dst:via AP`).
+// They count frames, not chirps or devices. coreHandleAlert() increments them
+// ahead of the repeat-suppression gate and regardless of any alert setting, so
+// they show whether the detection path is alive on a drive with few alerts.
+// Infra matches do not count. Both saturate at 0xFFFF. See
 // docs/detection_methods.md.
 // ============================================================
 
 extern uint16_t coreDirectFrames;
 extern uint16_t coreIndirectFrames;
 
-// Cameras observed each way, in devices rather than frames, spec C1-C3. Not
-// exclusive: a camera seen both ways counts in both, so the sum can exceed
-// fyDetCount. Both walk the table, so call per display refresh, not per frame.
+// Cameras observed each way, in devices, spec C1-C3. A camera seen both ways
+// counts in both, so the sum can exceed fyDetCount. Both walk the table, so
+// call them once per display refresh.
 uint16_t coreDirectDeviceCount();
 uint16_t coreIndirectDeviceCount();
 
 // ============================================================
-// RAW SNIFFER COUNTERS: count non-matching traffic too, so they distinguish a
-// dead radio from a quiet one where the tallies above cannot. coreSeenFrames is
-// everything the driver hands up; coreCandidateFrames is what survives the
-// type, length and RSSI_MIN guards. Spec S2. Written from the promiscuous
-// callback and read from loop(), hence volatile, and allowed to wrap.
+// RAW SNIFFER COUNTERS
+//
+// These count non-matching traffic too, so they tell a dead radio from a quiet
+// one where the tallies above cannot. coreSeenFrames counts everything the
+// driver hands up, and coreCandidateFrames counts what passes the type, length
+// and RSSI_MIN guards. Spec S2. The promiscuous callback writes them and loop()
+// reads them, hence volatile. Both wrap.
 // ============================================================
 
 extern volatile uint32_t coreSeenFrames;
@@ -77,29 +80,27 @@ extern volatile uint32_t coreCandidateFrames;
 
 // Management frames by subtype, indexed by the 802.11 subtype nibble (4 is a
 // probe request, 5 a probe response, 8 a beacon). `Seen` counts every one the
-// driver delivered, ahead of the RSSI gate; `Matched` counts those whose addr2
-// carried a target OUI. Every other counter in this firmware records a match,
-// so a subtype that never arrives and one that arrives and is never matched
-// are indistinguishable without these two.
+// driver delivered, ahead of the RSSI gate, and `Matched` counts those whose
+// addr2 holds a target OUI. Every other counter in this firmware records a
+// match, so only these two tell a subtype that never arrives from one that
+// arrives unmatched.
 #define CORE_MGMT_SUBTYPE_COUNT 16
 extern volatile uint32_t coreMgmtSeen[CORE_MGMT_SUBTYPE_COUNT];
 extern volatile uint32_t coreMgmtMatched[CORE_MGMT_SUBTYPE_COUNT];
 
-// Matched frames the alert queue had no room for, so they never reached the
-// log. Non-zero means the capture is incomplete by this much.
+// Queued frames lost before the log, because the alert queue was full or never
+// allocated. A non-zero count means the capture is short by that many frames.
 extern volatile uint32_t coreQueueDrops;
 
-// Load baselines for sizing the roost queue and flush policy against measured
-// behaviour rather than an estimate. See docs/roost_logging.md, "Capture
-// performance baselines". coreQueueDepthMax is the deepest the alert ring has
-// been; write and flush figures come from the roost writer via
-// roostSessionStats().
+// Load baselines for sizing the roost queue and flush policy. See
+// docs/roost_logging.md, "Capture Performance". coreQueueDepthMax is the
+// deepest the alert ring has reached. The roost writer reports write and flush
+// figures through roostSessionStats().
 extern volatile uint8_t  coreQueueDepthMax;
 uint8_t coreAlertQueueSize();   // denominator for coreQueueDepthMax
 
-// board_config.h must already be included before this header (both
-// main_*.cpp do `#include "board_config.h"` then `#include "core.h"`).
-// These guards keep core.h safe to parse standalone, for IDE tooling.
+// Each main_*.cpp includes board_config.h before this header. These guards
+// keep core.h parseable on its own, for IDE tooling.
 #ifndef USE_SD
 #define USE_SD 0
 #endif
@@ -109,66 +110,76 @@ uint8_t coreAlertQueueSize();   // denominator for coreQueueDepthMax
 #ifndef HAS_BUTTONS
 #define HAS_BUTTONS 0
 #endif
-// The Arduino SD default. A board holding more files open than this must raise
-// it in its own config; a roost session needs six.
+// BLE capture through NimBLE, which needs a Bluetooth 5 controller for
+// extended advertising. A board without one sets this to 0.
+#ifndef HAS_BLE_SCAN
+#define HAS_BLE_SCAN 1
+#endif
+#if ROOST_CAP_BLE && !HAS_BLE_SCAN
+#error "ROOST_CAP_BLE needs HAS_BLE_SCAN"
+#endif
+// Open-file limit passed to SD.begin(). The roost writer holds every declared
+// record file open and the manifest snapshot needs one more, which
+// roost_session.cpp checks at build time.
 #ifndef SD_MAX_OPEN_FILES
-#define SD_MAX_OPEN_FILES 5
+#define SD_MAX_OPEN_FILES 8
 #endif
 
-// The fleet logging contract, pulled in after the board's capability and
-// component declarations. Not optional and not guarded: a board that has not
-// declared them fails to build here, which is the point.
+// The fleet logging contract, after the board's capability and component
+// declarations. Deliberately unguarded, so a board that has not declared them
+// fails to build here.
 #include "roost_registry.h"
-// The fleet's buffered session writer. Header-only and platform-free; the
-// Arduino SD backend is supplied in core.cpp.
+// The fleet's buffered session writer, header-only and platform-free.
+// roost_session.cpp supplies the Arduino SD backend.
 #include "roost_sdlog.h"
-// The fleet's manifest renderer, on the same terms: it produces bytes and this
-// device decides where they go. No key name, timestamp format or counter is
-// spelled per device.
+// The fleet's manifest renderer. It produces bytes and this device decides
+// where they go. Devices never spell their own key names, timestamp formats or
+// counters.
 #include "roost_manifest.h"
-// The clock anchor arithmetic, including the pre-anchor case that must not be
-// computed at all. See roost_time.h.
+// The clock anchor arithmetic. See roost_time.h for the pre-anchor case.
 #include "roost_time.h"
-// The fleet's 802.11 management-body walker. Parsing bytes off the air with
-// pointer arithmetic is the code that must not live only on a device, so it is
-// here and host-tested rather than reimplemented per board.
+// The fleet's host-tested 802.11 management-body walker. Boards parse frame
+// bodies through it, never with their own pointer arithmetic.
 #include "roost_ie.h"
-// The channel-to-band derivation. `band` is a computed column, so the fleet has
-// one computation of it rather than a range test per device. See spec 3.1.
+// The channel-to-band derivation. `band` is a computed column, and every
+// device computes it here. See spec 3.1.
 #include "roost_channel.h"
 // The `list` and `map` value encodings. A registry key's declared type fixes
-// its rendering, so the device builds values here rather than joining its own.
+// its rendering, so the device builds values here.
 #include "roost_value.h"
-// GPIO for the BOOT button used by the Admin-mode trigger. GPIO0, the
-// strapping/BOOT button, on every current board. Override per board.
+// GPIO for the BOOT button the Admin-mode trigger reads. GPIO0 on every
+// current board. Override per board.
 #ifndef BOOT_BTN_PIN
 #define BOOT_BTN_PIN 0
 #endif
 
 // ============================================================
-// ALERT TYPES: shared by the promiscuous callback's queue and by board
-// orchestration code that reads coreHandleAlert()'s result.
+// ALERT TYPES
+//
+// The promiscuous callback's queue and the board code reading
+// coreHandleAlert()'s result share these.
 // ============================================================
 
 typedef enum : uint8_t {
   ALERT_OUI_ADDR2       = 0,
   ALERT_OUI_ADDR1       = 1,
   ALERT_OUI_ADDR3       = 2,
-  ALERT_SSID            = 3,   // only ever enqueued when ENABLE_SSID_MATCH=1
+  ALERT_SSID            = 3,   // needs ENABLE_SSID_MATCH=1
   ALERT_WILDCARD_PROBE  = 4,
-  // A probe request from a target OUI carrying a non-empty SSID. Direct, like
-  // every type but ALERT_OUI_ADDR1, and split from ALERT_OUI_ADDR2 so the
-  // probed name survives to the log.
+  // A probe request from a target OUI with a non-empty SSID. Direct, like every
+  // type but ALERT_OUI_ADDR1. Separate from ALERT_OUI_ADDR2 so the log keeps
+  // the probed name.
   ALERT_DIRECTED_PROBE  = 5,
   // A frame that matched no target, captured only while an operator survey
-  // window is open. It reaches the log and nothing else: no detection table
-  // entry, no counter, no display or notification. See coreSurveyStart().
+  // window is open. It reaches the log and nothing else, with no detection
+  // table entry, tally, display or notification. See coreSurveyStart().
   ALERT_SURVEY          = 6,
 } AlertType;
 
-// Frame facts recorded by POSITION, never by role. A role name varies per
-// frame, so it cannot be a column; the pipeline derives roles from type and
-// subtype. Filled in the promiscuous callback, where the frame still exists.
+// Frame facts recorded by position, never by role. A role name varies per
+// frame, so it cannot be a column, and the pipeline derives roles from type
+// and subtype. The promiscuous callback fills this while the frame still
+// exists.
 typedef struct {
   uint8_t  addr1[6], addr2[6], addr3[6];
   uint16_t seq;
@@ -184,23 +195,23 @@ typedef struct {
   uint16_t  seq;
   uint16_t  fcFlags;
   uint16_t  frameLen;
-  // When the frame was received, not when the row was written. The queue is
-  // drained from loop() and can run arbitrarily far behind under load.
+  // The frame's receive time. loop() drains the queue and can fall arbitrarily
+  // far behind under load.
   uint32_t  uptimeMs;
   int8_t    rssi;
   uint8_t   channel;
   char      bbFormat[8];
-  // The walker's result carried whole, not a bare string: an SSID is arbitrary
-  // octets, so its length and whether the element was there at all cannot be
-  // recovered from the bytes. See RoostSsid in roost_ie.h.
+  // The walker's whole result. An SSID is arbitrary octets, so a bare string
+  // loses its length and whether the element was present. See RoostSsid in
+  // roost_ie.h.
   RoostSsid ssid;
   char      frameKind[12];
   char      frameSubtype[16];
 } AlertEntry;
 
 // One GPS fix, flattened out of TinyGPS++ so the session writer needs no
-// parser. Each `has*` is false when the module did not report the field, which
-// keeps its column empty rather than carrying a zero.
+// parser. Each `has*` is false when the module did not report the field, and
+// the writer then leaves its column empty.
 typedef struct {
   bool   valid;
   double lat, lon;
@@ -219,13 +230,12 @@ void coreGpsFix(CoreGpsFix* out);
 const char* coreClockAnchor(uint32_t* anchorUnix, uint32_t* anchorUptimeMs);
 void coreUnixToIso(uint32_t unix, char* buf, size_t len);
 // ISO-8601 for a row observed at `uptimeMs`. False when the clock has never
-// anchored, in which case the column is left empty rather than filled.
+// anchored, and the caller then leaves the column empty.
 bool coreTimestampAt(uint32_t uptimeMs, char* buf, size_t len);
 
 // Session identity and provenance for the manifest.
 // Fills buf with the next free /bscope-TAG-YYMMDD-N. False when the day's 99
-// names are all taken: the session then keeps its boot name rather than
-// being renamed onto an existing directory.
+// names are all taken, and the session then keeps its boot name.
 bool     coreSessionDirName(char* buf, size_t len);
 uint32_t coreSessionSequence();
 uint32_t coreBootCount();
@@ -237,17 +247,16 @@ const char* coreDeviceTag();
 const char* coreOwnMac();
 const char* coreCountryCode();
 // Both render a registry `list` for config_change and return false when the
-// value did not fit, which the caller must not confuse with an empty value.
+// value did not fit. The caller must not treat false as an empty value.
 bool coreChannelListRoost(char* buf, size_t len);
 bool coreVendorMaskStr(char* buf, size_t len);
 void coreChannelListJson(char* buf, size_t len);
 
-// Result of coreHandleAlert(). Carries everything a board needs to update its own
-// display state and fire board-specific feedback (LED/buzzer/chirp), without
-// core knowing those peripherals exist. detIdx/count/chirpWorthy/macStr/oui/
-// distM are populated even when suppressed=true (rate-limited), but boards
-// should gate display/feedback updates on !suppressed to match the existing
-// per-board behavior (rate-limited hits never touched the display before).
+// Result of coreHandleAlert(), with everything a board needs to update its
+// display and fire its own LED, buzzer or chirp feedback. Core knows nothing of
+// those peripherals. Boards gate display and feedback on !suppressed.
+// A rate-limited hit still fills detIdx, count, chirpWorthy, macStr, oui and
+// distM. A survey or infra row returns suppressed with detIdx -1.
 typedef struct {
   bool      suppressed;
   int       detIdx;
@@ -271,54 +280,216 @@ void dualPrintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void dualPrintln(const char* str);
 
 // ============================================================
-// TARGET VENDORS: the OUI table is one flat list tagged by vendor, so a match
-// reports which vendor hit rather than a bare yes/no. `coreVendorMask` selects
-// which vendors the matcher accepts, one bit per Vendor, and is what the
-// Targets menu switches. A single aligned byte store is atomic on Xtensa, so it
-// can change live without stopping the sniffer. VENDOR_COUNT must stay <= 8:
-// coreVendorMask is one byte.
+// RADIO MODE
+//
+// Which radio captures. The modes are mutually exclusive, and the menu row
+// index is the enum value. It selects which stack is up, so the RX path never
+// reads it. Assign it only through coreSetRadioMode(). See design_spec.md
+// "Radio mode".
 // ============================================================
 
 typedef enum : uint8_t {
-  VENDOR_FLOCK   = 0,
-  VENDOR_AXON    = 1,
-  VENDOR_AXIS    = 2,
-  VENDOR_UTILITY = 3,
+  RADIO_MODE_WIFI = 0,   // 802.11 promiscuous capture
+  RADIO_MODE_BLE  = 1,   // BLE scan
+  RADIO_MODE_COUNT
+} RadioMode;
+
+extern RadioMode coreRadioMode;
+
+// ============================================================
+// BLE MATCHING
+//
+// Manufacturer data first, then the OUI table on public addresses only. See
+// spec M5 to M9.
+// ============================================================
+
+#define BLE_MATCH_ID_MAX 20
+
+typedef struct {
+  int8_t      vendor;     // Vendor, or -1 when nothing matched
+  bool        accessory;  // proves target equipment present, not a camera [M3]
+  bool        infra;      // OUI_CLASS_INFRA hit, which never alerts [M8]
+  const char* method;     // roost detection_method, or "unmatched"
+  char        id[BLE_MATCH_ID_MAX];   // rule-supplied serial, else empty
+} BleMatch;
+
+// True when the advertisement matched a target. `addrType` is the HCI value,
+// `payload` the raw AD data. Fills `out` whether or not it matched.
+bool coreBleMatch(const uint8_t* mac, uint8_t addrType,
+                  const uint8_t* payload, size_t payloadLen, BleMatch* out);
+
+// Advertisements that matched a target, for the panel and `status`. Excludes
+// infra hits, spec M8.
+extern volatile uint32_t coreBleMatched;
+
+// One queued ble_obs row. The NimBLE host task queues it and coreBleDrain()
+// writes it. The string fields point at static registry spellings. Spec B1 to
+// B4.
+#define BLE_ADV_MAX 255
+
+typedef struct {
+  uint32_t    uptimeMs;
+  uint8_t     mac[6];
+  uint8_t     addrType;      // HCI value
+  int8_t      rssi;
+  int8_t      txPower;
+  bool        hasTxPower;
+  bool        extended;      // extended advertising, which alone carries `sid`
+  uint8_t     sid;
+  const char* method;        // roost detection_method
+  const char* pduType;       // roost ble_pdu_type
+  const char* phyPrimary;    // roost ble_phy, or "" when unreported
+  const char* phySecondary;
+  bool        target;        // a primary or accessory match, which the table holds
+  int8_t      vendor;        // Vendor, or -1
+  bool        accessory;
+  char        id[BLE_MATCH_ID_MAX];   // rule-supplied serial, else empty
+  uint16_t    payloadLen;
+  uint8_t     payload[BLE_ADV_MAX];
+} BleObsEntry;
+
+// BLE rows lost before the log, to a full ring or an advertisement longer than
+// BLE_ADV_MAX. The manifest adds them to coreQueueDrops as observations
+// dropped.
+extern volatile uint32_t coreBleQueueDrops;
+
+// Radio buffers that failed to allocate at a radio start. Each failure leaves
+// that radio's matches counting as drops.
+extern volatile uint32_t coreRadioAllocFails;
+
+// Deepest the BLE ring has been, the BLE counterpart of coreQueueDepthMax.
+extern volatile uint8_t coreBleQueueDepthMax;
+uint8_t coreBleQueueSize();   // denominator for coreBleQueueDepthMax
+
+// Writes every queued BLE row and feeds target rows to the BLE detection table.
+// Returns true when the table changed, so the board redraws. Boards call it
+// from loop().
+bool coreBleDrain();
+
+// BLE detection table, display-only like fyDet [C5]. Holds target matches,
+// keyed by the rule's serial where it supplies one, else by MAC, so a rotating
+// address with a serial stays one device. It lasts the session, survives radio
+// switches and never persists. Spec B4.
+#ifndef MAX_BLE_DETECTIONS
+#define MAX_BLE_DETECTIONS 64
+#endif
+
+typedef struct {
+  char     key[18];      // serial, or the MAC string
+  char     mac[18];      // the most recent advertising address
+  int8_t   vendor;
+  bool     accessory;
+  int8_t   rssi;
+  uint16_t count;
+  uint32_t firstSeen;
+  uint32_t lastSeen;
+} BleDetection;
+
+extern BleDetection coreBleDet[MAX_BLE_DETECTIONS];
+extern uint16_t     coreBleDetCount;
+extern uint16_t     coreBleDetMissed;   // devices refused by a full table
+extern int16_t      coreBleDetLast;     // most recently updated index, or -1
+
+// Per-MAC window on infra rows, both radios, spec M8.
+uint32_t coreInfraDedupeMs();
+
+// Frames or advertisements per second over the last sampling window, for spec
+// S2. Each resamples at most once a second, so the rate always covers at least
+// a second.
+uint16_t coreSeenRate();
+uint16_t coreBleRate();
+
+// BLE scan counters. The NimBLE host task writes them and loop() reads them.
+// `coreBlePhy1M` and `coreBlePhyCoded` size the coded-PHY share, which decides
+// whether a PHY control is worth offering. `status` reports them, per S1.
+extern volatile uint32_t coreBleReports;
+extern volatile uint32_t coreBlePhy1M;
+extern volatile uint32_t coreBlePhyCoded;
+
+// Stops the outgoing radio before starting the incoming one, and writes the
+// config_change row. Re-applying the current mode does nothing, and a board
+// without HAS_BLE_SCAN refuses BLE. Call it only outside Admin mode.
+void coreSetRadioMode(RadioMode mode);
+
+// Lowercase slug matching the roost radio_mode vocabulary, or "unknown".
+const char* radioModeName(RadioMode mode);
+
+// ============================================================
+// TARGET VENDORS
+//
+// The OUI table is one flat list tagged by vendor, so a match reports which
+// vendor hit. `coreVendorMask` selects which vendors the matcher accepts, one
+// bit per Vendor, and the Targets menu switches it. A single aligned 16-bit
+// store is atomic on Xtensa, so the mask can change live without stopping the
+// sniffer. VENDOR_COUNT must stay <= 16, since coreVendorMask is two bytes.
+//
+// Motorola covers Motorola Solutions, Avigilon Alta and WatchGuard Video, one
+// corporate family. Analysis recovers the product line from the OUI, so the
+// 21-character panel shows one Motorola slot for all three.
+//
+// Infra tags backhaul hardware that these deployments use and that is common
+// everywhere else. Every Infra entry is OUI_CLASS_INFRA, which logs a row and
+// never alerts. See spec M2 and M8.
+// ============================================================
+
+typedef enum : uint8_t {
+  VENDOR_FLOCK    = 0,
+  VENDOR_AXON     = 1,
+  VENDOR_AXIS     = 2,
+  VENDOR_UTILITY  = 3,
+  VENDOR_MOTOROLA = 4,
+  VENDOR_VERKADA  = 5,
+  VENDOR_GENETEC  = 6,
+  VENDOR_DALLY    = 7,   // Digital Ally
+  VENDOR_INFRA    = 8,
   VENDOR_COUNT
 } Vendor;
 
-#define VENDOR_MASK_ALL ((uint8_t)((1u << VENDOR_COUNT) - 1))
+#define VENDOR_MASK_ALL ((uint16_t)((1u << VENDOR_COUNT) - 1))
 
-extern volatile uint8_t coreVendorMask;
+// What a match proves, spec M1 to M3. The table errs wide, so each entry
+// states how far to trust a match on it.
+typedef enum : uint8_t {
+  OUI_CLASS_PRIMARY   = 0,  // the target's own product
+  OUI_CLASS_ACCESSORY = 1,  // target equipment present, not a camera
+  OUI_CLASS_INFRA     = 2,  // corroborating only, common hardware
+} OuiClass;
 
-// Set the active vendor mask. Use this rather than assigning coreVendorMask
-// directly: it also recomputes whether any active target is locally
-// administered, which controls the randomised-MAC fast path in matchOuiRaw().
-void coreSetVendorMask(uint8_t mask);
+extern volatile uint16_t coreVendorMask;
 
-// Active target set as the Targets menu's list index: 0=Flock, 1=Axon, 2=All.
-// Returns -1 for any other mask, so the menu shows no active marker rather than
-// mislabelling a combination it has no row for. Axis and Utility have no row of
-// their own and are reachable only through All, which is the boot default.
+// Sets the active vendor mask. Use it in place of assigning coreVendorMask,
+// since it also recomputes whether any active target is locally administered,
+// which controls the randomised-MAC fast path in matchOuiRaw(), and writes the
+// config_change row.
+void coreSetVendorMask(uint16_t mask);
+
+// Active target set as the Targets menu's list index. Rows are parent
+// categories, so one covers every subsidiary tagged to it. Returns -1 for any
+// other mask, and the menu then shows no active marker. Vendors with no row of
+// their own are reachable only through All, the boot default.
+#define TARGET_ROW_COUNT 4
+
 int coreTargetIndex();
+
+// Lowercase label for a Targets menu row.
+const char* coreTargetRowName(int row);
 
 // Lowercase vendor slug, or "unknown". Stable strings, safe to log.
 const char* vendorName(uint8_t vendor);
 
 // ============================================================
-// DISTANCE ESTIMATE: a log-distance path-loss model with two user controls, one
-// per term.
+// DISTANCE ESTIMATE
+//
+// A log-distance path-loss model with two user controls, one per term.
 //
 //   d = 10 ^ ((RSSI_1m - RSSI_measured) / (10 * n))
 //
 // Environment Density sets n, how fast signal fades with distance.
-// coreRssiAt1mDbm sets the reference level it fades from. Both are directly
-// meaningful, which is the point: the reference is what the radio reads standing
-// a metre from a target, so it can be calibrated by walking up to one and reading
-// the number off the screen. Accuracy stays coarse whatever the settings, since
-// multipath alone swings instantaneous RSSI by 6-10 dB, so the controls remove
-// systematic bias rather than noise. Calibration procedure and ranges are in
-// docs/distance_estimation.md.
+// coreRssiAt1mDbm sets the reference level it fades from, the reading a metre
+// from a target, so an operator calibrates it by walking up to one and reading
+// the number off the screen. Multipath alone swings instantaneous RSSI by 6-10
+// dB, so accuracy stays coarse and the controls remove only systematic bias.
+// docs/distance_estimation.md has the calibration procedure and ranges.
 // ============================================================
 
 // Order must match DENSITY_N in core.cpp.
@@ -332,8 +503,8 @@ typedef enum : uint8_t {
 #define RSSI_AT_1M_MIN -85
 #define RSSI_AT_1M_MAX -20
 
-extern volatile uint8_t coreEnvDensity;    // an EnvDensity; set via coreSetEnvDensity()
-extern volatile int8_t  coreRssiAt1mDbm;   // expected RSSI at 1m; set via coreSetRssiAt1mDbm()
+extern volatile uint8_t coreEnvDensity;    // an EnvDensity, set through coreSetEnvDensity()
+extern volatile int8_t  coreRssiAt1mDbm;   // expected RSSI at 1m, set through coreSetRssiAt1mDbm()
 
 void coreSetEnvDensity(uint8_t density);   // ignores an out-of-range value
 void coreSetRssiAt1mDbm(int8_t dbm);       // clamps to [RSSI_AT_1M_MIN, RSSI_AT_1M_MAX]
@@ -344,16 +515,16 @@ void coreNudgeRssiAt1mDbm(int8_t db);
 float corePathLossExponent();              // n for the active Density
 const char* envDensityName(uint8_t density);   // "low" / "medium" / "high", safe to log
 
-// Metres. Callers skip ALERT_OUI_ADDR1 hits, whose RSSI is the AP->scanner path;
-// coreHandleAlert() already does, reporting -1 as CoreAlertResult::distM.
+// Metres. Callers skip ALERT_OUI_ADDR1 hits, whose RSSI is the AP-to-scanner
+// path. coreHandleAlert() already does, reporting -1 as CoreAlertResult::distM.
 float coreRssiToDistanceM(int8_t rssi);
 
-// Most recent non-suppressed detection's RSSI, or 0 if there has not been one.
+// Most recent non-suppressed detection's RSSI, or 0 before the first one.
 int8_t coreLastDetectionRssi();
 
-// Persisted as {"density":N,"rssi_1m":N}. coreSettingsLoad() must be called from
-// setup() once SPIFFS is mounted. False means absent or unparseable, which is not
-// an error: the defaults stand.
+// coreSettingsSave() persists `{"density":N,"rssi_1m":N,"prox_m":N}`. Call
+// coreSettingsLoad() from setup() once SPIFFS has mounted. Load returns false
+// when the file is absent or unparseable, and the defaults stand.
 bool coreSettingsLoad();
 bool coreSettingsSave();
 
@@ -370,12 +541,12 @@ void precompileOuis();
 
 // Returns the matching Vendor, or -1 for no match. Honours coreVendorMask and
 // the per-entry prefix length, so MA-M (28-bit) registrations match on the high
-// nibble of byte 4. Callers needing a yes/no can test >= 0.
+// nibble of byte 4.
 int  matchOuiRaw(const uint8_t* mac);
 bool isMulticast(const uint8_t* mac);
 
-// Returns the first *currently active* entry in the target OUI table (3 bytes).
-// Used to build a synthetic but realistic target MAC for the `inject` command.
+// Returns the first currently active entry in the target OUI table (3 bytes).
+// The `inject` command builds a synthetic target MAC from it.
 void coreGetFirstTargetOui(uint8_t out[3]);
 
 // ============================================================
@@ -388,49 +559,54 @@ void updateChannelMode();
 const char* channelModeName();
 uint16_t channelFreqMhz(uint8_t ch);
 
-// Runtime scan mode. `CHANNEL_MODE` is the board's build-time default, and the
-// Scan Mode menu switches this live in RAM, resetting to the default on reboot.
-// Custom and Full hop their board-defined channel lists. Single locks to one
-// channel (`coreSingleChannel`). coreNavApply()'s menu applies the mode change,
-// and boards only read these for rendering.
+// Runtime scan mode. `CHANNEL_MODE` is the board's build-time default. The Scan
+// Mode menu switches the mode live in RAM, and a reboot resets it. Custom and
+// Full hop their board-defined channel lists. Single locks to
+// `coreSingleChannel`. coreNavApply() applies the mode change, and boards only
+// read these for rendering.
 extern uint8_t coreSingleChannel;   // channel Single mode locks to (display + picker)
-int coreScanModeIndex();            // active mode as a menu list index: 0=Custom, 1=Full, 2=Single
+int coreScanModeIndex();            // active mode as a menu list index, 0=Custom, 1=Full, 2=Single
 
 // ============================================================
-// PROMISCUOUS CAPTURE: fills the internal alert queue, which the board loop
-// drains via coreDequeueAlert().
+// PROMISCUOUS CAPTURE
+//
+// wifiSniffer() fills the internal alert queue, and the board loop drains it
+// through coreDequeueAlert().
 // ============================================================
 
 void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type);
 bool coreDequeueAlert(AlertEntry& out);
 extern volatile bool sniffingStopped;
 
-// Exposed for the board `inject` command, which pushes a synthetic alert
-// through the real queue.
-// `fm` may be null, for a synthesised alert with no frame behind it.
+// The board `inject` command calls this to push a synthetic alert through the
+// real queue. `fm` may be null, for an alert with no frame behind it.
 void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t* mac,
                              const FrameMeta* fm, int8_t rssi, uint8_t ch,
                              const RoostSsid* ssid, const char* kind,
                              const char* fsubtype);
 
 // ============================================================
-// DETECTION TABLE + SD LOG + JSON EMIT: the shareable middle of
-// drainAlertQueue(). Boards call this once per dequeued AlertEntry, then use
-// the returned result for display/feedback.
+// DETECTION TABLE + SD LOG + JSON EMIT
+//
+// Boards call coreHandleAlert() once per dequeued AlertEntry, then use the
+// result for display and feedback.
 // ============================================================
 
 CoreAlertResult coreHandleAlert(const AlertEntry& e);
 
 // ============================================================
-// OPERATOR SURVEY WINDOW: a bounded interval during which every frame the
-// radio delivers is logged, not only frames matching the target table.
+// OPERATOR SURVEY WINDOW
 //
-// Rows go to wifi_obs carrying detection_method=operator_survey, capped per
-// device rather than per frame. Frames still pass the frame-type and RSSI_MIN
-// gates, and no radio setting changes for the window's duration.
+// A bounded interval during which the firmware logs every frame the radio
+// delivers, matched or not.
 //
-// Spec O1-O7 [D9] govern this. A board reads it as: call coreSurveyStart() on
-// an operator mark and coreSurveyTick() once per loop().
+// Rows go to wifi_obs, or ble_obs under BLE capture, with
+// detection_method=operator_survey, at most one per MAC per SURVEY_DEDUPE_MS.
+// 802.11 frames still pass the frame-type and RSSI_MIN gates. No radio setting
+// changes for the window's duration.
+//
+// Spec O1-O7 [D9] govern this. A board calls coreSurveyStart() on an operator
+// mark and coreSurveyTick() once per loop().
 // ============================================================
 
 // Duration options in seconds, for a settings screen. Index 0 is the default.
@@ -442,31 +618,30 @@ extern volatile uint16_t coreSurveySecs;
 void coreSurveyStart();
 
 // Closes the window once its duration has elapsed and reports what it caught.
-// Boards call this once per loop(); it does nothing while no window is open.
+// Boards call this once per loop(), and it does nothing while no window is
+// open.
 void coreSurveyTick();
 
 bool coreSurveyActive();
 
-// Window accounting, reset when a window opens, reported on close per spec O7.
-// `Rows` is survey frames offered to the queue, `Suppressed` is frames the
-// per-MAC cap held back, and `Evictions` counts a new MAC displacing a slot
-// still inside its window, meaning the table is undersized for the environment.
+// Window accounting. coreSurveyStart() zeroes these when a window opens and
+// coreSurveyTick() reports them on close, spec O7. `Rows` counts survey frames
+// offered to the queue and `Suppressed` counts frames the per-MAC limit held
+// back. The close report takes evictions from each radio's survey limit.
 extern volatile uint32_t coreSurveyRows;
 extern volatile uint32_t coreSurveySuppressed;
-extern volatile uint32_t coreSurveyEvictions;
 
-// Milliseconds left in the open window, 0 when none is open. For a board that
-// wants to show the window running.
+// Milliseconds left in the open window, 0 when none is open.
 uint32_t coreSurveyRemainingMs();
 
 extern int  fyDetCount;
 extern unsigned long fyLastTargetSeen;
 
-// Distinct new MACs that could not be recorded because the detection table hit
-// MAX_DETECTIONS. The table does not evict, so once full fyDetCount stops
-// moving and would otherwise read as "nothing new out here". Repeat hits on
-// already-known MACs still update, so this counts devices missed, not frames.
-// On a USE_SD board the SD event log is unaffected and no capture data is lost.
+// Distinct new MACs the detection table refused once it reached
+// MAX_DETECTIONS. The table never evicts, so a full table holds fyDetCount
+// still and this count shows the devices it missed. Repeat hits on known MACs
+// still update. On a USE_SD board coreHandleAlert() writes every wifi_obs row
+// regardless, so the capture loses nothing.
 extern uint16_t fyDroppedNew;
 
 // ============================================================
@@ -492,26 +667,27 @@ extern bool   gpsHasFix;
 extern double gpsLat;
 extern double gpsLng;
 
-// GPS parser health counters for the GPS detail screen. Mirrors the [gps]
-// serial diagnostic line: good/bad checksum counts, fix-carrying sentences, and
-// satellites in view. sats is -1 if none have been reported yet.
+// GPS parser health counters for the GPS detail screen, matching the [gps]
+// serial diagnostic line. Good and bad checksum counts, fix-carrying sentences,
+// and satellites in view, with sats -1 until the module reports any.
 void coreGpsStats(unsigned long& good, unsigned long& bad,
                   unsigned long& fixSent, int& sats);
 #endif
 
 // ============================================================
-// TIME SOURCE: a runtime priority chain of GPS once a module locks, then NTP
-// over WiFi if station credentials are stored, then millis() since boot.
+// TIME SOURCE
+//
+// A runtime priority chain of GPS once a module locks, then NTP over WiFi if
+// station credentials exist, then millis() since boot.
 //
 // coreTimeSync() runs once in setup() and blocks, because it must settle before
 // the promiscuous radio comes up, the only window in which a WiFi STA join is
-// safe. GPS cannot have a lock this early, so the NTP join bridges the pre-lock
-// window. coreTick(), polled every loop(), then drains the GPS UART and sets the
-// GPS anchor the moment a fix lands, at which point GPS takes over, since
-// coreTimestampStr() prefers GPS over NTP. A board with GPS onboard therefore
-// rides NTP or millis until it locks, then masters off GPS. A board with no
-// module stays on NTP or millis. A boot probe distinguishes checksum-valid NMEA
-// from a floating UART to report whether a module is wired at all.
+// safe. GPS has no lock this early, so NTP bridges the pre-lock window.
+// coreTick(), which loop() calls every pass, drains the GPS UART and sets the
+// GPS anchor the moment a fix lands, and timestamps prefer GPS over NTP from
+// then on. A board with no module stays on NTP or millis. A boot probe tells
+// checksum-valid NMEA from a floating UART to report whether a module is
+// present.
 // ============================================================
 
 void coreTimeSync();
@@ -519,15 +695,16 @@ void coreTick();
 bool coreTimeAnchored();
 
 // ============================================================
-// WIFI STATION CREDENTIALS: a single saved network used only for the boot-time
-// NTP fallback (never for the Admin SoftAP, which is its own identity). Stored
-// on SPIFFS at WIFI_CREDS_FILE as {"ssid","pass"} so they are set from the web
-// console instead of being compiled in. SSID is user-controlled bytes, so this
-// goes through a real JSON parser rather than hand-rolled string ops.
+// WIFI STATION CREDENTIALS
 //
-// Load returns true only when a non-empty SSID is stored. Save persists and
-// overwrites, rejecting an empty ssid. Have is a cheap presence check. Clear
-// removes the file, backing the console "wifi-forget" verb.
+// One saved network, used only for the boot-time NTP fallback. The Admin
+// SoftAP has its own identity. The web console sets the credentials, and the
+// firmware keeps them on SPIFFS at WIFI_CREDS_FILE as `{"ssid","pass"}`. The
+// SSID is user-controlled bytes, so a real JSON parser reads it.
+//
+// Load returns true only when the file holds a non-empty SSID. Save persists
+// and overwrites, rejecting an empty SSID. Have is a cheap presence check.
+// Clear removes the file, backing the console "wifi-forget" verb.
 // ============================================================
 
 bool coreWifiCredsHave();
@@ -543,93 +720,91 @@ void autosaveTick();
 void printHeartbeat();
 
 // ============================================================
-// SERIAL COMMANDS: word-based, using brief noun/verb tokens rather than single
-// letters, because the command set outgrew single characters. Core handles the
-// shared verbs (dump/prev/chirp/jingle/nav). `status` is genuinely per-board,
-// since its fields differ, so each board composes its own printStatus() from
-// the extern state above
-// (currentChannel, channelModeName(), fyDetCount, fySpiffsReady,
-// sniffingStopped, coreTimeAnchored()).
+// SERIAL COMMANDS
 //
-// Boards drive it with coreReadSerialCommand() (one shared line tokenizer),
-// call coreHandleSerialCommand() first, and handle their own verbs when it
-// returns false. Commands are newline-terminated. The verb is lowercased and
-// the argument is the trimmed remainder, or "" if there is none.
+// Commands are brief noun/verb words. Core handles the shared verbs that
+// corePrintSerialHelp() lists. Each board composes its own `status` from the
+// extern state above, since the fields differ per board.
+//
+// Boards read lines with coreReadSerialCommand(), pass each to
+// coreHandleSerialCommand() first, and handle their own verbs when it returns
+// false. Commands end in a newline.
 // ============================================================
 
 void dumpCurrentSession();
 void dumpSpiffsFile(const char* path);
 
-// Non-blocking line reader: drains Serial into an internal buffer and, each
-// time a full line arrives, returns true with `verb`/`arg` pointing at the
-// parsed tokens (lowercased verb, remainder as arg). Returns false when no
-// complete line is pending. Loop over it to process all buffered lines.
+// Non-blocking line reader. Drains Serial into an internal buffer and returns
+// true once a full line arrives, with `verb` lowercased and `arg` the trimmed
+// remainder, or "" when there is none. Returns false when no complete line is
+// pending. Loop over it to process every buffered line.
 bool coreReadSerialCommand(const char** verb, const char** arg);
 
-// Dispatches a core-owned verb (dump/prev/chirp/jingle/nav <up|down|select|
-// back|mark>). Returns true if handled, false so the board can try its own.
+// Dispatches a core-owned verb. Returns true if handled, false so the board
+// can try its own.
 bool coreHandleSerialCommand(const char* verb, const char* arg);
 
-// Prints the core-handled commands as indented help lines. Boards' own `help`
-// prints their board-specific verbs (status/inject/log/…) then calls this, so
-// the core command list lives in one place.
+// Prints the core-handled commands as indented help lines. A board's own
+// `help` prints its own verbs, then calls this.
 void corePrintSerialHelp();
 
 // ============================================================
-// NOTIFICATIONS: LED (NeoPixel) and buzzer feedback, gated on USE_LED/
-// USE_BUZZER. coreHandleAlert() calls the detection half internally, so boards
-// only need coreNotifyBoot() (once in setup(), after display init) and
-// coreNotifyTick() (once per loop(), turns off the LED after LED_FLASH_MS).
-// The in-range heartbeat pulse is retained in core.cpp but uncalled, spec A1.
+// NOTIFICATIONS
+//
+// LED (NeoPixel) and buzzer feedback, gated on USE_LED and USE_BUZZER.
+// coreHandleAlert() calls the detection half itself, so boards only call
+// coreNotifyBoot() once in setup(), after display init, and coreNotifyTick()
+// once per loop() to step the LED pulse train. Screen boards leave the in-range
+// heartbeat uncalled, spec A1.
 // ============================================================
 
 void coreNotifyBoot();
 void coreNotifyTick();
 
-// Runtime alert gates, toggled live from the on-device Alerts menu (SCREEN_
-// ALERTS). Session-only, enabled by default every boot and not persisted, which
-// matches the runtime scan mode. coreBuzzerEnabled gates the new-detection
-// chirp and coreLedEnabled gates the detection LED flashes. The
-// boot jingle, RGB cycle, and the chirp/jingle hooks all run unconditionally.
-// Boards may also read these to render the current state.
+// Runtime alert gates, toggled live from the Alerts menu (SCREEN_ALERTS). Both
+// start enabled each boot and never persist, like the runtime scan mode.
+// coreBuzzerEnabled gates the new-detection and proximity chirps, and
+// coreLedEnabled gates their LED flashes. The boot jingle, RGB cycle and the
+// on-demand replays ignore both.
 extern bool coreBuzzerEnabled;
 extern bool coreLedEnabled;
 
 // Blocking status blink for boot-time signaling, such as the SD-not-found
-// indicator: `count` on/off cycles of the given colour, leaving the LED off.
-// Boot-context only, since it blocks with delay(). A no-op without USE_LED.
+// indicator. Runs `count` on/off cycles of the given colour and leaves the LED
+// off. Call it only at boot, since it blocks in delay(). A no-op without
+// USE_LED.
 void coreLedBlink(uint8_t r, uint8_t g, uint8_t b,
                   uint8_t count, unsigned on_ms, unsigned off_ms);
 
-// Replay the detection chirp or boot jingle on demand, without waiting for a
-// real detection. Backs the "chirp" and "jingle" verbs on both the serial
-// console and the web console. Both block via delay(), which suits either call
-// site, since serial and WebConsole both dispatch from loop(). A no-op on a
-// board with no buzzer, gated on USE_BUZZER inside.
+// On-demand replays behind the "chirp", "jingle" and "prox" verbs on the
+// serial and web consoles. They block in delay(), which both consoles allow
+// because each dispatches from loop(). A no-op without USE_BUZZER.
 void corePlayDetectChirp();
 void corePlayStartupJingle();
 void corePlayProximityChirp();
 
-// The two bird calls, playable whichever one BOOT_SOUND selects, per spec A5.
-// Back the "crow" and "hawk" verbs. See docs/alerts.md for the tuning knobs.
+// The two bird calls behind the "crow" and "hawk" verbs, playable whichever one
+// BOOT_SOUND selects, spec A5. See docs/alerts.md for the tuning knobs.
 void corePlayCrowCall();
 void corePlayHawkCall();
 
 // ============================================================
-// PROXIMITY ALERT: a second chirp when a tracked target crosses inside a range
-// ring, since the new-detection chirp fires once per MAC per REDISCOVER_MS and
-// reads no RSSI. The ring is in metres rather than dBm, so `rssi_trim` stays
-// the one calibration loop for both it and the `dst:` readout. Per-MAC state is
-// a smoothed RSSI and a latch that clears only outside PROX_HYST_PCT of the
-// ring. Adds a sound, never a log row. See docs/alerts.md.
+// PROXIMITY ALERT
+//
+// A second chirp when a tracked target crosses inside a range ring, since the
+// new-detection chirp fires once per MAC per REDISCOVER_MS and reads no RSSI.
+// The ring is in metres, so `rssi_trim` stays the one calibration for both it
+// and the `dst:` readout. Each MAC keeps a smoothed RSSI and a latch that
+// clears only outside PROX_HYST_PCT of the ring. A crossing plays a sound and
+// writes no log row. See docs/alerts.md.
 // ============================================================
 
 // Selectable rings, in metres. 0 is off. Order is the picker's row order.
 #define PROX_RING_OPTION_COUNT 5
 extern const uint8_t PROX_RING_OPTIONS[PROX_RING_OPTION_COUNT];
 
-// Active ring in metres, 0 when off. Persisted as {"prox_m":N}. Set through
-// coreSetProxRingM(), which also clears every latch.
+// Active ring in metres, 0 when off. coreSettingsSave() persists it as
+// `prox_m`. Set it through coreSetProxRingM(), which also clears every latch.
 extern volatile uint8_t coreProxRingM;
 void coreSetProxRingM(uint8_t metres);
 
@@ -638,43 +813,44 @@ void coreSetProxRingM(uint8_t metres);
 int coreProxRingIndex();
 
 // ============================================================
-// INPUT: plain debounced buttons. Gated on HAS_BUTTONS, and always returns
-// INPUT_NONE otherwise. BTN_PIN_1 toggles the active screen and BTN_PIN_2
-// triggers a manual "area of interest" marker. The names stay abstract because
-// physical button placement is not consistent board to board. Self-initializes
-// both pins as INPUT_PULLUP on first call, so there is no separate init
-// function for boards to remember.
+// INPUT
+//
+// Plain debounced buttons under HAS_BUTTONS, and INPUT_NONE otherwise.
+// BTN_PIN_1 toggles the active screen and BTN_PIN_2 triggers a manual "area of
+// interest" marker. The names stay abstract because physical button placement
+// varies board to board. The first call sets both pins to INPUT_PULLUP, so
+// boards have no separate init to call.
 // ============================================================
 
 typedef enum { INPUT_NONE, INPUT_TOGGLE_SCREEN, INPUT_MANUAL_MARK } InputEvent;
 InputEvent coreInputTick();
 
 // ============================================================
-// SEMANTIC NAV LAYER: a display-independent event grammar (UP / DOWN / SELECT /
-// BACK / MARK) that the screen and menu state machine consumes, decoupled from
-// the physical input hardware. The mapping from physical input to semantic
-// event, meaning which button and short versus long press, lives in
-// coreNavTick() behind the board's NAV_SCHEME. A later board revision can
-// therefore swap the three buttons for an encoder or 5-way without touching the
-// screen logic. Events also arrive from the serial nav injector
-// (coreInjectNav), so the screen and menu machine can be driven over serial
-// with no physical input. coreNavTick() reads the physical buttons only under
-// a NAV_SCHEME. A 2-button board uses coreInputTick() instead. The injector
-// works on any board.
+// SEMANTIC NAV LAYER
 //
-// 3-button map: BTN_1 short=UP / long=MARK, BTN_2 short=DOWN, BTN_3
-// short=SELECT / long=BACK.
-// 4-button map: as above, with BACK moved to BTN_4 short, so SELECT no longer
-// carries a long press.
-// Manual-mark keeps a dedicated, always-available gesture on long BTN_1 rather
-// than an overloaded context press, under both schemes.
+// A display-independent event grammar (UP / DOWN / SELECT / BACK / MARK) that
+// the screen and menu state machine consumes. coreNavTick() maps physical
+// input to these events behind the board's NAV_SCHEME, so the screen logic
+// never reads a button. The serial nav injector (coreInjectNav) feeds the same
+// queue on any board. A 2-button board has no NAV_SCHEME and uses
+// coreInputTick() instead.
 //
-// Whichever button carries BACK also emits NAV_BACK_HOLD once it has been held
-// for NAV_EXIT_HOLD_MS. Only the Admin screen consumes it, so leaving the web
-// portal takes a deliberate hold rather than a reachable click. Under the
-// 4-button scheme the hold cancels the short BACK that release would emit.
-// Under the 3-button scheme BACK has already fired at NAV_LONG_PRESS_MS, and
-// Admin ignores it.
+// - 3-button map: BTN_1 short=UP / long=MARK, BTN_2 short=DOWN, BTN_3
+//   short=SELECT / long=BACK.
+// - 4-button map: as above, with BACK on BTN_4 short and no long press on
+//   SELECT.
+//
+// Long BTN_1 is MARK under both schemes.
+//
+// Whichever button carries BACK emits NAV_BACK_HOLD when held for
+// NAV_EXIT_HOLD_MS. Under the 4-button scheme two short BTN_4 presses within
+// NAV_BACK_DOUBLE_MS also emit it. Only the Admin screen consumes it, so
+// leaving the web portal takes a deliberate gesture.
+//
+// Under the 4-button scheme the hold cancels the short BACK that release would
+// emit. Under the 3-button scheme BACK has already fired at NAV_LONG_PRESS_MS,
+// and Admin ignores it. The double-press keeps both BACK events, which backs
+// out of two nested menus on every other screen.
 // ============================================================
 
 #ifndef NAV_SCHEME_3BTN
@@ -699,6 +875,9 @@ InputEvent coreInputTick();
 #ifndef NAV_LONG_PRESS_MS
 #define NAV_LONG_PRESS_MS 500   // hold >= this many ms = long press (BACK / MARK)
 #endif
+#ifndef NAV_BACK_DOUBLE_MS
+#define NAV_BACK_DOUBLE_MS 600  // max gap between two Back presses = NAV_BACK_HOLD
+#endif
 #ifndef NAV_EXIT_HOLD_MS
 #define NAV_EXIT_HOLD_MS 3000   // hold >= this many ms on Back = NAV_BACK_HOLD
 #endif
@@ -709,67 +888,75 @@ typedef enum {
   NAV_DOWN,    // next screen / menu item down
   NAV_SELECT,  // enter menu / confirm selection
   NAV_BACK,    // exit menu (no change)
-  NAV_MARK,    // manual "area of interest" marker (always available)
-  NAV_BACK_HOLD,  // sustained hold of the Back button: leave Admin
+  NAV_MARK,    // manual "area of interest" marker
+  NAV_BACK_HOLD,  // sustained hold or double press of Back, which leaves Admin
 } NavEvent;
 
-// Returns the next pending nav event, taking serial-injected events first and
-// then the physical buttons under a NAV_SCHEME, or NAV_NONE. Self-inits its
-// pins on first call. Poll once per loop, like coreInputTick().
+// Returns the next pending nav event, or NAV_NONE. Serial-injected events come
+// first, then the physical buttons under a NAV_SCHEME. The first call sets up
+// the pins. Poll once per loop, like coreInputTick().
 NavEvent coreNavTick();
 
-// Push a synthetic nav event into the same queue coreNavTick() drains. The
-// serial `nav` verb calls this. Available on every board.
+// Pushes a synthetic nav event into the queue coreNavTick() drains. The serial
+// `nav` verb calls this on every board.
 void coreInjectNav(NavEvent ev);
 
 // ============================================================
-// SCREENS + MENUS: the top-level screen carousel lives in core, holding state
-// only, with each board rendering coreCurrentScreen its own way, so every board
-// can show the same screens. coreNavApply() feeds a NavEvent into the state
-// machine and returns a NavAction the board acts on (redraw the display, run
-// the manual mark, enter Admin). See docs/menu_ux.md.
+// SCREENS + MENUS
+//
+// Core holds the screen carousel's state and each board renders
+// coreCurrentScreen its own way, so every board shows the same screens.
+// coreNavApply() feeds a NavEvent into the state machine and returns a
+// NavAction for the board to act on. See docs/menu_ux.md.
 // ============================================================
 
 typedef enum {
-  SCREEN_OVERVIEW,      // headline: detection count + channel + scanning/hit
-  SCREEN_GPS,           // detail: GPS position / fix status
-  SCREEN_DETECTIONS,    // detail: num detections / last detection MAC
-  SCREEN_SCAN_DETAIL,   // detail: current channel, dwell, mode
-  SCREEN_SCAN_MODES,    // menu: Custom Scan / Full Channel Scan
-  SCREEN_TARGETS,       // menu: which vendors to match (Flock / Axon / All)
-  SCREEN_ALERTS,        // menu: Buzzer mute/unmute + LED on/off (toggle in place)
-  SCREEN_CONFIG,        // menu: web console On / Off (Admin entry)
-  SCREEN_WIPE,          // menu: device wipe, device only or device + card
+  SCREEN_OVERVIEW,      // headline, detection count + channel + scanning/hit
+  SCREEN_GPS,           // detail, GPS position / fix status
+  SCREEN_DETECTIONS,    // detail, num detections / last detection MAC
+  SCREEN_SCAN_DETAIL,   // detail, current channel, dwell, mode
+  SCREEN_SCAN_MODES,    // menu, Custom Scan / Full Channel / Single
+  SCREEN_TARGETS,       // menu, which vendors to match (Flock / Axon / Motorola / All)
+  SCREEN_RADIO,         // menu, which radio captures (2.4GHz / BLE)
+  SCREEN_ALERTS,        // menu, Buzzer mute/unmute + LED on/off (toggle in place)
+  SCREEN_CONFIG,        // menu, web console On / Off (Admin entry)
+  SCREEN_WIPE,          // menu, device wipe, device only or device + card
   SCREEN_COUNT,
 } ScreenId;
 
 extern ScreenId coreCurrentScreen;
 
-// Board-observable side effects coreNavApply() asks the caller to run. The
-// screen-state change itself is internal to coreCurrentScreen. These are the
-// parts that need board-specific code, such as the SD row or portal start.
+// Side effects coreNavApply() asks the board to run, the parts that need
+// board-specific code such as the SD row or portal start. coreNavApply()
+// updates coreCurrentScreen itself.
 typedef enum {
   NAV_ACT_NONE,
-  NAV_ACT_REDRAW,   // screen/menu state changed, board should redraw
+  NAV_ACT_REDRAW,   // screen/menu state changed, so the board redraws
   NAV_ACT_MARK,     // run the manual area-of-interest marker
   NAV_ACT_ADMIN,    // enter Admin (web portal), Config menu confirmed "On"
   NAV_ACT_WIPE,     // device wipe confirmed, board runs coreDeviceWipe()
 } NavAction;
 
-// Feed one NavEvent into the screen/menu state machine. Updates
-// coreCurrentScreen and returns the side effect (if any) for the board to run.
+// Feeds one NavEvent into the screen/menu state machine. Updates
+// coreCurrentScreen and returns the side effect, if any, for the board to run.
 NavAction coreNavApply(NavEvent ev);
 
-// Menu drill-in state for the menu screens (SCAN_MODES / ALERTS / CONFIG):
+// False for a screen that does not apply to the active radio or board, such as
+// the channel plan under BLE capture. coreStepScreen() skips these, so a hidden
+// screen is unreachable.
+bool coreScreenVisible(ScreenId s);
+ScreenId coreStepScreen(ScreenId from, int dir);
+
+// Drill-in state for the menu screens.
 //   MENU_NONE          browsing the carousel, where Up/Down move screens
 //   MENU_LIST          an option list is open, coreMenuSel = highlighted index
 //   MENU_PICK_CHANNEL  Single-mode channel picker, coreMenuSel = channel dialed
 //   MENU_PICK_PROX     proximity-ring picker, coreMenuSel = PROX_RING_OPTIONS index
 //   MENU_CONFIRM_WIPE  device-wipe confirmation, coreWipeConfirmCount = presses
-// Boards read these to render the cursor and edit state. While the state is not
-// MENU_NONE the carousel is frozen, with Up/Down moving the highlight instead,
-// and long-Back pops out. MENU_CONFIRM_WIPE additionally ignores Up/Down and
-// the manual mark, so only Select and Back reach an armed wipe.
+// Boards read these to render the cursor and edit state. Outside MENU_NONE the
+// carousel holds still, Up/Down move the highlight and Back steps out one
+// level. MENU_CONFIRM_WIPE also ignores Up/Down and the manual mark, so only
+// Select and Back reach an armed wipe.
 typedef enum {
   MENU_NONE, MENU_LIST, MENU_PICK_CHANNEL, MENU_PICK_PROX, MENU_CONFIRM_WIPE
 } MenuState;
@@ -777,14 +964,14 @@ extern MenuState coreMenuState;
 extern int       coreMenuSel;
 
 // ============================================================
-// ADMIN-MODE TRIGGER: a double-press of the BOOT button enters the web portal
-// (Admin mode). coreAdminTriggerCheck() is polled at the top of each loop()
-// while in Detect. It self-inits BOOT_BTN_PIN as INPUT_PULLUP on first call and
-// returns true once when a debounced double-press completes, meaning two
-// presses within BOOT_DOUBLE_PRESS_MS. It works at any time, not only at boot,
-// so Detect and Admin can alternate repeatedly without a reboot. The portal
-// releases back to Detect via a web-console command or an idle timeout, as
-// described in web_portal.h. Non-blocking.
+// ADMIN-MODE TRIGGER
+//
+// A double-press of the BOOT button enters the web portal (Admin mode). Boards
+// poll coreAdminTriggerCheck() at the top of each loop() while in Detect. The
+// first call sets BOOT_BTN_PIN to INPUT_PULLUP, and the check returns true once
+// for each debounced pair of presses within BOOT_DOUBLE_PRESS_MS. It works at
+// any time after boot, so Detect and Admin can alternate without a reboot.
+// web_portal.h covers the way back to Detect. Non-blocking.
 // ============================================================
 
 #ifndef BOOT_DOUBLE_PRESS_MS
@@ -798,42 +985,54 @@ extern int       coreMenuSel;
 bool coreAdminTriggerCheck();
 
 // ============================================================
-// WIFI SNIFFER BRING-UP: the raw-IDF promiscuous capture init, covering driver
-// init, NULL mode, start, channel, and the promiscuous filter and callback.
-// Shared by every board's setup() and by webPortalStop() when it releases the
-// AP and resumes Detect. Clears sniffingStopped. The Admin web portal fully
-// deinits this driver to hand the radio to Arduino WiFi for the SoftAP, and
-// this brings it back up from clean. Must run after the board's peripheral
-// init, since it touches no display.
+// WIFI SNIFFER BRING-UP
+//
+// The raw-IDF promiscuous capture init, covering driver init, NULL mode, start,
+// channel, and the promiscuous filter and callback. coreRadioStart() calls it
+// under WiFi capture, including when webPortalStop() resumes Detect.
+// The Admin web portal fully deinits the driver to hand the radio to Arduino
+// WiFi for the SoftAP, and this brings it back up from clean. Clears
+// sniffingStopped.
 // ============================================================
 
 void coreWifiSnifferStart();
 
+// Full teardown of the raw promiscuous driver, leaving the clean state
+// coreWifiSnifferStart() expects. Sets sniffingStopped.
+void coreWifiSnifferStop();
+
+// Starts or stops whichever radio coreRadioMode selects. Boards and
+// webPortalStop() call these, so resuming Detect returns to the selected radio.
+void coreRadioStart();
+void coreRadioStop();
+
 // ============================================================
-// DEVICE WIPE: erases everything that identifies a unit or the places it has
-// been, so a device can be sold, donated, or handed on. Reached from
-// SCREEN_WIPE, and confirmed by three deliberate Select presses.
+// DEVICE WIPE
 //
-// WIPE_DEVICE clears onboard state only, for the case where the
-// card is pulled and replaced. WIPE_DEVICE_AND_CARD also empties the card's
-// root. What goes in either case:
-//   RAM     the detection table, zeroed before anything is written
-//   SPIFFS  formatted, so a file added later needs no edit here to be caught
+// Erases everything that identifies a unit or the places it has been, so an
+// owner can sell, donate or hand on a device. SCREEN_WIPE reaches it, and
+// three deliberate Select presses confirm it.
+//
+// WIPE_DEVICE clears onboard state only, for an owner who pulls and replaces
+// the card. WIPE_DEVICE_AND_CARD also empties the card's root. Each scope
+// erases these.
+//   RAM     the 802.11 detection table, zeroed before any storage write
+//   SPIFFS  formatted whole, so a file added later needs no edit here
 //   NVS     erased whole, taking boot_count and the WiFi driver's own store
 //   SD      every root entry, recursively, under WIPE_DEVICE_AND_CARD
 //
-// Unerasable: the eFuse MAC and serial, which coreDeviceTag()
-// derives session directory names from. Copies of a session taken off the
-// device before a wipe still name the unit that made them.
+// The eFuse MAC and serial survive, and coreDeviceTag() derives session
+// directory names from them. Copies of a session taken off the device before
+// a wipe still name the unit that made them.
 //
-// A card delete frees FAT entries; it does not overwrite the sectors. Treat it
-// as tidying, not sanitization, and destroy or host-format a card whose
-// contents matter.
+// A card delete frees FAT entries and leaves the sectors intact. Treat it as
+// tidying, not sanitization, and destroy or host-format a card whose contents
+// matter.
 //
-// Interruption: the scope is written to NVS first and the NVS erase runs last,
-// so a power cut mid-wipe leaves the record of what was asked for. Boards call
-// coreWipePending() in setup() and finish the job before the sniffer starts.
-// There is no partial state a device can boot into and keep logging from.
+// The wipe records its scope in NVS first and erases NVS last, so a power cut
+// mid-wipe leaves the requested scope on record. Boards call
+// coreWipePending() in setup() and finish the job before the sniffer starts,
+// so a device never boots into a partial wipe and keeps logging.
 // ============================================================
 
 typedef enum {
@@ -843,28 +1042,27 @@ typedef enum {
 } WipeScope;
 
 // Runs the erase and returns. The caller shows its own completion frame and
-// then calls corePowerOff(). Stops the sniffer and closes the roost session
-// before touching storage, so nothing rewrites a file that was just removed.
-// Blocks for as long as the card takes.
+// then calls corePowerOff(). Stops the active radio and closes the roost
+// session before touching storage, so nothing rewrites a removed file. Blocks
+// for as long as the card takes.
 void coreDeviceWipe(WipeScope scope);
 
-// The scope of a wipe that was interrupted, WIPE_NONE if none. Call once from
-// setup() after SPIFFS and SD are mounted and before coreWifiSnifferStart(),
-// and pass a non-WIPE_NONE result straight back to coreDeviceWipe().
+// The scope of an interrupted wipe, or WIPE_NONE. Call once from setup() after
+// SPIFFS and SD mount and before coreRadioStart(), and pass any other result
+// straight back to coreDeviceWipe().
 WipeScope coreWipePending();
 
 // Blanks the LED and buzzer and enters deep sleep with every wake source
-// disabled. The board has no software-accessible power latch, so this is as 
-// good as it gets. Only reset or a power cycle brings it back, no wakeup
-// functionality defined so that wipe completion is forced.
+// disabled, the closest these boards come to power-off without a software
+// power latch. Only reset or a power cycle brings the device back, so a wipe
+// always ends here.
 void corePowerOff();
 
-// Scope highlighted on SCREEN_WIPE and carried into the confirmation, and the
-// Select presses landed so far (0 to 3). Boards read both to draw the
-// confirmation overlay.
+// The scope highlighted on SCREEN_WIPE, which the confirmation keeps, and the
+// Select presses so far (0 to 3). Boards read both to draw the confirmation
+// overlay.
 WipeScope coreWipeSelectedScope();
 extern int coreWipeConfirmCount;
 
-// Select number of presses required to arm a wipe. Prevents accidental wipes or
-// interruptible time-based confirmation.
+// Select presses required to arm a wipe, to prevent an accidental one.
 #define WIPE_CONFIRM_PRESSES 3

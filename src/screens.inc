@@ -1,21 +1,19 @@
 // Copyright (C) 2026 Lone Crow Design, LLC
 // Licensed under the MIT License. See LICENSE.
 //
-// Screen carousel drawing, shared verbatim between the firmware
-// (src/main_oled.cpp) and the host-side renderer (tools/screen_render). Included
-// as a .inc rather than compiled on its own. It draws through whatever `u8g2`
-// object and state globals the includer has in scope, which on the device are
-// the real ones and on the host are stubs. Keeping it a single source means a
-// rendered PNG cannot drift from what the panel shows.
+// Screen carousel drawing, which the firmware (src/main_oled.cpp) and the
+// host-side renderer (tools/screen_render) both include verbatim. It draws
+// through whatever `u8g2` object and state globals the includer has in scope,
+// real on the device and stubs on the host.
 //
-// The includer must provide: a `u8g2` object, the disp* display state, core's
-// screen/menu state, and the board macros HAS_GPS / CHANNEL_DWELL_MS.
+// The includer must provide a `u8g2` object, the disp* display state, core's
+// screen and menu state, and the board macros HAS_GPS and CHANNEL_DWELL_MS.
 
 // ============================================================
-// SCREEN CAROUSEL: one draw function per ScreenId (core owns the state, this
-// board owns the pixels). Content rows sit below a shared title/index header.
-// Menu screens (SCAN MODE / ALERTS / WEB CONFIG) drill in via SELECT/BACK. See
-// docs/menu_ux.md.
+// SCREEN CAROUSEL
+// One draw function per ScreenId. Core owns the state and this file owns the
+// pixels. Content rows sit below a shared title and index header. The menu
+// screens drill in via SELECT and BACK. See docs/menu_ux.md.
 // ============================================================
 
 #define ROW1 24
@@ -23,9 +21,9 @@
 #define ROW3 48
 #define ROW4 60
 
-// Brief confirmation overlay shown when a manual mark is logged. While
-// markOverlayUntil is in the future, displayTick() holds this frame instead of
-// redrawing the current screen. It clears itself when the timer expires.
+// Brief confirmation overlay for a logged manual mark. While markOverlayUntil
+// is in the future, displayTick() holds this frame in place of the current
+// screen, then clears the timer once it expires.
 static unsigned long markOverlayUntil = 0;
 #define MARK_OVERLAY_MS 1500
 
@@ -38,18 +36,21 @@ static void drawMarkOverlay() {
   u8g2.sendBuffer();
 }
 
-// Indexed by dispVendor; order must match the Vendor enum in core.h. Not
-// vendorName(), whose lowercase strings are the stable form for serial and JSON.
+// Display names for the panel. The order must match the Vendor enum in core.h.
+// vendorName() holds the lowercase strings, the stable form for serial and
+// JSON.
 static const char* dispVendorName(int8_t vendor) {
-  static const char* const names[4] = { "Flock", "Axon", "Axis", "Utility" };
+  static const char* const names[VENDOR_COUNT] = {
+    "Flock", "Axon", "Axis", "Utility",
+    "Motorola", "Verkada", "Genetec", "DigAlly", "Infra",
+  };
   if (vendor < 0 || vendor >= (int)(sizeof(names) / sizeof(names[0]))) return "--";
   return names[vendor];
 }
 
-// '~' is part of the value: the number is a coarse guess, not a measurement.
-// Clamps past 999m rather than widening the row.
-// A negative distance is specifically an addr1 hit, not a missing reading.
-// Spec S3.
+// The '~' marks the number as a coarse estimate. Distances of 999m or more
+// show as ">999m" to hold the row width. A negative distance means an addr1
+// hit, which is different from a missing reading. Spec S3.
 static void dispFormatDist(float m, char* buf, size_t len) {
   if (m < 0.0f)        snprintf(buf, len, "via AP");
   else if (m >= 999.0f) snprintf(buf, len, ">999m");
@@ -69,13 +70,37 @@ static void drawScreenHeader(const char* title) {
 static void drawOverview() {
   char line[22];
   drawScreenHeader("OVERVIEW");
+  if (coreRadioMode == RADIO_MODE_BLE) {
+    // The BLE table's device count, with the most recent device below. An
+    // accessory shows "acc", since it proves equipment and not a camera [M3].
+    // BLE has no channel or distance to show.
 #if HAS_GPS
-  // Compact fix flag (Y/N). Full GPS detail lives on the GPS screen, and Y/N keeps
-  // the line within 128px even at max det/channel. `ch` is left-justified to
-  // width 2 (channels are 1–13) so a single→double digit hop pads with a space
-  // instead of shoving `gps:` right as the channel scans.
-  // '!' after the count marks a full detection table (see DETECTIONS screen for
-  // how many were missed). One char, so the line still fits 128px.
+    snprintf(line, sizeof(line), "det:%-3u%c gps:%c", (unsigned)coreBleDetCount,
+             coreBleDetMissed ? '!' : ' ', gpsHasFix ? 'Y' : 'N');
+#else
+    snprintf(line, sizeof(line), "det:%-3u%c", (unsigned)coreBleDetCount,
+             coreBleDetMissed ? '!' : ' ');
+#endif
+    u8g2.drawStr(0, ROW1, line);
+    if (coreBleDetLast >= 0) {
+      const BleDetection& d = coreBleDet[coreBleDetLast];
+      snprintf(line, sizeof(line), "typ:%s%s", dispVendorName(d.vendor),
+               d.accessory ? " acc" : "");
+      u8g2.drawStr(0, ROW2, line);
+      snprintf(line, sizeof(line), "rssi:%d n:%u", (int)d.rssi, (unsigned)d.count);
+      u8g2.drawStr(0, ROW3, line);
+      u8g2.drawStr(0, ROW4, d.key);
+    } else {
+      u8g2.drawStr(0, ROW2, "scanning...");
+    }
+    return;
+  }
+#if HAS_GPS
+  // The GPS screen shows full GPS detail, and the Y/N flag keeps this line
+  // within 128px at the widest det and channel. `ch` pads to width 2, so `gps:`
+  // holds still as the channel moves between one and two digits. '!' after the
+  // count marks a full detection table, and the DETECTIONS screen shows how
+  // many it missed.
   snprintf(line, sizeof(line), "det:%-3d%c ch:%-2u gps:%c",
            fyDetCount, fyDroppedNew ? '!' : ' ', currentChannel,
            gpsHasFix ? 'Y' : 'N');
@@ -120,8 +145,19 @@ static void drawGpsDetail() {
 #endif
 }
 
-// Abbreviates a frame count so two fit one 128px row. These answer zero /
-// trickle / thousands, so trailing digits buy nothing.
+// Formats uptime in at most 4 characters, the space ROW4 has left after the
+// count and rate at their widest. Above 10h it drops the minutes.
+static const char* shortUptime(uint32_t ms, char* buf, size_t cap) {
+  const uint32_t mins = ms / 60000u;
+  if      (mins < 60)   snprintf(buf, cap, "%um", (unsigned)mins);
+  else if (mins < 600)  snprintf(buf, cap, "%uh%02u",
+                                 (unsigned)(mins / 60), (unsigned)(mins % 60));
+  else if (mins < 6000) snprintf(buf, cap, "%uh", (unsigned)(mins / 60));
+  else                  snprintf(buf, cap, "%ud", (unsigned)(mins / 1440));
+  return buf;
+}
+
+// Abbreviates a count to fit ROW4, keeping only its magnitude.
 static const char* shortCount(uint32_t v, char* buf, size_t cap) {
   if      (v < 10000)   snprintf(buf, cap, "%u",  (unsigned)v);
   else if (v < 1000000) snprintf(buf, cap, "%uk", (unsigned)(v / 1000));
@@ -132,31 +168,47 @@ static const char* shortCount(uint32_t v, char* buf, size_t cap) {
 static void drawDetections() {
   char line[22];
   drawScreenHeader("DETECTIONS");
-  snprintf(line, sizeof(line), "devices: %d", fyDetCount);
-  u8g2.drawStr(0, ROW1, line);
-  // Cameras, not frames, and overlapping: one seen both ways counts in each,
-  // so dir+ind can exceed the total above. Spec C1-C2. Always drawn.
-  snprintf(line, sizeof(line), "dir:%u ind:%u",
-           (unsigned)coreDirectDeviceCount(), (unsigned)coreIndirectDeviceCount());
-  u8g2.drawStr(0, ROW2, line);
-  if (fyDetCount > 0) {
-    u8g2.drawStr(0, ROW3, dispMac);
+  const bool bleMode = coreRadioMode == RADIO_MODE_BLE;
+  if (bleMode) {
+    snprintf(line, sizeof(line), "devices: %u", (unsigned)coreBleDetCount);
+    u8g2.drawStr(0, ROW1, line);
+    // Every BLE detection is direct, so matched advertisements take the row the
+    // dir/ind split uses on 802.11.
+    snprintf(line, sizeof(line), "hits:%u", (unsigned)coreBleMatched);
+    u8g2.drawStr(0, ROW2, line);
+    u8g2.drawStr(0, ROW3, coreBleDetLast >= 0 ? coreBleDet[coreBleDetLast].mac
+                                              : "no detections yet");
   } else {
-    u8g2.drawStr(0, ROW3, "no detections yet");
+    snprintf(line, sizeof(line), "devices: %d", fyDetCount);
+    u8g2.drawStr(0, ROW1, line);
+    // Overlapping camera counts. A camera seen both ways counts in each, so
+    // dir+ind can exceed the total above. Spec C1-C2.
+    snprintf(line, sizeof(line), "dir:%u ind:%u",
+             (unsigned)coreDirectDeviceCount(), (unsigned)coreIndirectDeviceCount());
+    u8g2.drawStr(0, ROW2, line);
+    if (fyDetCount > 0) {
+      u8g2.drawStr(0, ROW3, dispMac);
+    } else {
+      u8g2.drawStr(0, ROW3, "no detections yet");
+    }
   }
-  // ROW4 is shared and the overflow warning wins it, spec S4: without that
-  // line devices: pins at MAX_DETECTIONS and reads as a quiet area.
-  if (fyDroppedNew) {
-    snprintf(line, sizeof(line), "FULL! missed:%u", (unsigned)fyDroppedNew);
+  // The overflow warning takes ROW4 when present, spec S4. Without it, the
+  // `devices:` count pins at the table size and reads as a quiet area.
+  const uint16_t missed = bleMode ? coreBleDetMissed : fyDroppedNew;
+  if (missed) {
+    snprintf(line, sizeof(line), "FULL! missed:%u", (unsigned)missed);
     u8g2.drawStr(0, ROW4, line);
   } else {
-    // The one row not in device units, required by spec S2: these count all
-    // traffic, so seen: climbing with zero devices is a quiet area while
-    // seen: flat is a deaf radio.
-    char sn[10], cd[10];
-    snprintf(line, sizeof(line), "seen:%s cand:%s",
-             shortCount(coreSeenFrames, sn, sizeof(sn)),
-             shortCount(coreCandidateFrames, cd, sizeof(cd)));
+    // The one row not in device units, spec S2. It counts everything the
+    // active radio hears, matched or not, with its rate and the uptime. The
+    // label names the unit, since advertisements and 802.11 frames arrive at
+    // very different rates.
+    char sn[10], up[8];
+    snprintf(line, sizeof(line), "%s:%s %u/s %s",
+             bleMode ? "adv" : "seen",
+             shortCount(bleMode ? coreBleReports : coreSeenFrames, sn, sizeof(sn)),
+             (unsigned)(bleMode ? coreBleRate() : coreSeenRate()),
+             shortUptime(millis(), up, sizeof(up)));
     u8g2.drawStr(0, ROW4, line);
   }
 }
@@ -164,6 +216,19 @@ static void drawDetections() {
 static void drawScanDetail() {
   char line[22];
   drawScreenHeader("SCAN");
+  if (coreRadioMode == RADIO_MODE_BLE) {
+    // Channel and dwell have no BLE reading, since the controller cycles the
+    // three advertising channels itself and the scan runs at full duty. The
+    // PHY split takes their place and shows whether the scanner hears coded PHY
+    // at all.
+    u8g2.drawStr(0, ROW1, "mode: BLE passive");
+    snprintf(line, sizeof(line), "adv: %u", (unsigned)coreBleReports);
+    u8g2.drawStr(0, ROW2, line);
+    snprintf(line, sizeof(line), "1M:%u cod:%u",
+             (unsigned)coreBlePhy1M, (unsigned)coreBlePhyCoded);
+    u8g2.drawStr(0, ROW3, line);
+    return;
+  }
   snprintf(line, sizeof(line), "mode: %s", channelModeName());
   u8g2.drawStr(0, ROW1, line);
   snprintf(line, sizeof(line), "channel: %u", currentChannel);
@@ -172,9 +237,8 @@ static void drawScanDetail() {
   u8g2.drawStr(0, ROW3, line);
 }
 
-// Scan Mode menu. Browsing marks the active mode with '*'. Drilled in
-// (MENU_LIST), the cursor '>' tracks coreMenuSel, and Single opens a channel
-// picker.
+// Scan Mode menu. '*' marks the active mode. In MENU_LIST the cursor '>'
+// tracks coreMenuSel, and Single opens a channel picker.
 static void drawScanModes() {
   drawScreenHeader("SCAN MODE");
   if (coreMenuState == MENU_PICK_CHANNEL) {
@@ -198,17 +262,37 @@ static void drawScanModes() {
   if (coreMenuState == MENU_NONE) u8g2.drawStr(0, ROW4, "Select to change");
 }
 
-// Targets menu. Which vendors the OUI matcher accepts, orthogonal to Scan Mode:
-// this picks WHAT to look for, Scan Mode picks WHERE to listen. Act-and-close,
-// same idiom as Scan Mode. Row order must match TARGET_MASKS in core.cpp.
+// Targets menu. Picks which vendors the matchers accept, independent of Scan
+// Mode, which picks where to listen. Selecting a row applies it and closes the
+// menu, as on Scan Mode. Row order must match TARGET_MASKS in core.cpp.
 static void drawTargets() {
   drawScreenHeader("TARGETS");
-  static const char* const opts[3] = { "Flock", "Axon", "All" };
+  static const char* const opts[TARGET_ROW_COUNT] = {
+    "Flock", "Axon", "Motorola", "All",
+  };
   int active = coreTargetIndex();          // -1 if the mask matches no row
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < TARGET_ROW_COUNT; i++) {
     char line[22];
     char cursor = (coreMenuState == MENU_LIST && coreMenuSel == i) ? '>' : ' ';
     char act    = (i == active) ? '*' : ' ';
+    snprintf(line, sizeof(line), "%c%c%s", cursor, act, opts[i]);
+    u8g2.drawStr(0, ROW1 + i * 12, line);
+  }
+  // Four option rows fill the panel and leave no room for the footer.
+  if (coreMenuState == MENU_NONE && TARGET_ROW_COUNT < 4)
+    u8g2.drawStr(0, ROW4, "Select to change");
+}
+
+// Radio menu. Picks which radio captures, independent of Targets and Scan Mode.
+// The modes are exclusive, so the row index is the RadioMode value and one row
+// always shows the active mark.
+static void drawRadio() {
+  drawScreenHeader("RADIO");
+  static const char* const opts[RADIO_MODE_COUNT] = { "2.4GHz", "BLE" };
+  for (int i = 0; i < RADIO_MODE_COUNT; i++) {
+    char line[22];
+    char cursor = (coreMenuState == MENU_LIST && coreMenuSel == i) ? '>' : ' ';
+    char act    = (i == (int)coreRadioMode) ? '*' : ' ';
     snprintf(line, sizeof(line), "%c%c%s", cursor, act, opts[i]);
     u8g2.drawStr(0, ROW1 + i * 12, line);
   }
@@ -216,8 +300,8 @@ static void drawTargets() {
 }
 
 // Alerts menu. Two toggles (Buzzer mute/unmute, LED on/off) plus the proximity
-// ring, which drills into a range picker the way Single → channel does. Rows
-// show the CURRENT state so a toggle is unambiguous.
+// ring, which drills into a range picker the way Single opens the channel
+// picker. Rows show the current state, so a toggle reads unambiguously.
 static void drawAlerts() {
   drawScreenHeader("ALERTS");
   char line[22];
@@ -247,7 +331,8 @@ static void drawAlerts() {
   if (coreMenuState == MENU_NONE) u8g2.drawStr(0, ROW4, "Select to change");
 }
 
-// Config menu. Web Console On enters Admin (SoftAP portal). Off closes it.
+// Config menu. Web Console On enters Admin (SoftAP portal), and Off closes the
+// menu.
 static void drawConfig() {
   drawScreenHeader("WEB CONFIG");
   u8g2.drawStr(0, ROW1, "Web Console");
@@ -261,8 +346,8 @@ static void drawConfig() {
   if (coreMenuState == MENU_NONE) u8g2.drawStr(0, ROW4, "Select to enter");
 }
 
-// Device-wipe menu. Both rows arm the three-press confirmation rather than
-// acting, so the scope is chosen before anything is irreversible. See core.h.
+// Device-wipe menu. Both rows arm the three-press confirmation, so the
+// operator picks the scope before anything is irreversible. See core.h.
 
 #define WIPE_ROW1    33
 #define WIPE_ROW_GAP 13
@@ -278,8 +363,8 @@ static void drawWipe() {
 }
 
 // Wipe confirmation, drawn in place of the carousel while coreMenuState is
-// MENU_CONFIRM_WIPE. Names the scope as well as the count, so the card is never
-// erased by a gesture the operator thought applied to the device alone.
+// MENU_CONFIRM_WIPE. It names the scope as well as the count, so an operator
+// never erases the card with a gesture meant for the device alone.
 static void drawWipeConfirm() {
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawFrame(2, 8, 124, 52);
@@ -292,7 +377,8 @@ static void drawWipeConfirm() {
   snprintf(prompt, sizeof(prompt), "Press Confirm %dx", WIPE_CONFIRM_PRESSES);
   u8g2.drawStr((128 - u8g2.getStrWidth(prompt)) / 2, 36, prompt);
 
-  // One star per press landed, in a larger face so the count reads at a glance.
+  // One star per confirmed press, in a larger face so the count reads at a
+  // glance.
   char stars[WIPE_CONFIRM_PRESSES * 2] = "";
   int n = 0;
   for (int i = 0; i < coreWipeConfirmCount && i < WIPE_CONFIRM_PRESSES; i++) {
@@ -307,8 +393,8 @@ static void drawWipeConfirm() {
 
 static void displayScreen() {
   u8g2.clearBuffer();
-  // The confirmation is modal: it replaces the carousel rather than overlaying
-  // a screen, so no other reading can be mistaken for the thing being armed.
+  // The confirmation replaces the whole carousel, so the operator cannot
+  // mistake another reading for the action the presses arm.
   if (coreMenuState == MENU_CONFIRM_WIPE) {
     drawWipeConfirm();
     u8g2.sendBuffer();
@@ -321,6 +407,7 @@ static void displayScreen() {
     case SCREEN_SCAN_DETAIL: drawScanDetail();  break;
     case SCREEN_SCAN_MODES:  drawScanModes();   break;
     case SCREEN_TARGETS:     drawTargets();     break;
+    case SCREEN_RADIO:       drawRadio();       break;
     case SCREEN_ALERTS:      drawAlerts();      break;
     case SCREEN_CONFIG:      drawConfig();      break;
     case SCREEN_WIPE:        drawWipe();        break;

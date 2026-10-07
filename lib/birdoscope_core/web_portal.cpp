@@ -1,26 +1,19 @@
 // Copyright (C) 2026 Lone Crow Design, LLC
 // Licensed under the MIT License. See LICENSE.
 //
-// Untethered "Admin" web portal. See web_portal.h for the interface contract.
+// The Admin web portal. See web_portal.h for the interface.
 //
-// Backed by WebConsole, an async, schema-driven console pulled in as a
-// lib_deps git dependency. This file declares what Birdoscope exposes and
-// keeps the stable webPortalStart/Stop/Tick interface so the board main files
-// are unchanged:
-//   • session    → the SPIFFS session JSON (and the promoted previous session),
-//                  downloadable on every board.
-//   • logs       → on SD boards, an escape-hatch page listing every CSV on the
-//                  card, each with a download link. The live capture logs are
-//                  GPS-named, and /log.csv is only the pre-anchor buffer, so a
-//                  single addFile() cannot reach them but a directory listing
-//                  can.
-//   • status     → a console command that prints firmware version + scan state
-//                  into the log stream.
+// WebConsole, an async schema-driven console from lib_deps, serves the portal.
+// This file declares what Birdoscope exposes through it. The main pieces are:
+//   - session: the SPIFFS session JSON and the previous session, for download
+//     on every board.
+//   - logs: on SD boards, a page listing each session directory's files, and
+//     any .csv in the card's root, with download links.
+//   - commands: the serial console's verbs, with status, wifi, calibrate and
+//     help pinned as buttons.
 //
-// SoftAP mode competes for the same radio as the promiscuous sniffer, so the
-// caller pauses detection while the portal is up (see web_portal.h). This file
-// owns only the server. The promiscuous and SoftAP radio handoff lives in the
-// core and board code that calls webPortalStart() and webPortalStop().
+// SoftAP and the promiscuous sniffer share one radio, so webPortalStart() stops
+// the selected radio and webPortalStop() restarts it.
 #include "web_portal.h"
 #include "roost_session.h"
 #include "board_config.h"   // must precede core.h so USE_SD/HAS_GPS gate its externs
@@ -37,18 +30,18 @@
 
 using jelly::webconsole::WebConsole;
 
-// mDNS / device name (SSID + password live in web_portal.h so the boards can
-// pass them to webPortalStart()). board_config.h may override.
+// mDNS and device name. The AP SSID and password live in web_portal.h, where
+// the boards read them for webPortalStart(). board_config.h may override.
 #ifndef WEB_PORTAL_DEVICE_NAME
-#define WEB_PORTAL_DEVICE_NAME  "birdoscope"   // also mDNS: birdoscope.local
+#define WEB_PORTAL_DEVICE_NAME  "birdoscope"   // also the mDNS name, birdoscope.local
 #endif
 
-// Idle auto-resume: Admin releases back to Detect on its own so an accidental
-// BOOT double-press in the field can't silently pause scanning. Two windows:
-// nobody ever connected within _NO_CLIENT_MS of entry, or the last client left
-// more than _IDLE_MS ago. board_config.h may override.
+// Idle timeouts that return Admin to Detect, so an accidental BOOT double press
+// in the field does not pause scanning for good. Admin ends when no client
+// connects within WEB_PORTAL_NO_CLIENT_MS of entry, or WEB_PORTAL_IDLE_MS after
+// the last client leaves. board_config.h may override.
 #ifndef WEB_PORTAL_NO_CLIENT_MS
-#define WEB_PORTAL_NO_CLIENT_MS 180000UL  // 3min to join the AP + connect before we give up
+#define WEB_PORTAL_NO_CLIENT_MS 180000UL  // 3 min to join the AP and connect
 #endif
 #ifndef WEB_PORTAL_IDLE_MS
 #define WEB_PORTAL_IDLE_MS      60000UL   // 60s after the last client disconnects
@@ -58,41 +51,42 @@ static WebConsole console;
 static bool          portalActive = false;
 static bool          registered   = false;
 static char          status[96]   = "browse to configure";
-// Runtime release state (reset each webPortalStart):
+// Release state, reset on each webPortalStart().
 static volatile bool exitRequested = false;   // set by the web "return to scan" action
-static unsigned long exitReqMs     = 0;        // when it was requested (grace for the response to flush)
+static unsigned long exitReqMs     = 0;        // request time, for the flush grace period
 static unsigned long portalStartMs = 0;        // for the never-connected timeout
-static unsigned long lastClientMs  = 0;        // last time a client was seen
+static unsigned long lastClientMs  = 0;        // last time any client held a connection
 static bool          everHadClient = false;
 
-// "status" command. Prints firmware version and current scan state into the
-// console log, the "web serial" stream, so the running state is readable
-// without opening a page. Composed from core externs, since printStatus() is
-// static to each board main and unreachable here. Mirrors the serial `status`
-// verb.
+// The "status" command. Prints firmware version and scan state into the console
+// log, mirroring the serial `status` verb. It reads core externs, since each
+// board main keeps its own static printStatus().
 static String reportStatus() {
   unsigned long s = millis() / 1000;
   console.logf("Birdoscope %s", coreBuildIdentity());
   console.logf("uptime=%lus ch=%u mode=%s det=%d spiffs=%d sniffing=%d",
                s, (unsigned)currentChannel, channelModeName(), fyDetCount,
                fySpiffsReady ? 1 : 0, sniffingStopped ? 0 : 1);
-  // Two units on purpose: frames say whether the path is alive, devices say
-  // what is out there. Device counts overlap and can sum past det, spec C2.
+  // Frame counts show whether the path is alive, and device counts show what is
+  // out there. Device counts overlap and can sum past det, spec C2.
   console.logf("frames direct=%u indirect=%u",
                (unsigned)coreDirectFrames, (unsigned)coreIndirectFrames);
   console.logf("devices direct=%u indirect=%u (of %d total)",
                (unsigned)coreDirectDeviceCount(),
                (unsigned)coreIndirectDeviceCount(), fyDetCount);
-  // Frozen at whatever they held when the portal stopped the sniffer; read
-  // over serial for a live figure.
+  // These hold their values from when the portal stopped the sniffer. Serial
+  // shows the live figures.
   console.logf("sniffer seen=%u cand=%u qdrop=%u",
                (unsigned)coreSeenFrames, (unsigned)coreCandidateFrames,
                (unsigned)coreQueueDrops);
-  // From the roost writer, the same source the serial heartbeat reads.
+  // Reads the roost writer, the same source as the serial `status` command.
   uint32_t rw = 0, rd = 0, wf = 0, fx = 0;
   roostSessionStats(&rw, &rd, &wf, &fx);
-  console.logf("load qmax=%u/%u rows=%u fixes=%u dropped=%u worst_flush=%ums session=%s",
+  console.logf("load qmax=%u/%u bqmax=%u/%u bqdrop=%u rows=%u fixes=%u dropped=%u"
+               " worst_flush=%ums session=%s",
                (unsigned)coreQueueDepthMax, (unsigned)coreAlertQueueSize(),
+               (unsigned)coreBleQueueDepthMax, (unsigned)coreBleQueueSize(),
+               (unsigned)coreBleQueueDrops,
                (unsigned)rw, (unsigned)fx, (unsigned)rd, (unsigned)wf,
                roostSessionOpen() ? roostSessionDir() : "none");
   console.logf("heap=%u min_free=%u largest_block=%u",
@@ -101,13 +95,13 @@ static String reportStatus() {
   return String("Birdoscope v") + BIRDOSCOPE_VERSION + " – status printed to log";
 }
 
-// Active distance model plus a worked example, which is what makes the numbers
-// checkable against a tape measure.
+// The active distance model with a worked example, so an operator can check
+// the numbers against a tape measure.
 static String describeDistanceModel() {
   char buf[192];
   int8_t last = coreLastDetectionRssi();
   if (last != 0) {
-    snprintf(buf, sizeof(buf),   // real reading beats a hypothetical one
+    snprintf(buf, sizeof(buf),   // prefers a real reading to the -80 dBm example
              "density=%s (n=%.1f) rssi_1m=%ddBm; last detection %ddBm reads ~%.1fm",
              envDensityName(coreEnvDensity), corePathLossExponent(),
              (int)coreRssiAt1mDbm, (int)last, coreRssiToDistanceM(last));
@@ -120,10 +114,8 @@ static String describeDistanceModel() {
   return String(buf);
 }
 
-// Batches log lines into ~900-byte console.log() calls. Streaming a whole log
-// at one WebSocket frame per line overran the socket and dropped the client,
-// which surfaced as disconnect and reconnect churn after a bulk `log`.
-// Batching keeps it to a handful of frames.
+// Batches log lines into console.log() calls of about 900 bytes. One WebSocket
+// frame per line overruns the socket on a bulk dump and drops the client.
 struct LogBatcher {
   String buf;
   void add(const String& s) {
@@ -134,9 +126,8 @@ struct LogBatcher {
   void flush() { if (buf.length()) { console.log(buf); buf = String(); } }
 };
 
-// Streams a whole file into the console log, capped and batched. This is the
-// web equivalent of the serial dump and prev commands. Past the cap it stops
-// and points at the download button.
+// Streams a file into the console log in batches, for the web dump and prev
+// commands. Past the cap it stops and points at the download button.
 static const size_t WEB_LOG_STREAM_CAP = 8192;
 
 static String streamFileToConsole(fs::FS& fs, const char* path, const char* label) {
@@ -165,12 +156,11 @@ static String streamFileToConsole(fs::FS& fs, const char* path, const char* labe
 }
 
 #if USE_SD
-// Prints the SD detection log. Default (full=false) prints the CSV header + only
-// the last 10 rows, held in a RAM-safe rolling window so a log far larger than
-// RAM never loads at once (and only ~11 batched lines hit the WebSocket).
-// full=true streams the whole file, batched and opt-in, and may reconnect on a
-// very large log. Draws from the session's wifi_obs file, which lives under a
-// provisional directory until the clock anchors and then follows the rename.
+// Prints the open session's wifi_obs file, which roostSessionDir() locates
+// before and after the anchor rename. By default it prints the header and the
+// last 10 rows, through a rolling window, so the file never loads into RAM
+// whole. full=true streams the whole file in batches, and a very large file may
+// drop the client.
 static const int WEB_LOG_TAIL = 10;
 
 static String dumpSdLog(bool full) {
@@ -194,7 +184,7 @@ static String dumpSdLog(bool full) {
     f.close();
     return String("SD log: printed to log (full)");
   }
-  // Tail: header + a rolling window of the last WEB_LOG_TAIL rows.
+  // Header, then a rolling window of the last WEB_LOG_TAIL rows.
   String header, win[WEB_LOG_TAIL];
   int cnt = 0, pos = 0;
   bool first = true;
@@ -215,97 +205,117 @@ static String dumpSdLog(bool full) {
 #endif
 
 #if USE_SD
-// A filename is safe to serve from SD root only if it is a bare name, with no
-// path separators, no "..", and no leading slash. This is an open AP, so the
-// guard matters.
+// Accepts a bare file name, or one directory level as `dir/file`, with no
+// empty part, backslash or "..", since /dl serves the card to anyone on the AP.
 static bool sdNameSafe(const String& f) {
-  if (f.length() == 0 || f.length() > 40) return false;
-  if (f.indexOf('/') >= 0 || f.indexOf('\\') >= 0) return false;
-  if (f.indexOf("..") >= 0) return false;
-  return true;
+  if (f.length() == 0 || f.length() > 80) return false;
+  if (f.indexOf('\\') >= 0 || f.indexOf("..") >= 0) return false;
+  int slash = f.indexOf('/');
+  if (slash < 0) return true;
+  if (slash == 0 || slash == (int)f.length() - 1) return false;
+  return f.indexOf('/', slash + 1) < 0;
 }
 
-// Escape-hatch page: list every .csv on the SD card with a download link. The
-// live capture logs are GPS-named (see core.cpp sdTryNameLog), so the schema's
-// single-fs addFile() cannot reach them. This raw route walks the card
-// instead.
+static String sdBaseName(File& f) {
+  String name = f.name();
+  int slash = name.lastIndexOf('/');
+  return slash >= 0 ? name.substring(slash + 1) : name;
+}
+
+// Appends one download link per file in `dir`. `prefix` is empty for the root
+// and `name/` for a session directory.
+static bool sdListFiles(String& p, File& dir, const String& prefix, bool csvOnly) {
+  bool any = false;
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    if (!f.isDirectory()) {
+      String name = sdBaseName(f);
+      if (!csvOnly || name.endsWith(".csv")) {
+        any = true;
+        p += "<li><a href=\"/dl?f=";
+        p += prefix + name;
+        p += "\">";
+        p += name;
+        p += "</a> (";
+        p += String((unsigned long)f.size());
+        p += " bytes)</li>";
+      }
+    }
+    f.close();
+  }
+  return any;
+}
+
+// The /logs page body. Lists each roost session directory and its files, then
+// any loose .csv in the card's root.
 static String buildLogsBody() {
   String p;
-  p.reserve(1024);
+  p.reserve(2048);
   p += "<section class=\"card\"><h2>SD card logs</h2>";
   File root = SD.open("/");
   if (!root || !root.isDirectory()) {
     p += "<p>SD card not available.</p></section>";
     return p;
   }
-  p += "<ul>";
   bool any = false;
-  for (File f = root.openNextFile(); f; f = root.openNextFile()) {
-    if (f.isDirectory()) { f.close(); continue; }
-    String name = f.name();
-    int slash = name.lastIndexOf('/');
-    if (slash >= 0) name = name.substring(slash + 1);
-    if (name.endsWith(".csv")) {
-      any = true;
-      p += "<li><a href=\"/dl?f=";
-      p += name;
-      p += "\">";
-      p += name;
-      p += "</a> (";
-      p += String((unsigned long)f.size());
-      p += " bytes)</li>";
+  for (File d = root.openNextFile(); d; d = root.openNextFile()) {
+    String name = sdBaseName(d);
+    if (d.isDirectory() && name.startsWith(LOG_PREFIX)) {
+      File dir = SD.open("/" + name);
+      p += "<h3>" + name + "</h3><ul>";
+      if (dir && sdListFiles(p, dir, name + "/", false)) any = true;
+      else p += "<li><i>empty</i></li>";
+      p += "</ul>";
+      if (dir) dir.close();
     }
-    f.close();
+    d.close();
   }
+  root.rewindDirectory();
+  String loose = "<ul>";
+  if (sdListFiles(loose, root, "", true)) { p += "<h3>Card root</h3>" + loose + "</ul>"; any = true; }
   root.close();
-  if (!any) p += "<li><i>no CSV logs on card yet</i></li>";
-  p += "</ul></section>";
+  if (!any) p += "<p><i>no logs on card yet</i></p>";
+  p += "</section>";
   return p;
 }
 #endif  // USE_SD
 
-// One-time declaration of everything the console exposes. Registration must
-// happen before begin() and persists across start/stop cycles, so it runs
-// once. begin() and stop() then toggle the server.
+// Declares everything the console exposes. Registration must come before
+// begin() and persists across start and stop, so it runs once.
 static void ensureRegistered() {
   if (registered) return;
 
-  // The SPIFFS session (upstream flock-you persistence), download only.
+  // The SPIFFS session files from the upstream flock-you format, download only.
   console.addFile("session", FY_SESSION_FILE, "application/json", false);
   console.addFile("prev_session", FY_PREV_FILE, "application/json", false);
 
 #if USE_SD
-  console.addPage("Logs", "/logs");   // top-bar button → the SD CSV listing
+  console.addPage("Logs", "/logs");   // top-bar button to the SD CSV listing
 #endif
-  console.addPage("Return to scan", "/scan");   // top-bar button → leave Admin
+  console.addPage("Return to scan", "/scan");   // top-bar button to leave Admin
 
-  // Pinned so it stays a one-click button in the Controls card. Unpinned
-  // commands are typed verbs only, and printing status to the log is the most
-  // reached-for diagnostic. No args and non-destructive, so no confirm.
+  // Pinned as a button in the Controls card, since status is the most used
+  // diagnostic. An operator types the unpinned commands.
   jelly::webconsole::CommandOpts statusOpts;
   statusOpts.pinned = true;
   console.onCommand("status", "print firmware version + scan state to the log",
                     [](JsonVariantConst) -> String { return reportStatus(); },
                     statusOpts);
 
-  // Release the AP and resume Detect. This only flags the request. The actual
-  // teardown runs in webPortalTick(), in loop context, after this response has
-  // flushed, so the server is never torn down inside its own handler. Left as a
-  // typed verb rather than pinned, because the "Return to scan" top-bar page
-  // below already surfaces the action as a button.
+  // Releases the AP and resumes Detect. The handler only sets a flag, and
+  // webPortalTick() tears down after the response flushes, outside the server's
+  // own handler. Typed only, since the "Return to scan" page is the button.
   console.onCommand("scan", "leave Admin and resume detection",
                     [](JsonVariantConst) -> String {
                       exitRequested = true; exitReqMs = millis();
                       return String("returning to detection…");
                     });
 
-  // WiFi station credentials for the boot-time NTP fallback (used only when no
-  // GPS module is detected). Pinned so it's a one-click form in the Controls
-  // card, since the point is to set these without a serial cable. Persisted to
-  // SPIFFS by core and consumed at the next boot. WebConsole has no password
-  // field type, so `pass` renders as plain text, which is acceptable on this
-  // local AP. The stored password is never echoed back, only the SSID.
-  // Submitting an empty SSID reports the currently-saved network.
+  // Station credentials for the boot-time NTP fallback, which runs only when no
+  // GPS module answers. Pinned, so an operator can set them without a serial
+  // cable. Core saves them to SPIFFS and reads them at the next boot.
+  // WebConsole has no password field type, so `pass` shows as plain text on
+  // this local AP. Replies echo the SSID, never the password. An empty SSID
+  // reports the saved network.
   static const jelly::webconsole::Field wifiArgs[] = {
     { "ssid", "network SSID", jelly::webconsole::FieldType::Text, nullptr, false },
     { "pass", "password",     jelly::webconsole::FieldType::Text, nullptr, false },
@@ -319,7 +329,7 @@ static void ensureRegistered() {
                       String ssid = a["ssid"] | "";
                       String pass = a["pass"] | "";
                       ssid.trim();
-                      if (ssid.length() == 0) {          // no SSID entered → report current
+                      if (ssid.length() == 0) {          // no SSID entered, report the saved one
                         String cur, cpass;
                         if (coreWifiCredsLoad(cur, cpass))
                           return String("saved network: ") + cur + " (enter an SSID to change)";
@@ -331,8 +341,8 @@ static void ensureRegistered() {
                     }, wifiOpts);
 
   // Distance-estimate calibration, one field per term of the model. `rssi_trim`
-  // steps the reference rather than replacing it; submitting nothing reports the
-  // current model. See docs/distance_estimation.md.
+  // steps the reference by a delta, and an empty submit reports the current
+  // model. See docs/distance_estimation.md.
   static const jelly::webconsole::Field calibrateArgs[] = {
     { "density",   "environment density",              jelly::webconsole::FieldType::Enum,   "low,medium,high", false },
     { "rssi_1m",   "expected RSSI at 1m (dBm)",        jelly::webconsole::FieldType::Number, nullptr, false },
@@ -346,7 +356,7 @@ static void ensureRegistered() {
                     [](JsonVariantConst a) -> String {
                       String density = a["density"] | "";
                       density.trim();
-                      // Absent means unset: WebConsole omits blank inputs.
+                      // WebConsole omits blank inputs, so an absent key means unset.
                       bool haveRef  = !(a["rssi_1m"].isNull());
                       bool haveStep = !(a["rssi_trim"].isNull());
 
@@ -361,13 +371,13 @@ static void ensureRegistered() {
                         else return String("unknown density \"") + density + "\" \u2013 expected low, medium, or high";
                       }
 
-                      // Absolute wins over a step. `requested` is kept separately
-                      // from what was applied so the clamp check below is honest.
+                      // An absolute rssi_1m wins over a step. `requested` holds
+                      // the asked-for value for the clamp check below.
                       int before    = (int)coreRssiAt1mDbm;
                       int requested = before;
                       if (haveRef) {
                         requested = (int)(a["rssi_1m"] | before);
-                        // Clamped before the int8_t cast, which would wrap.
+                        // Clamps before the int8_t cast, which would wrap.
                         int v = requested;
                         if (v > RSSI_AT_1M_MAX) v = RSSI_AT_1M_MAX;
                         if (v < RSSI_AT_1M_MIN) v = RSSI_AT_1M_MIN;
@@ -380,8 +390,8 @@ static void ensureRegistered() {
                         coreNudgeRssiAt1mDbm((int8_t)step);
                       }
 
-                      // Only when genuinely out of range, not merely unchanged: a
-                      // resent value or a zero step is not a clamp.
+                      // Notes a clamp only when the value left the accepted range.
+                      // A resent value or a zero step leaves after == requested.
                       int after = (int)coreRssiAt1mDbm;
                       String note;
                       if (after != requested)
@@ -395,7 +405,7 @@ static void ensureRegistered() {
                     }, calibrateOpts);
 
   jelly::webconsole::CommandOpts wifiForgetOpts;
-  wifiForgetOpts.confirm = true;   // destructive-ish: wipes the stored network
+  wifiForgetOpts.confirm = true;   // erases the stored network
   console.onCommand("wifi-forget", "erase the saved WiFi network",
                     [](JsonVariantConst) -> String {
                       coreWifiCredsClear();
@@ -403,12 +413,10 @@ static void ensureRegistered() {
                     }, wifiForgetOpts);
 
   // --- Serial-console parity ---------------------------------------------
-  // The same verbs the UART serial console exposes, so the web console is a
-  // full stand-in and `help` lists everything. dump, prev, and log stream a
-  // file into the log, capped like the serial dumps. inject and nav are
-  // Detect-loop actions that no-op in Admin, where scanning is paused, and say
-  // so. Typed verbs rather than pinned, keeping the Controls card to the
-  // one-click diagnostics.
+  // The serial console's verbs, so the web console stands in for a cable. dump,
+  // prev and log stream a file into the log with a cap. inject and nav act on
+  // the Detect loop, so in Admin they only say they did nothing. None
+  // gets a button.
   console.onCommand("dump", "print the current session JSON to the log",
                     [](JsonVariantConst) -> String {
                       return streamFileToConsole(SPIFFS, FY_SESSION_FILE, "current session");
@@ -436,9 +444,9 @@ static void ensureRegistered() {
                     });
 #endif
 #if USE_SD
-  // Default: header + last 10 rows (RAM-safe, batched). `log full` (or --full)
-  // streams the whole file. Text arg (not Enum) so the bare `--full` a user
-  // reflexively types isn't rejected by server-side enum validation.
+  // Prints the header and last 10 rows, or the whole file with `log full` or
+  // `--full`. The argument is Text so server-side enum validation accepts
+  // `--full`.
   static const jelly::webconsole::Field logArgs[] = {
     { "mode", "mode", jelly::webconsole::FieldType::Text, nullptr, false },
   };
@@ -468,10 +476,8 @@ static void ensureRegistered() {
   // -----------------------------------------------------------------------
 
 #if USE_BUZZER
-  // Replay the buzzer sounds on demand, without waiting for a real detection.
-  // The players block via delay(), but WebConsole runs command handlers in
-  // loop() context, so that is safe. Left unpinned, since these are occasional
-  // and do not earn a button.
+  // Replays the buzzer sounds on demand. The players block in delay(), which is
+  // safe because WebConsole runs command handlers in loop() context.
   console.onCommand("chirp", "play the new-detection chirp",
                     [](JsonVariantConst) -> String {
                       corePlayDetectChirp();
@@ -499,17 +505,15 @@ static void ensureRegistered() {
                     });
 #endif
 
-  // Pinned "help" button in the Controls card. Typing `help` is a client-side
-  // built-in that lists every command from the manifest. The pinned button
-  // routes to the server, so this handler prints the same reference into the
-  // log.
+  // Pinned "help" button. Typed `help` is a client-side built-in that lists
+  // every command, but the button goes to the server, so this handler prints
+  // the reference into the log. Keep it in step with the commands above.
   jelly::webconsole::CommandOpts helpOpts;
   helpOpts.pinned = true;
   console.onCommand("help", "list the available console commands",
                     [](JsonVariantConst) -> String {
-                      // One console.log() rather than a line per command, so the
-                      // button does not reintroduce the WebSocket flooding that
-                      // batching exists to prevent.
+                      // One console.log() for the whole list, to stay under the
+                      // WebSocket frame limit LogBatcher guards.
                       String h = "commands:\n";
                       h += "  status   – firmware version + scan state\n";
                       h += "  gps      – GPS fix, sats, position, counters\n";
@@ -539,32 +543,24 @@ void webPortalStart(const char* apSsid, const char* apPassword) {
   if (portalActive) return;
   ensureRegistered();
 
-  // Radio handoff via full stack separation, not coexistence. Detect drives the
-  // WiFi driver in raw promiscuous mode, using esp_wifi_* with no esp_netif or
-  // IP layer. Admin drives it through Arduino WiFi, via WiFi.softAP inside
-  // console.begin, which owns esp_netif and DHCP. These are different modes, so
-  // the switch is hard: tear the raw driver fully down here, then let Arduino
-  // bring it back up from a clean, uninitialized state, which is what
-  // WiFiGeneric's lazy init expects. If Arduino instead inits on top of a live
-  // raw driver it does not own, the AP radio comes up with no netif or DHCP
-  // attached, leaving the SSID visible but 10.99.7.1 unreachable. The two
-  // stacks never run at once. esp_wifi_* comes from core.h.
-  sniffingStopped = true;
-  esp_wifi_set_promiscuous(false);
-  esp_wifi_stop();
-  esp_wifi_deinit();
+  // Detect drives the WiFi driver raw through esp_wifi_*, with no esp_netif or
+  // IP layer. Admin drives it through Arduino WiFi, whose WiFi.softAP inside
+  // console.begin() owns esp_netif and DHCP. The two stacks never run at once.
+  // coreRadioStop() tears the selected radio fully down first, because
+  // WiFiGeneric's lazy init needs an uninitialized driver. On a live raw driver
+  // the AP comes up with no netif or DHCP, and 10.99.7.1 is unreachable.
+  coreRadioStop();
 
   WebConsole::Config cfg;
   cfg.apSsid     = apSsid;
   cfg.apPassword = apPassword;
   cfg.apIp       = IPAddress(10, 99, 7, 1);   // distinctive subnet, avoids LAN clashes
-  cfg.deviceName = WEB_PORTAL_DEVICE_NAME;    // also mDNS: birdoscope.local
+  cfg.deviceName = WEB_PORTAL_DEVICE_NAME;    // also the mDNS name
   cfg.fs         = &SPIFFS;
   console.begin(cfg);
 
-  // "Return to scan" top-bar button. Flags the release, with teardown deferred
-  // to webPortalTick(), as in the "scan" command. Re-added each start, because
-  // begin() rebuilds the server.
+  // The "Return to scan" page sets the same flag as the "scan" command. Routes
+  // go back on at each start, because begin() rebuilds the server.
   console.server().on("/scan", HTTP_GET, [](AsyncWebServerRequest* req) {
     exitRequested = true; exitReqMs = millis();
     req->send(200, "text/html",
@@ -575,8 +571,7 @@ void webPortalStart(const char* apSsid, const char* apPassword) {
   });
 
 #if USE_SD
-  // Escape hatch: SD-card CSV listing + per-file download. Re-added each start
-  // because begin() rebuilds the server.
+  // The SD listing and per-file download, also re-added at each start.
   console.server().on("/logs", HTTP_GET, [](AsyncWebServerRequest* req) {
     req->send(200, "text/html", console.pageShell("Logs", buildLogsBody()));
   });
@@ -586,7 +581,10 @@ void webPortalStart(const char* apSsid, const char* apPassword) {
     if (!sdNameSafe(f)) { req->send(400, "text/plain", "bad name"); return; }
     String path = "/" + f;
     if (!SD.exists(path)) { req->send(404, "text/plain", "not found"); return; }
-    req->send(SD, path, "text/csv", true);   // download (Content-Disposition: attachment)
+    const char* type = path.endsWith(".csv")  ? "text/csv"
+                     : path.endsWith(".json") ? "application/json"
+                     : "application/octet-stream";
+    req->send(SD, path, type, true);   // sends Content-Disposition attachment
   });
 #endif
 
@@ -602,17 +600,14 @@ void webPortalStart(const char* apSsid, const char* apPassword) {
 
 void webPortalStop() {
   if (!portalActive) return;
-  console.stop();          // Arduino: softAPdisconnect + WiFi.mode(WIFI_STA), server torn down
+  console.stop();          // softAPdisconnect, WiFi.mode(WIFI_STA), server down
 
-  // Full stack handoff back to Detect, mirroring webPortalStart().
-  // console.stop() leaves Arduino WiFi initialized in STA. WiFi.mode(WIFI_OFF)
-  // makes Arduino fully deinit itself, destroying its netifs, calling
-  // esp_wifi_deinit, and resetting its internal init flags, so the driver is
-  // clean. coreWifiSnifferStart() then re-inits raw promiscuous from that clean
-  // state. Because Arduino reset its own flags, the next webPortalStart re-inits
-  // cleanly too, which is what makes repeated Detect and Admin hops safe.
+  // The reverse of the webPortalStart() handoff. console.stop() leaves Arduino
+  // WiFi initialized in STA. WiFi.mode(WIFI_OFF) makes Arduino destroy its
+  // netifs, call esp_wifi_deinit and reset its init flags, which leaves the
+  // driver clean for coreRadioStart() and for the next webPortalStart().
   WiFi.mode(WIFI_OFF);
-  coreWifiSnifferStart();   // clears sniffingStopped, Detect resumes
+  coreRadioStart();
 
   portalActive  = false;
   exitRequested = false;
@@ -625,9 +620,8 @@ void webPortalTick() {
 
   unsigned long now = millis();
 
-  // Diagnostic: watch heap fragmentation and WebSocket client count while the
-  // portal is up. Serial output only, since serial input is paused in Admin.
-  // Every 5s.
+  // Logs heap fragmentation and WebSocket client count to serial every 5 s
+  // while the portal is up.
   static unsigned long lastHeapLogMs = 0;
   if (now - lastHeapLogMs > 5000) {
     lastHeapLogMs = now;
@@ -636,11 +630,11 @@ void webPortalTick() {
                (unsigned)console.clientCount());
   }
 
-  // Deferred release for the web "return to scan" action. Waits a beat after
-  // the request so the confirmation response flushes before teardown.
+  // Deferred release for "return to scan". The 300 ms wait lets the
+  // confirmation response flush before teardown.
   if (exitRequested && now - exitReqMs > 300) { webPortalStop(); return; }
 
-  // Idle auto-resume so an accidental entry self-heals.
+  // Idle timeouts, see WEB_PORTAL_NO_CLIENT_MS.
   if (console.clientCount() > 0) { everHadClient = true; lastClientMs = now; }
   bool neverConnected = !everHadClient && (now - portalStartMs > WEB_PORTAL_NO_CLIENT_MS);
   bool wentIdle       =  everHadClient && console.clientCount() == 0

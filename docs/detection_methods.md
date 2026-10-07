@@ -1,8 +1,12 @@
-# Detection Methods — Frame Semantics, Geometry, and Backtrace Logic
+# Detection Methods
+
+How the firmware matches captured frames to target devices, what each match says
+about where the target is, and how analysis turns matches into positions.
 
 ## 802.11 Address Fields
 
-Every 802.11 management frame carries four address fields in the MAC header. Their meaning depends on the frame type, but for the frames this firmware watches:
+Every 802.11 management frame contains three address fields, and their meaning
+depends on the frame type.
 
 | Field   | Probe Request (from camera)   | Probe Response (to camera)                   |
 |---------|-------------------------------|----------------------------------------------|
@@ -10,287 +14,286 @@ Every 802.11 management frame carries four address fields in the MAC header. The
 | `addr2` | Camera MAC (transmitter)      | AP MAC (the access point replying)           |
 | `addr3` | Broadcast `ff:ff:ff:ff:ff:ff` | AP BSSID (same as addr2 for a basic AP)      |
 
-The 802.11 convention is: addr1 = receiver, addr2 = transmitter. For infrastructure mode, addr3 carries the BSSID of the network. The firmware reads all three from `wifi_ieee80211_hdr_3addr_t` (`hdr->addr1`, `hdr->addr2`, `hdr->addr3`).
+addr1 is always the receiver and addr2 the transmitter. The firmware reads all
+three from `wifi_ieee80211_mac_hdr_t`.
 
----
+Each `wifi_obs` row in the roost log holds `mac`, the address that matched,
+beside the header's `addr1`, `addr2` and `addr3`. The serial JSON detection line
+follows the upstream flock-you schema instead, with the replying AP in `ap_mac`
+for an `oui_addr1` hit.
 
-## 2. Flock Detection Methods
+## Flock Detection Methods
 
-### `wildcard_probe` (DeFlockJoplin signature)
+### `wildcard_probe` (DeFlockJoplin Signature)
 
-**Frame type:** Probe Request (management subtype 4)
-**Trigger:** `addr2` OUI matches a Flock target AND the SSID IE has zero length
+- Frame type: Probe Request (management subtype 4)
+- Trigger: `addr2` OUI matches a target and the SSID IE has zero length
 
-**What it means:** The camera is transmitting. Wildcard probe requests (empty SSID) are how a station discovers all available networks on a channel — Flock cameras do this on channel hop to find nearby devices. Zero-length SSID is the distinguishing feature; a camera probing for a specific network would have a non-empty SSID.
+Stations send wildcard probes to discover every network on a channel, and Flock
+cameras send them on each channel hop. The RSSI measures the camera's own
+transmission, so path-loss triangulation is valid.
 
-**RSSI geometry:** The RSSI is the camera's own transmission received at the scanner. This is the only detection type where `RSSI ∝ 1/distance-to-camera` is geometrically correct. Path-loss triangulation is valid.
+- `mac` logged: `addr2`, the camera MAC.
 
-**`mac` logged:** `addr2` — the camera MAC.
-**`ap_mac` logged:** `null` — the camera is transmitting, not an AP.
+This is the highest-confidence signature. In DeFlockJoplin's Joplin, MO field
+tests, 2 of 12 detections were non-Flock, about 17% false positives.
 
-**Confidence:** Highest. A Flock OUI + zero-length SSID combination on a probe request is the most precise available signature. Field false positive rate: ~17% in DeFlockJoplin's Joplin, MO tests (2/12 detections were non-Flock).
+### `directed_probe` (Named Probe)
 
----
+- Frame type: Probe Request (management subtype 4)
+- Trigger: `addr2` OUI matches a target and the SSID IE is non-empty
 
-### `oui_addr2` (transmitter-side catch)
+The probed name identifies the backhaul network the camera joins.
 
-**Frame type:** Any management or data frame
-**Trigger:** `addr2` OUI matches a Flock target (but frame is not a probe request, so not `wildcard_probe`)
+RSSI geometry matches `wildcard_probe`.
 
-**What it means:** A Flock OUI device is transmitting a non-probe frame — likely a data frame, association request, or null frame during an active connection. Less common than probes.
+- `mac` logged: `addr2`, the camera MAC.
 
-**RSSI geometry:** Same as `wildcard_probe` — the camera is the transmitter, so RSSI reflects camera→scanner path loss. Triangulation is valid.
+### `oui_addr2` (Transmitter-Side Catch)
 
-**`mac` logged:** `addr2` — the camera MAC.
-**`ap_mac` logged:** `null`.
+- Frame type: Any captured management or data frame
+- Trigger: `addr2` OUI matches a target, and the frame is neither a wildcard
+  nor a directed probe request
 
----
+Usually a data frame, association request or null frame during an active
+connection, all less common than probes. RSSI geometry matches
+`wildcard_probe`.
 
-### `oui_addr1` (receiver-side / sleeping camera catch)
+- `mac` logged: `addr2`, the camera MAC.
 
-**Frame type:** Probe Response (management subtype 5) or unicast data frame
-**Trigger:** `addr1` OUI matches a Flock target
+### `oui_addr1` (Receiver-Side, Sleeping Camera Catch)
 
-**What it means:** The camera's MAC appears as the destination of a frame. For probe responses this is the standard AP behaviour: the AP received the camera's wildcard probe request and replied with a unicast probe response addressed to the camera. The scanner receives this AP-to-camera transmission because it is also on that channel.
+- Frame type: Probe Response (management subtype 5) or unicast data frame
+- Trigger: `addr1` OUI matches a target
 
-**Why this is valuable:** A camera that is in a sleep cycle between network check-ins may not transmit at all during the capture window. The `wildcard_probe` and `oui_addr2` methods both require the camera to be the transmitter and will miss it entirely. But nearby APs will still send probe responses to the camera's MAC if they received a probe from it at any point recently (APs cache probe request MACs briefly). `oui_addr1` catches those responses, providing evidence that a Flock camera is in the area even when it is silent.
+An AP that recently heard the camera's probe replies with a unicast probe
+response, and the scanner overhears it on the same channel. This catches a
+camera sleeping between check-ins that sends nothing during the capture window,
+which every direct method misses.
 
-**RSSI geometry — why it diverges:**
-
-```
+```text
  [Flock camera]  ──probe request──>  [AP]  ──probe response──>  [Birdoscope]
        │                               │                              │
    unknown                         addr2 of                     records
    position                        the frame                    this RSSI
 ```
 
-The firmware records `pkt->rx_ctrl.rssi`, which is the received signal strength of the AP's probe response at the scanner's antenna. This value reflects **AP → scanner path loss**. The camera is at the other end of a separate link (camera → AP) with completely independent geometry.
+The RSSI measures the AP-to-scanner link and says nothing about where the camera
+sits. The path-loss solver converges on the AP or diverges, so these
+observations alone leave the camera unplaced.
 
-The path-loss triangulation model assumes `RSSI ∝ 1/distance-to-camera`. For `oui_addr1` the actual relationship is `RSSI ∝ 1/distance-to-AP`. The solver either converges to the AP's location (wrong target) or diverges — in practice, a stationary scanner will record nearly constant RSSI for the same AP regardless of the camera's exact position, and the solver produces nonsense. Camera position is unconstrained by these observations alone.
+- `mac` logged: `addr1`, the camera MAC.
+- The row's `addr2` holds the AP that replied.
 
-**`mac` logged:** `addr1` — the camera MAC (as a destination address).
-**`ap_mac` logged:** `addr2` — the MAC of the AP that sent the probe response. This is zero in captures before the addr2 fix.
+### `oui_addr3` (BSSID-Field Catch)
 
----
+- Frame type: Management frame, with `CHECK_ADDR3` set
+- Trigger: `addr3` OUI matches a target
 
-### `oui_addr3` (BSSID-field catch)
+addr3 names the network, not the transmitter. The camera sends the frame when it
+is the AP or transmits under a randomized `addr2`, but a client joining the
+camera's network sends it otherwise, so RSSI geometry varies by frame. Every
+current board leaves `CHECK_ADDR3` off.
 
-**Frame type:** Any frame where `addr3` carries a network BSSID
-**Trigger:** `addr3` OUI matches a Flock target
+- `mac` logged: `addr3`.
 
-**What it means:** A Flock OUI appears as the BSSID in addr3. This would indicate a Flock camera acting as an access point — hosting a network rather than joining one. This is not standard operating behaviour and has not been observed in the field. The method is included as a completeness check and to catch non-standard firmware modes or misconfigured devices.
+### `ssid_match` (SSID Text Match)
 
-**`mac` logged:** `addr3`.
-**`ap_mac` logged:** `null`.
+- Frame type: Probe Request, Probe Response, or Beacon, with
+  `ENABLE_SSID_MATCH` set
+- Trigger: SSID IE in the frame body contains a keyword from the configured
+  list
 
----
+A match on a Flock network name such as `FLOCK` or `FlockSafety` is secondary
+enrichment. It can identify a camera probing for its configured network, or the
+infrastructure it connects to.
 
-### `ssid_keyword` (SSID text match)
+RSSI geometry depends on frame type. In a probe request the camera is the
+transmitter, so the geometry is correct. In a beacon an AP broadcasts the
+matched SSID, which has the same wrong geometry as `oui_addr1`.
 
-**Frame type:** Probe Request or Beacon
-**Trigger:** SSID IE in the frame body contains a keyword from the configured list
+- `mac` logged: `addr2`, the transmitting station.
 
-**What it means:** The device is probing for or advertising a network whose name matches a Flock-specific keyword (e.g. `FLOCK`, `FlockSafety`, or deployment-specific names). This is a secondary enrichment channel — it may identify cameras probing for their configured network name, or it may reveal the network name of the infrastructure they connect to.
+### Target OUI Table Provenance
 
-**RSSI geometry:** Depends on frame type. If from a probe request, the camera is the transmitter (correct geometry). If from a beacon, an AP is broadcasting the matched SSID (wrong geometry, same issue as `oui_addr1`).
+Flock Safety holds one IEEE assignment, the MA-L block `B4:1E:52`, but builds
+most of its hardware from third-party modules that will not match it. The
+other Flock prefixes in `lib/birdoscope_core/core.cpp` come from field
+observation of those modules. Most resolve to one contract module manufacturer,
+the rest to a handful of silicon and module vendors. One resolves to no registry
+and sits one hex digit from a live block, likely a transcription error, so
+confirm it against its source. One more has the locally administered bit set,
+the mark of a derived virtual-interface address, so no registry lists it.
 
-**`mac` logged:** `addr2` — the transmitting station.
-**`ap_mac` logged:** `null`.
+The Axon entries are all vendor registrations, including acquired subsidiaries,
+listed in the table below.
 
----
+Keep two risks of the field-observed entries in mind when you read a capture.
 
-### Target OUI table provenance
+- **They fail together.** A module supplier change, a hardware revision on a
+  different block, or a move to a registered prefix retires most of the Flock
+  table at once. A fleet-wide drop in Flock matches while the rest of the
+  detection path works more likely means this than an absence of cameras.
+- **They match broadly.** A module vendor's MA-L matches every device built on
+  that module. That is the bulk of the known false positives, and the
+  wildcard-probe signature is the OUI-independent second check.
 
-The OUI table in `lib/birdoscope_core/core.cpp` is not one kind of entry. The
-difference determines how far each entry can be trusted and how it fails.
+You can re-audit the table against the IEEE registry, which publishes the MA-L,
+MA-M and MA-S assignments as CSV at `standards-oui.ieee.org`. A name search for
+"Axon" also returns several unrelated networking companies alongside Axon
+Enterprise.
 
-Flock Safety holds one IEEE assignment, the MA-L block `B4:1E:52`. That
-is the only Flock entry that cannot match a third party's hardware.
-
-Every other Flock-tagged prefix belongs to a module vendor rather than to Flock,
-and was observed empirically in the field rather than derived from a
-registration. The majority resolve to a single contract module manufacturer, with
-the remainder spread across a handful of silicon and module vendors. One prefix
-resolves to no registry at all and is one hex digit from a live block, so it is
-plausibly a transcription error and is worth confirming against its original
-source before being trusted. One further prefix is unregistered by design: its
-locally-administered bit is set, which is what a derived virtual-interface
-address looks like, so its absence from the registry is expected.
-
-The Axon entries are the opposite case. They are the vendor's own registrations,
-including those of acquired subsidiaries, which is why they are enumerated with
-their block assignments in the table below.
-
-This split has two consequences that matter when reading a capture.
-
-- **The empirical half is fragile as a group.** A module supplier change, a
-  hardware revision on a different block, or a move to the vendor's own
-  registered prefix retires most of the Flock table at once, while the
-  vendor-registered entries keep matching. A sudden fleet-wide drop in Flock
-  matches with the rest of the detection path demonstrably working is more
-  consistent with this than with an actual absence of cameras.
-- **The empirical half is broad.** Matching a module vendor's MA-L matches every
-  device built on that module, not only cameras. This is the bulk of the known
-  false-positive surface, and it is why the wildcard-probe signature exists as an
-  OUI-independent second check.
-
-The table can be re-audited against the IEEE registry, which publishes the MA-L,
-MA-M and MA-S assignments as CSV at `standards-oui.ieee.org`. When searching by
-name, note that several unrelated networking companies have names containing
-"Axon", and a substring search returns them alongside Axon Enterprise.
-
----
-
-## 3. Axon Detection Methods
+## Axon Detection Methods
 
 ### Axon Enterprise and Subsidiary OUIs
 
 | Prefix | Block | Organization | Relation to Axon |
-|---|---|---|---|---|
-| `00:25:DF` | MA-L | Axon Enterprise, Inc. | Primary. Registered 2010-01-05 as TASER International; renamed with the company in 2017. |
+|---|---|---|---|
+| `00:25:DF` | MA-L | Axon Enterprise, Inc. | Primary. TASER International registered it 2010-01-05, and it took the company's new name in 2017. |
 | `FC:01:9E` | MA-L | VIEVU | Body-camera maker, acquired by Axon 2018 |
-| `7C:83:34:4` | MA-M (/28) | Fusus | Real-time crime center / camera aggregation, acquired by Axon Jan 2024 |
+| `7C:83:34:4` | MA-M (/28) | Fusus | Real-time crime center and camera aggregation, acquired by Axon Jan 2024 |
 | `84:B3:86:5` | MA-M (/28) | Fusus | Second Fusus block, registered 2022-10-07 |
 
-Bluetooth SIG company ID `845` (`0x034D`) = "TASER International, Inc." — still the registered name;
-Axon never re-registered under the new company name.
+The Bluetooth SIG lists Axon's company ID `845` (`0x034D`) under its old name,
+"TASER International, Inc."
 
 Caveats:
 
-- The upstream flock-you OUI dump covers MA-L only, so the Fusus /28 blocks cannot resolve from it.
-  `84:B3:86` appears there as its MA-M parent, "IEEE Registration Authority", which corroborates the
-  /28 sub-allocation.
-- No IEEE registration found for Dedrone (acquired by Axon 2024); likely ships on a contract
-  manufacturer's OUI.
-
----
+- The upstream flock-you OUI dump covers MA-L only, so the Fusus /28 blocks do
+  not resolve from it. `84:B3:86` appears there as its MA-M parent, "IEEE
+  Registration Authority", which corroborates the /28 sub-allocation.
+- The IEEE registry lists no assignment for Dedrone (acquired by Axon 2024),
+  which likely ships on a contract manufacturer's OUI.
 
 ### Axon 5 GHz Characteristics
 
 - SSID hidden (empty)
 - Auth `[WPA2_PSK]`
-- Channel 149 / 153 / 157 / 161 / 165 only — 5 GHz UNII-3
-- MAC sub-ranges: `6d:xx`–`70:xx` (the bulk), plus `82`–`86`, `a1`, `a6`.
+- Channel 149, 153, 157, 161 or 165 only, the 5 GHz UNII-3 band
+- MAC sub-ranges `6d:xx` to `70:xx` (the bulk), plus `82` to `86`, `a1`, `a6`
 
-Visually confirmed and OUI-matched, but further data capture and behavioral analysis needed.
-
----
+Visual sighting and OUI match confirm these. Their behavior needs more capture
+and analysis.
 
 ### Axon 2.4 GHz Characteristics
 
-- Not seen on 2.4 GHz, further data capture and behavioral analysis needed.
-- Firmware updated to include Axon OUIs as targets while scanning in any mode
-
----
+- No sighting on 2.4 GHz yet. This needs more capture and behavioral analysis.
+- The firmware matches Axon OUIs as targets in every scan mode.
 
 ### Axon BLE Characteristics
 
-- Public AD payloads start with the same 3 bytes: `4D 03` (company ID 845, little-endian) then `02`,
-followed by a 9-byte ASCII serial beginning `X`.
+- Public AD payloads start with `4D 03` (company ID 845, little-endian) and
+  `02`, then a 9-character ASCII serial made of `X`, a 2-digit model prefix and
+  6 alphanumerics. Scan data confirms the format.
+- Some payloads contain empty manufacturer data, and only an OUI match catches
+  them.
+- Prefixes seen in the wild:
+  - X87: Signal Vehicle Unit
+  - X99: Unknown mobile device, not infrastructure but collocated with X87s
+- No BLE camera traffic seen yet. Fixed installations seem to broadcast on
+  5 GHz only.
 
-- Some payloads show empty manufacturer data, an OUI-only match is what catches them
+## The addr2 Backtrace for `oui_addr1` Camera Positions
 
-- AD payloads encode serial number information about the device. Axon's format is X + 2-digit model prefix + 6 alphanumeric, 9 characters total. Confirmed with scan data.
+On its own, an `oui_addr1` hit places the camera within about 200 m of where the
+scanner heard it. The row's `addr2` names the AP that replied, and the analysis
+pipeline narrows the bound with companion wardriving data:
 
-- Observed in the wild:
-      - X87: Signal Vehicle Unit
-      - X99: Unknown mobile device, not infrastructure but collocated with X87s
+1. Look up the row's `addr2` in `wd3_wifi`, the wardriving scanner's AP
+   database.
+2. If wardriving scanners saw the AP from several positions,
+   `triangulated_positions` holds a path-loss-fitted location for it.
+3. The camera heard the AP's reply, so it sits within the AP's coverage radius,
+   typically 30 to 150 m depending on AP power and environment.
+4. Use the AP's position as a bounded location proxy for the camera.
 
-- No BLE camera traffic observed, fixed installations seems to broadcast on 5GHz only
-
----
-
-## 3. The addr2 Backtrace — Resolving oui_addr1 Camera Positions
-
-### Background
-
-`oui_addr1` detections are the only way to confirm a sleeping camera's presence during a capture window. Without them, cameras that happen to not transmit during the drive-by would go undetected. But because the RSSI is geometrically wrong, these are the lowest-quality location estimates in the dataset.
-
-Before the addr2 fix, the full information chain for an `oui_addr1` detection was:
-- Camera MAC: known (addr1 of the frame)
-- Camera position: unknown — only the scanner's GPS is recorded
-- Which AP sent the probe response: unknown — addr2 was discarded
-
-This left no path to a camera location better than "somewhere within ~200m of where the scanner was when it heard this."
-
-### The addr2 fix
-
-With `ap_mac` in the log, the analysis pipeline can perform a **backtrace** with companion wardriving data:
-
-1. The logged `ap_mac` identifies exactly which AP sent this probe response
-2. Look up that MAC in `wd3_wifi` (the wardriving scanner's AP database)
-3. If the AP has been observed from multiple scanner positions, `triangulated_positions` has a path-loss-fitted location for it
-4. The camera must be within that AP's coverage radius to have received a probe response from it — typically 30–150m depending on AP power and environment
-5. Use the triangulated AP position as a **bounded location proxy** for the camera
-
-This replaces "somewhere within 200m of the scanner" with "within ~100m of AP at [known coordinates]". It is not as precise as `wildcard_probe` triangulation (which is geometrically direct), but it bounds the search area meaningfully and is the only available method for cameras that never transmit.
-
-**Dependency:** The backtrace only works if the AP was observed by a wardriving scanner. If the AP is absent from `wd3_wifi`, only the scanner's GPS is available as a location bound. This is still the same quality as before the fix, so the fix is never worse.
-
-**For the same camera MAC that also has `oui_addr2` or `wildcard_probe` detections** (i.e., it transmitted at some point during the session), those detections provide a direct geometric fix and take precedence. The addr2 backtrace is the fallback for cameras that only appear via `oui_addr1`.
-
----
+The result is coarser than direct triangulation but is the only bound for a
+camera that never transmits. If no wardriving scanner saw the AP, only the
+scanner's GPS bounds the location.
 
 ## Method Priority for Location Estimation
 
-When a camera MAC has been detected by multiple methods, prefer in this order:
+When multiple methods detect a camera MAC, prefer them in this order.
 
-| Priority | Method                        | Why                                                                                    |
-|----------|-------------------------------|----------------------------------------------------------------------------------------|
-| 1        | `wildcard_probe`              | Camera is transmitting; RSSI is geometrically correct; highest-confidence signature    |
-| 2        | `oui_addr2`                   | Camera is transmitting; RSSI is correct; slightly lower confidence than wildcard probe |
-| 3        | `oui_addr1` + addr2 backtrace | AP position proxies camera position; bounded but not direct                            |
-| 4        | `oui_addr1` centroid only     | Scanner GPS centroid; only useful for confirming approximate area                      |
+| Priority | Method                        | Why                                  |
+|----------|-------------------------------|--------------------------------------|
+| 1        | `wildcard_probe`              | Direct, highest-confidence signature |
+| 2        | `oui_addr2`                   | Direct, slightly lower confidence    |
+| 3        | `oui_addr1` + addr2 backtrace | The AP's position bounds the camera  |
+| 4        | `oui_addr1` centroid only     | Confirms the approximate area only   |
 
-A camera MAC with only `oui_addr1` hits and no matching AP in `wd3_wifi` falls into priority 4 and should be flagged as `position_quality=low` in output.
+The output marks a priority-4 position `position_quality=low`.
 
----
+## Direct, Indirect and Conditional
 
-## Direct and Indirect
+Each detection method falls into one of three kinds, split by whether the target
+itself transmitted.
 
-Every detection method is one of two kinds, split by whether the target itself transmitted:
+| Kind        | Methods                                         | Meaning                                                           |
+|-------------|-------------------------------------------------|-------------------------------------------------------------------|
+| Direct      | `wildcard_probe`, `directed_probe`, `oui_addr2` | The target transmitted the frame, so RSSI describes the target    |
+| Indirect    | `oui_addr1`                                     | An AP answered a target's probe, so RSSI describes the AP link    |
+| Conditional | `oui_addr3`, `ssid_match`                       | The transmitter depends on the frame, so RSSI may describe either |
 
-| Kind     | Methods                                                    | Meaning                                                        |
-|----------|------------------------------------------------------------|----------------------------------------------------------------|
-| Direct   | `wildcard_probe`, `oui_addr2`, `oui_addr3`, `ssid_keyword` | The target transmitted the frame, so RSSI describes the target |
-| Indirect | `oui_addr1`                                                | An AP answered a target's probe, so RSSI describes the AP link |
+Only direct detections have a usable scanner-to-camera range, so only they fire
+the new-detection chirp, seed the proximity ring, and produce a `dst:` reading.
+An indirect detection still counts, logs and flashes the LED, and reads
+`dst:via AP`. The firmware currently handles conditional detections as direct,
+pending logic that tells the cases apart. See [Alert behavior](alerts.md).
 
-The split decides more than bookkeeping. Only direct detections carry a usable scanner-to-camera range, so only they fire the new-detection chirp, seed the proximity ring, and produce a `dst:` reading. An indirect detection still counts, still logs, and still flashes the LED; it reads `dst:via AP` because its RSSI cannot bound the camera's distance. See [Alert behavior](alerts.md).
+### Devices on the Panel
 
-### On the panel: devices
+The Detections screen shows `dir:` and `ind:` as camera counts, deduped per
+camera per direction. APs never count.
 
-The Detections screen shows `dir:` and `ind:` as counts of cameras, deduped per camera per direction. Two different APs answering for the same camera is one indirect camera, not two, and APs are never counted as devices in their own right.
+The two overlap. A camera seen directly and later through an AP reply counts in
+both, so `dir + ind` can exceed the `devices:` total above them. Each answers an
+independent question. `dir` is roughly what you can visually locate from where
+you are, and `ind` is what is in the area with no usable range.
 
-The two overlap. A camera seen directly and later through an AP reply counts in both, so `dir + ind` can exceed the `devices:` total above them. That is deliberate: each answers an independent question. `dir` is roughly what is visually locatable from where you are; `ind` is what is in the area with no usable range.
+### Frames Off the Panel
 
-### Off the panel: frames
+The OLED boards' `status` line and the web portal console report the raw frame
+tallies `direct` and `indirect`, which count matching frames instead of devices.
+`coreHandleAlert()` increments them ahead of the repeat-suppression gate and
+independently of every alert setting, so they keep counting while the alert
+path stays quiet for a target it has already announced.
 
-`status` and the web portal also report the raw frame tallies, which count matching frames rather than devices. They are incremented ahead of the repeat-suppression gate and independently of every alert setting, which is the point: the alert path deliberately stays quiet for a target it has already announced.
+The same two consoles report `seen`, every frame the radio delivered, and
+`cand`, the frames left after the type, length and RSSI filters. Zero devices
+with `seen` climbing is a quiet area, and zero devices with `seen` flat is a
+deaf radio. The portal stops the sniffer, so its figures hold their last value
+while it runs. The TFT board's `status` line reports none of these.
 
-Both consoles additionally report `seen` and `cand`, which count all traffic rather than matches. These are the baseline the device counts are read against: zero devices with `seen` climbing is a quiet area, zero devices with `seen` flat is a deaf radio. No device-unit figure distinguishes those two, which is why `seen`/`cand` also appear on the Detections screen despite not being device units.
-
----
+The Detections screen's bottom row shows the same traffic count with its rate
+and the uptime, as `seen:` on 802.11 and `adv:` (advertisements) on BLE. A full
+detection table takes that row for its `FULL! missed:` warning.
 
 ## Single-Observation Distance Estimate
 
-A single RSSI reading also yields a coarse range, independent of the triangulation above and answering a different question: triangulation places a target on a map from many GPS-anchored observations, whereas this gives a distance from wherever the scanner stood, from one reading.
+A single RSSI reading also gives a coarse distance from wherever the scanner
+stood, separate from the map triangulation above. It applies to every direct
+method, and the firmware reports none for `oui_addr1`.
 
-It applies to `wildcard_probe` and `oui_addr2` hits only, priorities 1 and 2. For `oui_addr1` the RSSI describes the AP link instead, so no distance is reported, for the same reason the solver cannot use those observations.
-
-The model, its two calibration settings, and their accuracy limits are covered in [Distance estimation](distance_estimation.md).
-
----
+[Distance estimation](distance_estimation.md) covers the model, its two
+calibration settings, and their accuracy limits.
 
 ## Receiver Sensitivity Floor
 
-`RSSI_MIN` sets the level below which a frame is discarded before it reaches the capture. On the Analyze r0.1 board it is -100 dBm, deliberately below the roughly -95 dBm at which the radio stops reporting usefully. Other boards default to -95 dBm.
+The sniffer discards any frame below `RSSI_MIN` before it reaches the capture.
+On the Analyze boards it is -100 dBm, deliberately below the roughly -95 dBm at
+which the radio stops reporting usefully. Other boards default to -95 dBm.
 
-The threshold decides what gets recorded at all, not what counts as a good detection. A frame it drops cannot be reconsidered later, whereas a weak frame that was written can always be filtered during analysis. Setting the cutoff below the radio's usable floor keeps the marginal tail of real detections in the corpus and moves the quality decision to the analysis side.
+Analysis can filter a weak frame the device wrote but can never recover one it
+dropped, so a cutoff below the usable floor keeps the marginal tail of real
+detections and leaves the quality decision to analysis.
 
-The cost is more noise. Detections near the floor carry unreliable RSSI, so treat them as evidence that something was present rather than as evidence of range. The single-observation distance estimate and the addr2 backtrace both depend on RSSI being meaningful, so neither should be trusted at the bottom of the scale.
-
----
+The cost is more noise. Treat detections near the floor as evidence of presence
+only, since their RSSI is too unreliable for a distance estimate.
 
 ## Why the SSID Field Is Empty for Most Detections
 
-The `ssid` field in the log is only populated for `ssid_keyword` detections. For `wildcard_probe`, the SSID IE is zero-length by definition (it's the wildcard). For `oui_addr1` and `oui_addr2`, the firmware does not parse the frame body — it only inspects the MAC header. This is intentional: full frame body parsing in the IRAM callback is expensive and the OUI/addr matching is sufficient for all primary detection methods.
+The firmware captures the SSID IE from every management frame that contains
+one, whatever method matched, and logs it in the `ssid` field. A
+`wildcard_probe` has a zero-length SSID IE by definition, and a data frame has
+no SSID IE at all, so either one logs an empty `ssid`.

@@ -1,14 +1,14 @@
 // Copyright (C) 2026 Lone Crow Design, LLC
 // Licensed under the MIT License. See LICENSE.
 //
-// Arduino.h must come first (board_config.h's pin/channel-list defines use
-// uint8_t/size_t). board_config.h must come before core.h: core.h has
-// #ifndef fallbacks for USE_SD/HAS_GPS so it stays parseable standalone,
-// and those fallbacks would silently win (locking in 0) if core.h were
-// processed first on a board that actually sets them.
+// Arduino.h comes first, since board_config.h uses uint8_t and size_t.
+// board_config.h comes before core.h, or core.h's #ifndef fallbacks for USE_SD
+// and HAS_GPS lock in 0 on a board that sets them.
 #include <Arduino.h>
 #include "board_config.h"
 #include "core.h"
+#include "ble_ad.h"
+#include "mac_limit.h"
 #include "roost_session.h"
 #include "esp_event.h"   // esp_event_loop_create_default() for coreWifiSnifferStart()
 #include <ctype.h>
@@ -18,12 +18,16 @@
 #include <WiFi.h>
 #include <SPIFFS.h>
 #include <SD.h>
+#if HAS_BLE_SCAN
+#include <NimBLEDevice.h>
+#endif
 #include <ArduinoJson.h>   // wifi-creds file parse/serialize (SSID is user bytes)
 #include <Preferences.h>   // boot_count, which must survive a power cut
 #include "esp_mac.h"       // esp_read_mac() for own_macs and device_serial
 #include "esp_event.h"
 #include "nvs_flash.h"     // whole-partition erase, in coreDeviceWipe()
 #include "esp_sleep.h"     // deep sleep, in corePowerOff()
+#include "esp_heap_caps.h" // per-radio buffers, allocated while that radio runs
 
 #ifndef MIRROR_SERIAL
 #define MIRROR_SERIAL 0
@@ -41,15 +45,12 @@
 #define HAS_GPS 0
 #endif
 
-// The boot-time NTP fallback needs no board opt-in, because WiFi and time.h are
-// universal on ESP32 and cost negligible flash. It joins WiFi only when GPS is
-// absent and credentials are stored, so a GPS board with a healthy module never
-// touches the radio here.
+// The boot-time NTP fallback needs no board opt-in. It joins WiFi only when GPS
+// is absent and the web console has stored credentials.
 #ifndef WIFI_CREDS_FILE
 #define WIFI_CREDS_FILE "/wifi.json"
 #endif
-// Persisted tuning the web console writes. Shared file rather than one per
-// setting, so adding the next knob costs no extra loader.
+// The web console writes persisted tuning here.
 #ifndef SETTINGS_FILE
 #define SETTINGS_FILE "/settings.json"
 #endif
@@ -62,9 +63,8 @@
 #ifndef PATH_LOSS_N
 #define PATH_LOSS_N 2.5f
 #endif
-// Environment Density presets: the path-loss exponent for each setting. Medium
-// defers to PATH_LOSS_N so a board that already tuned that value still gets it,
-// and so the default model is unchanged from before the presets existed.
+// Environment Density presets, the path-loss exponent for each setting. Medium
+// defers to PATH_LOSS_N so a board that tuned that value keeps it.
 #ifndef PATH_LOSS_N_LOW
 #define PATH_LOSS_N_LOW  2.0f    // open ground, near line of sight
 #endif
@@ -74,9 +74,7 @@
 #ifndef PATH_LOSS_N_HIGH
 #define PATH_LOSS_N_HIGH 3.5f    // dense urban, heavy obstruction
 #endif
-// Proximity-alert tuning, described where the module lives further down and in
-// docs/alerts.md. Up here with the rest of the compiled-in defaults because
-// coreSettingsLoad() seeds the ring from PROX_RING_M.
+// Proximity-alert defaults. See the PROXIMITY ALERT section and docs/alerts.md.
 #ifndef PROX_RING_M
 #define PROX_RING_M 25        // default ring in metres, 0 disables
 #endif
@@ -84,23 +82,22 @@
 #define PROX_HYST_PCT 130     // clear the latch beyond this percent of the ring
 #endif
 #ifndef PROX_EMA_SHIFT
-#define PROX_EMA_SHIFT 2      // alpha = 1/4: tracks a moving vehicle, ignores a null
+#define PROX_EMA_SHIFT 2      // alpha = 1/4, tracks a moving vehicle and ignores a null
 #endif
 
-// How long to join the saved network before giving up and timestamping from
-// boot. board_config.h may override, and a few boards already define it.
+// Time limit on joining the saved network. Past it, timestamps count from
+// boot.
 #ifndef NTP_JOIN_TIMEOUT_MS
 #define NTP_JOIN_TIMEOUT_MS 10000
 #endif
-// Presence probe: how long coreTimeSync() waits for a checksum-valid NMEA
-// sentence before concluding no GPS module is wired and falling through to NTP.
+// Time coreTimeSync() waits for a checksum-valid NMEA sentence before it treats
+// the GPS module as absent and falls through to NTP.
 #ifndef GPS_PRESENCE_PROBE_MS
 #define GPS_PRESENCE_PROBE_MS 3000
 #endif
 
 // ============================================================
-// BUILD IDENTITY: assembled once into a static buffer rather than built per
-// call, since the boot banner, the web console and the display all want it.
+// BUILD IDENTITY
 // ============================================================
 
 const char* coreBuildRev() { return BIRDOSCOPE_GIT_REV; }
@@ -116,114 +113,128 @@ const char* coreBuildIdentity() {
 }
 
 // ============================================================
-// TARGET OUI TABLE. Shared target data, not board config. One flat table
-// tagged by vendor rather than a table per vendor: a single scan in the
-// promiscuous hot path, and the match reports which vendor hit, which the
-// logging side needs to distinguish Flock from Axon.
+// TARGET OUI TABLE. Shared target data, not board config.
 //
-// Flock entries contributed by @NitekryDPaul + Michael/DeFlockJoplin field
-// research: https://github.com/DeflockJoplin/flock-you
-// Axon entries transcribed from the IEEE registry
-// (https://standards-oui.ieee.org), covering the Axon Enterprise, VieVu and
-// Fusus assignments. The two Fusus ones are MA-M /28 blocks, which is the whole
-// reason the nibbles field exists.
+// Flock entries contributed by @NitekryDPaul and Michael/DeFlockJoplin field
+// research, https://github.com/DeflockJoplin/flock-you
+// Axon entries come from the IEEE registry (https://standards-oui.ieee.org),
+// covering the Axon Enterprise, VieVu and Fusus assignments.
 //
-// DRAM_ATTR is functional, not decorative. matchOuiRaw() is IRAM_ATTR and
-// runs from the WiFi promiscuous callback, which must not depend on flash being
-// readable: SPIFFS autosave writes make the flash mapping briefly unavailable,
-// and a fetch from memory-mapped .rodata during that window faults. The
-// previous oui_bytes[][] avoided this by being uninitialised .bss, written at
-// boot by precompileOuis().
-//
-// Dropping const is NOT sufficient on its own. GCC promotes a static array it
-// can prove is never written into .rodata regardless, which puts it back in
-// flash; verified by checking the symbol's section in the .elf. DRAM_ATTR
-// forces .dram0.data. Do not remove it, and do not add const.
+// matchOuiRaw() runs from the WiFi promiscuous callback and must read the table
+// while SPIFFS writes have flash unmapped. DRAM_ATTR places it in .dram0.data.
+// Keep DRAM_ATTR and leave off const, since GCC moves a never-written static
+// array into flash .rodata without it.
 // ============================================================
 
-// nibbles: how many hex digits of the prefix are significant.
+// `nibbles` counts the significant hex digits of the prefix.
 //   6 = MA-L, a 24-bit OUI, b[3] unused
 //   7 = MA-M, a 28-bit prefix, high nibble of b[3] significant
 typedef struct {
   uint8_t b[4];
   uint8_t nibbles;
   uint8_t vendor;
+  uint8_t cls;      // OuiClass, how far a match on the entry counts
 } OuiEntry;
 
 static DRAM_ATTR OuiEntry oui_table[] = {
   // --- Flock Safety ---
-  // The only block IEEE assigns to Flock Safety itself. Every other prefix
-  // below belongs to a module vendor, so this is the one entry that cannot
-  // match a third party's hardware. See docs/detection_methods.md, "Target OUI
-  // table provenance".
-  {{0xB4,0x1E,0x52,0}, 6, VENDOR_FLOCK},
+  // The only block IEEE assigns to Flock Safety. Every other Flock prefix
+  // belongs to a module vendor and can match third-party hardware. See
+  // docs/detection_methods.md, "Target OUI table provenance".
+  {{0xB4,0x1E,0x52,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
 
   // Original flock-you findings from @NitekryDPaul
-  {{0x70,0xC9,0x4E,0}, 6, VENDOR_FLOCK}, {{0x3C,0x91,0x80,0}, 6, VENDOR_FLOCK},
-  {{0xD8,0xF3,0xBC,0}, 6, VENDOR_FLOCK}, {{0x80,0x30,0x49,0}, 6, VENDOR_FLOCK},
-  {{0xB8,0x35,0x32,0}, 6, VENDOR_FLOCK}, {{0x14,0x5A,0xFC,0}, 6, VENDOR_FLOCK},
-  {{0x74,0x4C,0xA1,0}, 6, VENDOR_FLOCK}, {{0x08,0x3A,0x88,0}, 6, VENDOR_FLOCK},
-  {{0x9C,0x2F,0x9D,0}, 6, VENDOR_FLOCK}, {{0xC0,0x35,0x32,0}, 6, VENDOR_FLOCK},
-  {{0x94,0x08,0x53,0}, 6, VENDOR_FLOCK}, {{0xE4,0xAA,0xEA,0}, 6, VENDOR_FLOCK},
-  {{0xF4,0x6A,0xDD,0}, 6, VENDOR_FLOCK}, {{0xF8,0xA2,0xD6,0}, 6, VENDOR_FLOCK},
-  {{0x24,0xB2,0xB9,0}, 6, VENDOR_FLOCK}, {{0x00,0xF4,0x8D,0}, 6, VENDOR_FLOCK},
-  {{0xD0,0x39,0x57,0}, 6, VENDOR_FLOCK}, {{0xE8,0xD0,0xFC,0}, 6, VENDOR_FLOCK},
-  {{0xE0,0x4F,0x43,0}, 6, VENDOR_FLOCK}, {{0xB8,0x1E,0xA4,0}, 6, VENDOR_FLOCK},
-  {{0x70,0x08,0x94,0}, 6, VENDOR_FLOCK}, {{0x58,0x8E,0x81,0}, 6, VENDOR_FLOCK},
-  {{0xEC,0x1B,0xBD,0}, 6, VENDOR_FLOCK}, {{0x3C,0x71,0xBF,0}, 6, VENDOR_FLOCK},
-  {{0x58,0x00,0xE3,0}, 6, VENDOR_FLOCK}, {{0x90,0x35,0xEA,0}, 6, VENDOR_FLOCK},
-  {{0x5C,0x93,0xA2,0}, 6, VENDOR_FLOCK}, {{0x64,0x6E,0x69,0}, 6, VENDOR_FLOCK},
-  {{0x48,0x27,0xEA,0}, 6, VENDOR_FLOCK}, {{0xA4,0xCF,0x12,0}, 6, VENDOR_FLOCK},
-  // Locally-administered (0x82 has bit 0x02 set) and unregistered with IEEE,
-  // which is what a derived virtual-interface MAC looks like. Field-tested by
-  // Michael/DeFlockJoplin as catching cameras the original 30 missed, so it is
-  // a live target, not stale data. matchOuiRaw()'s LAA fast-path exists for it:
-  // see g_haveLaaTargets.
-  {{0x82,0x6B,0xF2,0}, 6, VENDOR_FLOCK},
+  {{0x70,0xC9,0x4E,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY}, {{0x3C,0x91,0x80,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  {{0xD8,0xF3,0xBC,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY}, {{0x80,0x30,0x49,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  {{0xB8,0x35,0x32,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY}, {{0x14,0x5A,0xFC,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  {{0x74,0x4C,0xA1,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY}, {{0x08,0x3A,0x88,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  {{0x9C,0x2F,0x9D,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY}, {{0xC0,0x35,0x32,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  {{0x94,0x08,0x53,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY}, {{0xE4,0xAA,0xEA,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  {{0xF4,0x6A,0xDD,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY}, {{0xE0,0x0A,0xF6,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  {{0x24,0xB2,0xB9,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY}, {{0x00,0xF4,0x8D,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  {{0xD0,0x39,0x57,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY}, {{0xE8,0xD0,0xFC,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  {{0xE0,0x4F,0x43,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY}, {{0xB8,0x1E,0xA4,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  {{0x70,0x08,0x94,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY}, {{0x58,0x8E,0x81,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  {{0xEC,0x1B,0xBD,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY}, {{0x3C,0x71,0xBF,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  {{0x58,0x00,0xE3,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY}, {{0x90,0x35,0xEA,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  {{0x5C,0x93,0xA2,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY}, {{0x64,0x6E,0x69,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  {{0x14,0xB5,0xCD,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  // Espressif variants the source marks low confidence. A match on either is
+  // weaker evidence than the rest of this block.
+  {{0x48,0x27,0xEA,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY}, {{0xA4,0xCF,0x12,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
+  // Qualcomm Atheros `00:03:7f` appears in Flock radio firmware blobs and is
+  // deliberately absent. It is Atheros' own MA-L and would match every Atheros
+  // radio in range, so it can only ever serve as a secondary attribute.
+
+  // Locally administered and unregistered with IEEE, consistent with a derived
+  // virtual-interface MAC. Michael/DeFlockJoplin field-tested it, and live data
+  // has not shown it since. See g_haveLaaTargets.
+  {{0x82,0x6B,0xF2,0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
 
   // --- Axon Enterprise and acquired brands ---
-  {{0x00,0x25,0xDF,0}, 6, VENDOR_AXON},   // Axon Enterprise (was TASER Intl)
-  {{0xFC,0x01,0x9E,0}, 6, VENDOR_AXON},   // VieVu, acquired 2018
-  {{0x7C,0x83,0x34,0x40}, 7, VENDOR_AXON},// Fusus MA-M /28, acquired 2024
-  {{0x84,0xB3,0x86,0x50}, 7, VENDOR_AXON},// Fusus MA-M /28
+  {{0x00,0x25,0xDF,0}, 6, VENDOR_AXON, OUI_CLASS_PRIMARY},   // Axon Enterprise (was TASER Intl)
+  {{0xFC,0x01,0x9E,0}, 6, VENDOR_AXON, OUI_CLASS_PRIMARY},   // VieVu, acquired 2018
+  {{0x7C,0x83,0x34,0x40}, 7, VENDOR_AXON, OUI_CLASS_PRIMARY},// Fusus MA-M /28, acquired 2024
+  {{0x84,0xB3,0x86,0x50}, 7, VENDOR_AXON, OUI_CLASS_PRIMARY},// Fusus MA-M /28
 
   // --- Axis Communications ---
-  // Surveillance cameras. Carried on the hypothesis that a target may ship 
-  // under another registrant's block.
-  // Expect commercial-install false positives: tag them, do not trust them.
-  {{0x00,0x40,0x8C,0}, 6, VENDOR_AXIS}, {{0xAC,0xCC,0x8E,0}, 6, VENDOR_AXIS},
-  {{0xB8,0xA4,0x4F,0}, 6, VENDOR_AXIS}, {{0xE8,0x27,0x25,0}, 6, VENDOR_AXIS},
+  // Surveillance cameras. Expect false positives from commercial installs until
+  // a larger dataset verifies the tag.
+  {{0x00,0x40,0x8C,0}, 6, VENDOR_AXIS, OUI_CLASS_PRIMARY}, {{0xAC,0xCC,0x8E,0}, 6, VENDOR_AXIS, OUI_CLASS_PRIMARY},
+  {{0xB8,0xA4,0x4F,0}, 6, VENDOR_AXIS, OUI_CLASS_PRIMARY}, {{0xE8,0x27,0x25,0}, 6, VENDOR_AXIS, OUI_CLASS_PRIMARY},
 
   // --- Utility, Inc ---
-  // BodyWorn / in-car law-enforcement video. The vendor's own registrations,
-  // so unlike the Flock rows these cannot match a third party's hardware.
-  {{0x00,0x09,0xBC,0}, 6, VENDOR_UTILITY}, {{0x00,0x16,0xED,0}, 6, VENDOR_UTILITY},
+  // BodyWorn and in-car law-enforcement video, under the vendor's own
+  // registrations.
+  {{0x00,0x09,0xBC,0}, 6, VENDOR_UTILITY, OUI_CLASS_PRIMARY}, {{0x00,0x16,0xED,0}, 6, VENDOR_UTILITY, OUI_CLASS_PRIMARY},
+
+  // --- Motorola Solutions family ---
+  // Verified against the 2026-08-07 IEEE registry and the analytics registry
+  // mirror. The parent's own blocks are infra, since their install
+  // base is mostly radio. Analytics uses them, spec M2.
+  {{0x00,0x04,0x7D,0}, 6, VENDOR_MOTOROLA, OUI_CLASS_INFRA},
+  {{0x00,0x18,0x85,0}, 6, VENDOR_MOTOROLA, OUI_CLASS_INFRA},
+  {{0x00,0x1F,0x92,0}, 6, VENDOR_MOTOROLA, OUI_CLASS_INFRA},
+  {{0x4C,0xCC,0x34,0}, 6, VENDOR_MOTOROLA, OUI_CLASS_INFRA},
+  {{0x10,0x74,0x6F,0}, 6, VENDOR_MOTOROLA, OUI_CLASS_INFRA},
+  {{0x9C,0x86,0x2B,0}, 6, VENDOR_MOTOROLA, OUI_CLASS_INFRA},
+  {{0xB8,0xE2,0x8C,0}, 6, VENDOR_MOTOROLA, OUI_CLASS_INFRA},
+  // Acquired surveillance product lines under the same parent.
+  {{0x70,0x1A,0xD5,0}, 6, VENDOR_MOTOROLA, OUI_CLASS_PRIMARY},  // Avigilon Alta
+  {{0x00,0x1D,0x96,0}, 6, VENDOR_MOTOROLA, OUI_CLASS_PRIMARY},  // WatchGuard Video
+
+  // --- Other surveillance vendors, own registrations ---
+  {{0xE0,0xA7,0x00,0}, 6, VENDOR_VERKADA, OUI_CLASS_PRIMARY},
+  {{0x00,0x0A,0xB1,0}, 6, VENDOR_GENETEC, OUI_CLASS_PRIMARY},
+  {{0x00,0xBF,0x15,0}, 6, VENDOR_GENETEC, OUI_CLASS_PRIMARY},
+  {{0x0C,0xBF,0x15,0}, 6, VENDOR_GENETEC, OUI_CLASS_PRIMARY},
+  {{0x00,0x23,0xBD,0}, 6, VENDOR_DALLY,   OUI_CLASS_PRIMARY},
+
+  // --- Backhaul ---
+  // Cradlepoint cellular routers, seen beside pole-mounted surveillance and
+  // municipal infrastructure, and also fleet vehicles, retail and construction
+  // sites. Never a detection on its own.
+  {{0x00,0x30,0x44,0}, 6, VENDOR_INFRA, OUI_CLASS_INFRA},
+  {{0x00,0xE0,0x1C,0}, 6, VENDOR_INFRA, OUI_CLASS_INFRA},
 
 #ifdef BENCH_BAIT_OUI
-  // Bench load generator, absent from the default build. A local OUI matched on
-  // purpose so a stationary bench sees real matched traffic, which is the only
-  // way to exercise the queue and the write path without driving. Sessions
-  // captured with this are load measurements, not detections.
-  {{BENCH_BAIT_OUI, 0}, 6, VENDOR_FLOCK},
+  // Bench load generator. Matches a local OUI so a stationary bench exercises
+  // the queue and the write path. Sessions captured with this are load
+  // measurements, not detections.
+  {{BENCH_BAIT_OUI, 0}, 6, VENDOR_FLOCK, OUI_CLASS_PRIMARY},
 #endif
 };
 static const size_t OUI_COUNT = sizeof(oui_table) / sizeof(oui_table[0]);
 
-// Which vendors the matcher currently accepts, one bit per Vendor. A single
-// aligned byte store is atomic on Xtensa, so the Targets menu can switch this
-// live without stopping the sniffer or double-buffering the table.
-volatile uint8_t coreVendorMask = VENDOR_MASK_ALL;
+// Which vendors the matcher accepts, one bit per Vendor. An aligned 16-bit
+// store is atomic on Xtensa, so the Targets menu switches this live without
+// stopping the sniffer.
+volatile uint16_t coreVendorMask = VENDOR_MASK_ALL;
 
-// True when any active target prefix is itself locally-administered. Gates the
-// LAA fast-path in matchOuiRaw(): skipping randomised MACs wholesale is a big
-// win, but it silently blocks an LAA target such as 82:6b:f2. Recomputed by
-// precompileOuis() and by coreSetVendorMask(), since masking out a vendor can
-// remove the last LAA target and re-enable the fast path.
-//
-// Defaults true, which is the fail-safe direction: before precompileOuis()
-// runs we scan more than necessary, never less. Both mains call it before
-// coreWifiSnifferStart(), so in practice it is correct by the time any frame
-// arrives.
+// True when any active target prefix is locally administered, which disables
+// the LAA fast path in matchOuiRaw(). precompileOuis() and coreSetVendorMask()
+// recompute it. Defaults true so the matcher scans everything until the first
+// recompute.
 static DRAM_ATTR bool g_haveLaaTargets = true;
 
 static void recomputeLaaTargets() {
@@ -235,25 +246,26 @@ static void recomputeLaaTargets() {
   g_haveLaaTargets = any;
 }
 
-// The config_change row belongs here rather than at the menu, or the next path
-// that reaches a setter records nothing and the log stops describing the
-// capture. Re-applying the same mask writes no row.
-void coreSetVendorMask(uint8_t mask) {
-  coreVendorMask = (uint8_t)(mask & VENDOR_MASK_ALL);
+// Logs the config_change row here so every caller records it. Re-applying the
+// same mask writes no row.
+void coreSetVendorMask(uint16_t mask) {
+  coreVendorMask = (uint16_t)(mask & VENDOR_MASK_ALL);
   recomputeLaaTargets();
   roostLogConfigVendorMask();
 }
 
-// Menu row order for SCREEN_TARGETS. Kept adjacent to coreTargetIndex() so the
-// two cannot drift; screens.inc renders labels in the same order.
-static const uint8_t TARGET_MASKS[3] = {
-  (uint8_t)(1u << VENDOR_FLOCK),
-  (uint8_t)(1u << VENDOR_AXON),
+// Menu row order for SCREEN_TARGETS. screens.inc renders labels in the same
+// order. Parent categories only, so a row covers every subsidiary tagged to it.
+// Vendors with no row of their own are reachable through All.
+static const uint16_t TARGET_MASKS[TARGET_ROW_COUNT] = {
+  (uint16_t)(1u << VENDOR_FLOCK),
+  (uint16_t)(1u << VENDOR_AXON),
+  (uint16_t)(1u << VENDOR_MOTOROLA),
   VENDOR_MASK_ALL,
 };
 
 int coreTargetIndex() {
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < TARGET_ROW_COUNT; i++) {
     if (coreVendorMask == TARGET_MASKS[i]) return i;
   }
   return -1;   // a mask with no row, e.g. everything cleared
@@ -298,19 +310,28 @@ void ouiFromMac(const uint8_t* mac, char* buf, size_t len) {
   snprintf(buf, len, "%02x:%02x:%02x", mac[0], mac[1], mac[2]);
 }
 
-const char* vendorName(uint8_t vendor) {
-  switch (vendor) {
-    case VENDOR_FLOCK:   return "flock";
-    case VENDOR_AXON:    return "axon";
-    case VENDOR_AXIS:    return "axis";
-    case VENDOR_UTILITY: return "utility";
-    default:             return "unknown";
-  }
+// Lowercase slugs for serial, JSON and the roost vendor_mask list. screens.inc
+// holds a title-case table for the panel.
+static const char* const kVendorSlugs[VENDOR_COUNT] = {
+  "flock", "axon", "axis", "utility",
+  "motorola", "verkada", "genetec", "digital_ally", "infra",
+};
+
+// Menu row labels, lowercase for serial, in TARGET_MASKS order. screens.inc
+// holds the title-case copy for the panel.
+const char* coreTargetRowName(int row) {
+  static const char* const kRows[TARGET_ROW_COUNT] = {
+    "flock", "axon", "motorola", "all",
+  };
+  return (row >= 0 && row < TARGET_ROW_COUNT) ? kRows[row] : "unknown";
 }
 
-// The table is a byte literal now, so there is nothing left to parse. Retained
-// for two reasons: both board mains call it in setup(), and the boot line tells
-// you which target set you are about to drive around with.
+const char* vendorName(uint8_t vendor) {
+  return vendor < VENDOR_COUNT ? kVendorSlugs[vendor] : "unknown";
+}
+
+// Seeds g_haveLaaTargets and prints the active target set at boot. Both board
+// mains call it in setup().
 void precompileOuis() {
   uint16_t per[VENDOR_COUNT] = {0};
   uint16_t laa = 0;
@@ -332,9 +353,8 @@ void precompileOuis() {
 }
 
 void coreGetFirstTargetOui(uint8_t out[3]) {
-  // Must honour the active mask: the `inject` command builds a synthetic target
-  // MAC from this, and returning a Flock OUI while the Targets menu is set to
-  // Axon would make the injected test frame miss.
+  // Honours the active mask, because the `inject` command builds a synthetic
+  // target MAC from this and the frame has to match.
   for (size_t i = 0; i < OUI_COUNT; i++) {
     if (coreVendorMask & (1u << oui_table[i].vendor)) {
       out[0] = oui_table[i].b[0];
@@ -343,7 +363,7 @@ void coreGetFirstTargetOui(uint8_t out[3]) {
       return;
     }
   }
-  out[0] = oui_table[0].b[0];   // mask cleared entirely: fall back to entry 0
+  out[0] = oui_table[0].b[0];   // mask cleared entirely, fall back to entry 0
   out[1] = oui_table[0].b[1];
   out[2] = oui_table[0].b[2];
 }
@@ -352,27 +372,110 @@ bool IRAM_ATTR isMulticast(const uint8_t* mac) {
   return mac[0] & 0x01;
 }
 
-// Returns the matching Vendor, or -1 for no match. Callers that only need a
-// yes/no can test >= 0.
-int IRAM_ATTR matchOuiRaw(const uint8_t* mac) {
-  // Locally-administered (randomised) MACs have bit 1 of byte 0 set, and fixed
-  // infrastructure normally never uses them, so skipping them wholesale avoids
-  // scanning the table for most phone probe traffic. Only valid while no active
-  // target is itself LAA: 82:6b:f2 is, and this early return silently blocked
-  // it before g_haveLaaTargets existed. Byte 0 carries the LAA bit, so the
-  // prefix compare below already keeps LAA inputs matching only LAA entries.
-  if ((mac[0] & 0x02) && !g_haveLaaTargets) return -1;
-  const uint8_t mask = coreVendorMask;
+// Returns the matching oui_table index, or -1. Skips the LAA gate, for BLE,
+// where a random address sets the LAA bit.
+static int IRAM_ATTR ouiLookup(const uint8_t* mac) {
+  const uint16_t mask = coreVendorMask;
   for (size_t i = 0; i < OUI_COUNT; i++) {
     const OuiEntry& e = oui_table[i];
-    // Prefix compare first: byte 0 rejects non-target frames, so the mask test
-    // only runs on a prefix hit.
+    // Prefix compare first, so the mask test runs only on a prefix hit.
     if (mac[0] != e.b[0] || mac[1] != e.b[1] || mac[2] != e.b[2]) continue;
     if (!(mask & (1u << e.vendor)))                               continue;
     if (e.nibbles == 7 && ((mac[3] ^ e.b[3]) & 0xF0))             continue;
-    return (int)e.vendor;
+    return (int)i;
   }
   return -1;
+}
+
+static int IRAM_ATTR matchOuiIndex(const uint8_t* mac) {
+  // Filter out locally administered MACs except the LAA hits
+  if ((mac[0] & 0x02) && !g_haveLaaTargets) return -1;
+  return ouiLookup(mac);
+}
+
+int IRAM_ATTR matchOuiRaw(const uint8_t* mac) {
+  const int i = matchOuiIndex(mac);
+  return i < 0 ? -1 : (int)oui_table[i].vendor;
+}
+
+// Manufacturer-data rules, the axis that survives address randomisation. A
+// company id alone is weak, so a rule may require a type byte and a printable
+// ASCII identifier. `cls` states what a match proves, as on the OUI table, spec
+// M3 and M8. A company id is a Bluetooth SIG assignment, unrelated to IEEE
+// OUIs.
+typedef struct {
+  uint16_t companyId;
+  int16_t  typeByte;    // -1 when the rule has no discriminator byte
+  uint8_t  idOffset;    // from the start of the manufacturer data
+  uint8_t  idLen;       // 0 when the rule extracts no identifier
+  uint8_t  vendor;
+  uint8_t  cls;         // OuiClass
+} BleMfrRule;
+
+static const BleMfrRule ble_mfr_rules[] = {
+  { BLE_COMPANY_AXON,     BLE_AXON_TYPE_BYTE, 3, 9, VENDOR_AXON,     OUI_CLASS_PRIMARY },
+  // Penguin battery pack. Nobody has characterised its serial offset, so the
+  // rule matches on the company id alone.
+  { BLE_COMPANY_XUNTONG,  -1,                 0, 0, VENDOR_FLOCK,    OUI_CLASS_ACCESSORY },
+  // The SIG assigned these ids to the vendors themselves, per its company
+  // identifier list as of 2026-09-22. Neither has a characterised payload. A
+  // vendor-owned company id is narrow enough to stand alone under M1, except
+  // Motorola's, which radios may share, so it is infra until a payload
+  // separates its camera lines.
+  { BLE_COMPANY_AXIS,     -1,                 0, 0, VENDOR_AXIS,     OUI_CLASS_PRIMARY },
+  { BLE_COMPANY_MOTOROLA, -1,                 0, 0, VENDOR_MOTOROLA, OUI_CLASS_INFRA },
+};
+static const size_t BLE_MFR_RULE_COUNT =
+    sizeof(ble_mfr_rules) / sizeof(ble_mfr_rules[0]);
+
+volatile uint32_t coreBleMatched = 0;
+
+bool coreBleMatch(const uint8_t* mac, uint8_t addrType,
+                  const uint8_t* payload, size_t payloadLen, BleMatch* out) {
+  out->vendor    = -1;
+  out->accessory = false;
+  out->infra     = false;
+  out->method    = "unmatched";
+  out->id[0]     = '\0';
+
+  // 1. Manufacturer data, the strongest axis and the cheapest rejection.
+  uint8_t mfrLen = 0;
+  const uint8_t* mfr =
+      bleFindAdType(payload, payloadLen, BLE_AD_MANUFACTURER, &mfrLen);
+  if (mfr) {
+    const int company = bleMfrCompanyId(mfr, mfrLen);
+    for (size_t i = 0; i < BLE_MFR_RULE_COUNT; i++) {
+      const BleMfrRule& r = ble_mfr_rules[i];
+      if (company != (int)r.companyId)                    continue;
+      if (!(coreVendorMask & (1u << r.vendor)))           continue;
+      if (r.typeByte >= 0
+          && (mfrLen < 3 || mfr[2] != (uint8_t)r.typeByte)) continue;
+      // A company id plus a type byte matches too much without the printable
+      // id check.
+      if (r.idLen
+          && !bleMfrAsciiId(mfr, mfrLen, r.idOffset, r.idLen,
+                            out->id, sizeof(out->id)))      continue;
+      out->vendor    = (int8_t)r.vendor;
+      out->accessory = r.cls == OUI_CLASS_ACCESSORY;
+      out->infra     = r.cls == OUI_CLASS_INFRA;
+      out->method    = "ble_mfr";
+      return true;
+    }
+  }
+
+  // 2. The OUI table, public addresses only, since a random address may carry
+  //    any prefix.
+  if (addrType == BLE_ADDR_PUBLIC || addrType == BLE_ADDR_PUBLIC_ID) {
+    const int i = ouiLookup(mac);
+    if (i >= 0) {
+      out->vendor    = (int8_t)oui_table[i].vendor;
+      out->accessory = oui_table[i].cls == OUI_CLASS_ACCESSORY;
+      out->infra     = oui_table[i].cls == OUI_CLASS_INFRA;
+      out->method    = "ble_oui";
+      return true;
+    }
+  }
+  return false;
 }
 
 #if ENABLE_SSID_MATCH
@@ -401,11 +504,9 @@ static size_t   customChannelIndex = 0;
 static size_t   fullHopIndex = 0;
 static unsigned long lastHop = 0;
 
-// Runtime scan mode + Single-mode channel. Default to the board's build-time
-// CHANNEL_MODE / SINGLE_CHANNEL. The Scan Mode menu switches them live in RAM,
-// resetting to the default on reboot. This was a compile-time `#if CHANNEL_MODE`
-// gate, and is now a runtime switch so the menu can change modes without
-// reflashing.
+// Runtime scan mode and Single-mode channel, seeded from the board's
+// CHANNEL_MODE and SINGLE_CHANNEL. The Scan Mode menu changes them in RAM, and a
+// reboot restores the defaults.
 static uint8_t g_scanMode        = CHANNEL_MODE;
 uint8_t        coreSingleChannel = SINGLE_CHANNEL;
 
@@ -434,9 +535,8 @@ int coreScanModeIndex() {
   }
 }
 
-// Display and JSON only: freq_mhz stopped being a logged column in wifi_obs v2,
-// because channel and band already determine it. Channel 14 is the one the
-// linear formula misses - 802.11 puts it at 2484 MHz, not 2477.
+// Display and JSON only. wifi_obs logs channel and band, which determine the
+// frequency. 802.11 puts channel 14 at 2484 MHz, off the linear formula.
 uint16_t channelFreqMhz(uint8_t ch) {
   if (ch == 14) return 2484;
   return (ch >= 1 && ch <= 13) ? (uint16_t)(2407 + 5 * ch) : 0;
@@ -448,7 +548,10 @@ void applyInitialChannel() {
     case CHANNEL_MODE_CUSTOM: currentChannel = customChannels[0]; break;
     default:                  currentChannel = fullHopChannels[0]; break;
   }
-  esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+  // Callers can change the channel plan while BLE holds the radio and the
+  // 802.11 driver is down. currentChannel still tracks the plan.
+  if (coreRadioMode == RADIO_MODE_WIFI)
+    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
   lastHop = millis();
 }
 
@@ -484,14 +587,14 @@ static void coreSetScanMode(uint8_t mode, uint8_t singleChannel) {
   customChannelIndex = 0;
   fullHopIndex = 0;
   applyInitialChannel();
-  // See coreSetVendorMask(). A mode switch is a `channels` change; obs_mode is
-  // fixed promiscuous on this build and does not move with it.
+  // Logs a `channels` change, see coreSetVendorMask(). obs_mode stays
+  // promiscuous on this build.
   roostLogConfigChannels();
   dualPrintf("[bscope] scan mode -> %s ch=%u\n", channelModeName(), currentChannel);
 }
 
 // ============================================================
-// JSON ESCAPE: only needed for SSIDs, which are user-controlled bytes
+// JSON ESCAPE, for SSIDs, which are user-controlled bytes
 // ============================================================
 
 static size_t jsonEscape(char* dst, size_t cap, const char* src) {
@@ -543,13 +646,12 @@ typedef struct {
   uint32_t lastSeen;
   uint16_t count;
   char     ssid[33];
-  // Proximity-alert state, session-only and absent from fySerializeDet(). 0
-  // dBm is impossible for a real reading, so emaRssi is its own unseeded flag.
+  // Proximity-alert state, session-only and absent from fySerializeDet(). A real
+  // reading is never 0 dBm, so emaRssi == 0 means unseeded.
   int8_t   emaRssi;
   uint8_t  proxLatched;
-  // Not exclusive: a camera seen both ways sets both. `method` cannot answer
-  // this, recording only how the row was first created. Session-only, like the
-  // proximity state above. Spec C1-C2.
+  // A camera seen both ways sets both. `method` records only how the row was
+  // first created. Session-only, spec C1-C2.
   uint8_t  seenDirect;
   uint8_t  seenIndirect;
 } FYDetection;
@@ -588,9 +690,9 @@ static bool shouldSuppressDuplicate(const char* macStr) {
   return false;
 }
 
-// Detection tallies, described in core.h. Plain uint16_t rather than volatile:
-// only coreHandleAlert() writes them, from the loop()-context queue drain, and
-// the display reads them from the same context.
+// Detection tallies, described in core.h. Plain uint16_t, since only
+// coreHandleAlert() writes them, from the loop()-context queue drain, and the
+// display reads them from the same context.
 uint16_t coreDirectFrames   = 0;
 uint16_t coreIndirectFrames = 0;
 
@@ -599,8 +701,8 @@ static void tallyFrame(AlertType t) {
   if (n < 0xFFFF) n++;
 }
 
-// Devices, not frames, and the two overlap: a camera seen both ways counts in
-// each, so the sum can exceed fyDetCount. Spec C1-C3.
+// Device counts, which overlap. A camera seen both ways counts in each, so the
+// sum can exceed fyDetCount. Spec C1-C3.
 uint16_t coreDirectDeviceCount() {
   uint16_t n = 0;
   for (int i = 0; i < fyDetCount; i++) if (fyDet[i].seenDirect) n++;
@@ -622,19 +724,16 @@ static const char* alertTypeToMethod(AlertType t) {
     case ALERT_WILDCARD_PROBE: return "wildcard_probe";
     case ALERT_DIRECTED_PROBE: return "directed_probe";
     case ALERT_SURVEY:         return "operator_survey";   // spec O3
-    // The vocabulary's word for "no target matched". "unknown" is not in
-    // detection_method's allowed set, so it would fail to resolve, empty a
-    // column and raise vocabulary_error. Unreachable today; the default arm is
-    // what the next alert type falls through.
+    // Every AlertType needs its own case. The default returns the vocabulary's
+    // word for "no target matched", since detection_method has no "unknown".
     default:                   return "unmatched";
   }
 }
 
-// Returns index of entry (new or updated), or -1 if table is full.
-// chirpWorthy = true when the caller should fire the ascending new-discovery
-// chirp: either (a) MAC is brand new to this session, or (b) MAC is known
-// but has not been seen in REDISCOVER_MS, meaning it left RF range and came
-// back. A board without a buzzer ignores outChirpWorthy.
+// Returns the index of the new or updated entry, or -1 when the table is full.
+// Sets outChirpWorthy when the MAC is new to this session, or when it went
+// unseen for REDISCOVER_MS and so left RF range and came back. A board without
+// a buzzer ignores outChirpWorthy.
 static int fyAddDetection(const char* mac, const char* method,
                           int8_t rssi, uint8_t ch, const char* ssid,
                           bool direct, bool* outChirpWorthy) {
@@ -643,15 +742,15 @@ static int fyAddDetection(const char* mac, const char* method,
     if (strcasecmp(fyDet[i].mac, mac) == 0) {
       bool rediscover = (now - fyDet[i].lastSeen) > REDISCOVER_MS;
       if (fyDet[i].count < 0xFFFF) fyDet[i].count++;
-      // Latched, never cleared: a later frame of the other kind adds a
-      // direction rather than replacing one.
+      // Latched and never cleared. A later frame of the other kind adds a
+      // direction to the row.
       if (direct) fyDet[i].seenDirect   = 1;
       else        fyDet[i].seenIndirect = 1;
       fyDet[i].lastSeen = now;
       fyDet[i].rssi     = rssi;
       fyDet[i].channel  = ch;
-      // NULL or a real name: roostSsidPrintable already decided, so this does
-      // not second-guess what an empty SSID means.
+      // `ssid` is NULL or a printable name, since roostSsidPrintable() already
+      // decided what an empty SSID means.
       if (ssid && !fyDet[i].ssid[0]) {
         strlcpy(fyDet[i].ssid, ssid, sizeof(fyDet[i].ssid));
       }
@@ -661,15 +760,14 @@ static int fyAddDetection(const char* mac, const char* method,
     }
   }
   if (fyDetCount >= MAX_DETECTIONS) {
-    // Table full: no eviction, no wraparound. Count what we could not record so
-    // the display can say so, because otherwise fyDetCount stops moving
-    // and reads as "nothing new out here" rather than "out of room". Repeat
-    // hits on MACs already in the table still update above, so this counts
-    // distinct devices missed, not frames.
+    // Full table, with no eviction and no wraparound. fyDroppedNew counts the
+    // distinct devices refused, so the display can show the table is out of
+    // room and not a quiet area. Repeat hits on MACs already in the table still
+    // update above.
     //
-    // On a USE_SD board no capture data is lost: the wifi_obs row is written
-    // by coreHandleAlert() independent of this return value. On a board
-    // without SD, these devices are genuinely gone.
+    // On a USE_SD board coreHandleAlert() writes the wifi_obs row whatever this
+    // returns, so the capture keeps every device. A board without SD loses
+    // them.
     if (fyDroppedNew < 0xFFFF) fyDroppedNew++;
     if (outChirpWorthy) *outChirpWorthy = false;
     return -1;
@@ -682,8 +780,8 @@ static int fyAddDetection(const char* mac, const char* method,
   d.firstSeen = now;
   d.lastSeen  = now;
   d.count     = 1;
-  // Left unseeded rather than taking `rssi`, which may be an oui_addr1 hit
-  // measuring the AP path. proximityEvaluate() seeds it from a direct one.
+  // proximityEvaluate() seeds this from a direct hit. `rssi` may come from an
+  // oui_addr1 hit, which measures the AP path.
   d.emaRssi     = 0;
   d.proxLatched = 0;
   d.seenDirect   = direct ? 1 : 0;
@@ -697,12 +795,12 @@ static int fyAddDetection(const char* mac, const char* method,
 }
 
 // ============================================================
-// SPIFFS SESSION PERSISTENCE: bulletproof envelope format
+// SPIFFS SESSION PERSISTENCE, a CRC-checked envelope format
 // ============================================================
 //
-// Wire format on disk:
-//   Line 1: {"v":1,"count":N,"bytes":B,"crc":"0xXXXXXXXX"}\n
-//   Line 2+: [{"mac":...},...]     (exactly B bytes, CRC32 == X)
+// On-disk format, in two parts:
+//   1. An envelope line, `{"v":1,"count":N,"bytes":B,"crc":"0xXXXXXXXX"}\n`
+//   2. The payload, `[{"mac":...},...]`, exactly B bytes, with CRC32 == X
 //
 // Atomic write procedure:
 //   1. Compute payload size + CRC (pass 1)
@@ -742,8 +840,8 @@ static uint32_t fyComputePayloadCRC(size_t& outBytes) {
   return crc;
 }
 
-// Minimal envelope parser: pulls bytes + crc fields by substring search.
-// Robust to field reordering. Rejects anything without both required keys.
+// Minimal envelope parser. Finds the bytes and crc fields by substring search,
+// in any order, and rejects anything missing either one.
 static bool fyParseEnvelope(const char* hdr, size_t& outBytes, uint32_t& outCrc) {
   const char* b = strstr(hdr, "\"bytes\":");
   const char* c = strstr(hdr, "\"crc\":\"0x");
@@ -867,8 +965,8 @@ void fySaveSession() {
              savedCount, (unsigned)payloadBytes, (unsigned long)crc);
 }
 
-// Promote any valid session file from last boot into /prev_session.json, then
-// start this boot with a fresh empty table. Preserves history across power cycles.
+// Promotes any valid session file from the last boot to /prev_session.json,
+// then starts this boot with an empty table.
 void fyPromotePrevSession() {
   if (!fySpiffsReady) return;
 
@@ -912,8 +1010,8 @@ static unsigned long lastHeartbeat = 0;
 void printHeartbeat() {
   if (millis() - lastHeartbeat >= HEARTBEAT_MS) {
     if (fyDroppedNew) {
-      // Table is full and has been dropping devices. Say so every heartbeat,
-      // since det= is pinned at MAX_DETECTIONS and looks like a quiet area.
+      // The table is full and dropping devices. Say so every heartbeat, since
+      // det= stays at MAX_DETECTIONS and looks like a quiet area.
       dualPrintf("[bscope] scanning (ch=%u mode=%s det=%d TABLE FULL, missed=%u)\n",
                     currentChannel, channelModeName(), fyDetCount,
                     (unsigned)fyDroppedNew);
@@ -926,10 +1024,9 @@ void printHeartbeat() {
 }
 
 // ============================================================
-// SERIAL COMMANDS: core handles the shared verbs, whose dump format is
-// identical on every board. `status` is genuinely per-board, since its fields
-// differ, so each board composes its own printStatus() using the extern state
-// below rather than a shared core implementation.
+// SERIAL COMMANDS. Core handles the verbs every board shares. Each board
+// composes its own `status` in printStatus(), from the extern state below,
+// because the fields differ by board.
 // ============================================================
 
 void dumpCurrentSession() {
@@ -959,9 +1056,10 @@ void dumpSpiffsFile(const char* path) {
   f.close();
 }
 
-// Shared line tokenizer, described in core.h. Accumulates Serial bytes into a static
-// buffer until a newline, then splits into a lowercased verb (first token) and
-// a trimmed argument (remainder). Overlong lines are truncated, not overflowed.
+// Shared line tokenizer, described in core.h. Accumulates Serial bytes in a
+// static buffer until a newline, then splits the line into a lowercased verb
+// (the first token) and a trimmed argument (the rest). Drops bytes past the end
+// of the buffer.
 bool coreReadSerialCommand(const char** verb, const char** arg) {
   static char line[64];
   static size_t len = 0;
@@ -1011,9 +1109,9 @@ static void gpsEchoFor(uint32_t ms);
 bool coreHandleSerialCommand(const char* verb, const char* arg) {
   if (!strcmp(verb, "dump")) { dumpCurrentSession(); return true; }
   if (!strcmp(verb, "prev")) { dumpSpiffsFile(FY_PREV_FILE); return true; }
-  // Tone tests, each acknowledged on the console so the verb is distinguishable
-  // from a silent failure. Gated with the help listing, so a board without a
-  // buzzer reports them as unknown rather than accepting them silently.
+  // Tone tests. Each prints an acknowledgement, so success looks different from
+  // a silent failure. The help listing's gate hides them on a board without a
+  // buzzer, which reports them as unknown verbs.
 #if USE_BUZZER
   if (!strcmp(verb, "chirp"))  {
     dualPrintln("[bscope] playing detection chirp"); corePlayDetectChirp();    return true; }
@@ -1094,7 +1192,29 @@ volatile uint8_t  coreQueueDepthMax = 0;
 
 uint8_t coreAlertQueueSize() { return ALERT_QUEUE_SIZE; }
 
-static volatile AlertEntry alertQueue[ALERT_QUEUE_SIZE];
+// Each radio's queue and rate-limit tables exist only while that radio runs.
+// Start allocates them and stop frees them, so the idle radio holds no buffer
+// memory. A failed allocation leaves the radio running, reports on the
+// console, and turns its matches into counted drops [G1].
+//
+// `psramOk` lets a buffer go to PSRAM when the board has it. Only a buffer the
+// 802.11 RX callback never touches may, since that callback runs from IRAM
+// while flash writes have the cache, and with it PSRAM, switched off.
+volatile uint32_t coreRadioAllocFails = 0;
+
+static void* radioAlloc(size_t n, const char* what, bool psramOk = false) {
+  void* p = psramOk ? heap_caps_calloc(1, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+                    : nullptr;
+  if (!p) p = heap_caps_calloc(1, n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!p) coreRadioAllocFails = coreRadioAllocFails + 1;
+  if (!p)
+    dualPrintf("[bscope] %s: %u bytes unavailable, its matches count as "
+               "dropped\n", what, (unsigned)n);
+  return p;
+}
+
+// nullptr while the 802.11 sniffer is down.
+static AlertEntry* volatile alertQueue = nullptr;
 static volatile size_t alertHead = 0;  // written by callback
 static volatile size_t alertTail = 0;  // read by loop()
 static portMUX_TYPE    queueMux  = portMUX_INITIALIZER_UNLOCKED;
@@ -1107,11 +1227,19 @@ void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t* mac,
                              const RoostSsid* ssid, const char* kind,
                              const char* fsubtype) {
   portENTER_CRITICAL_ISR(&queueMux);
+  if (!alertQueue) {
+    // A running sniffer without its queue lost the frame. A stopped one, which
+    // the `inject` command can reach, had nothing to lose.
+    if (!sniffingStopped) coreQueueDrops = coreQueueDrops + 1;
+    portEXIT_CRITICAL_ISR(&queueMux);
+    return;
+  }
   size_t next = (alertHead + 1) % ALERT_QUEUE_SIZE;
   if (next == alertTail) {                         // drop if full, loop() is behind
-    // A matched frame lost outright: it never reaches the log. Distinct from
-    // fyDroppedNew, which is a full display table on a board that still writes
-    // the row. Becomes device_event buffer_full and observations_dropped.
+    // A matched frame lost outright, which never reaches the log. fyDroppedNew
+    // counts something else, a full display table on a board that still writes
+    // the row. This count feeds device_event buffer_full and
+    // observations_dropped.
     coreQueueDrops = coreQueueDrops + 1;
     portEXIT_CRITICAL_ISR(&queueMux);
     return;
@@ -1122,8 +1250,7 @@ void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t* mac,
   e->rssi    = rssi;
   e->channel = ch;
   memcpy((void*)e->mac, mac, 6);
-  // Stamped here, in the callback, so the row carries when the frame arrived
-  // rather than when loop() got round to it.
+  // Stamped in the callback, so the row records the frame's arrival time.
   e->uptimeMs = millis();
   if (fm) {
     memcpy((void*)e->addr1, fm->addr1, 6);
@@ -1141,8 +1268,8 @@ void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t* mac,
     ((char*)e->bbFormat)[0] = '\0';
   }
 
-  // Copied whole: a string copy drops `len` and `present`, which is what
-  // separates an absent SSID element from a present empty one.
+  // Copy the whole struct. `len` and `present` tell an absent SSID element from
+  // a present empty one, and a string copy drops both.
   if (ssid) *(RoostSsid*)&e->ssid = *ssid;
   else      memset((void*)&e->ssid, 0, sizeof(RoostSsid));
 
@@ -1153,9 +1280,8 @@ void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t* mac,
   else           { ((char*)e->frameSubtype)[0] = '\0'; }
 
   alertHead = next;
-  // High-water mark, to size the queue against real load rather than a guess.
-  // The roost row carries the IE lists, which widens every entry; this says
-  // how much headroom there is to spend. Migration P5.
+  // High-water mark, for sizing the queue against real load. Each entry holds
+  // the IE lists, so this shows how much headroom remains.
   uint8_t depth = (uint8_t)((alertHead + ALERT_QUEUE_SIZE - alertTail) % ALERT_QUEUE_SIZE);
   if (depth > coreQueueDepthMax) coreQueueDepthMax = depth;
   portEXIT_CRITICAL_ISR(&queueMux);
@@ -1163,7 +1289,7 @@ void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t* mac,
 
 // ============================================================
 // OPERATOR SURVEY WINDOW. Contract in core.h, rules in spec O1-O7 [D9]. The
-// flag is read by the promiscuous callback and written only from loop().
+// promiscuous callback reads the flag, and only loop() writes it.
 // ============================================================
 
 const uint16_t SURVEY_OPTIONS_S[SURVEY_OPTION_COUNT] = { 10, 20, 30 };
@@ -1171,88 +1297,65 @@ volatile uint16_t coreSurveySecs = SURVEY_OPTIONS_S[0];
 
 // ---- Per-MAC rate limit -----------------------------------------------------
 //
-// One row per MAC per SURVEY_DEDUPE_MS, time-windowed rather than log-once,
-// applied before a frame reaches the queue. Matched frames never reach this;
-// they are logged in full by their own path. Spec O6 [D9].
+// One row per MAC per time window, applied before a frame reaches the queue. The survey window and infra matches each
+// hold their own table. Target matches never reach either. Spec O6 [D9] and M8
+// [D17].
 #ifndef SURVEY_DEDUPE_SLOTS
 #define SURVEY_DEDUPE_SLOTS 256
 #endif
 #ifndef SURVEY_DEDUPE_MS
 #define SURVEY_DEDUPE_MS 2000
 #endif
+#ifndef INFRA_DEDUPE_SLOTS
+#define INFRA_DEDUPE_SLOTS 64
+#endif
+#ifndef INFRA_DEDUPE_MS
+#define INFRA_DEDUPE_MS 10000
+#endif
 
-static DRAM_ATTR uint8_t  surveySeenMac[SURVEY_DEDUPE_SLOTS][6];
-static DRAM_ATTR uint32_t surveySeenAt[SURVEY_DEDUPE_SLOTS];
-static DRAM_ATTR uint8_t  surveySeenUsed[SURVEY_DEDUPE_SLOTS];
-volatile uint32_t coreSurveyEvictions = 0;
+uint32_t coreInfraDedupeMs() { return INFRA_DEDUPE_MS; }
 
-// Spreads the low three bytes, the ones that vary within a vendor.
-static inline size_t IRAM_ATTR surveyHash(const uint8_t* mac) {
-  uint32_t h = ((uint32_t)mac[3] << 16) | ((uint32_t)mac[4] << 8) | mac[5];
-  h ^= (uint32_t)mac[0] << 7;
-  h *= 2654435761u;
-  return (size_t)(h % SURVEY_DEDUPE_SLOTS);
+#ifndef BLE_LIMIT_SLOTS
+#define BLE_LIMIT_SLOTS 512
+#endif
+
+// The sniffer attaches the 802.11 tables while it runs, and the BLE scan
+// attaches the BLE tables. See mac_limit.h for the algorithm.
+static DRAM_ATTR MacLimit surveyLimit = {};
+static DRAM_ATTR MacLimit infraLimit  = {};
+static MacLimit bleSurveyLimit = {};
+static MacLimit bleInfraLimit  = {};
+
+// `psramOk` follows radioAlloc(). Only the BLE tables may take it.
+static void limitStart(MacLimit* l, uint16_t slots, uint32_t windowMs,
+                       const char* what, bool psramOk) {
+  if (l->at) return;
+  macLimitAttach(l, radioAlloc(MAC_LIMIT_BYTES(slots), what, psramOk),
+                 slots, windowMs);
 }
 
-// Wrap-safe: millis() rolls over about every 49 days and a capture outlives it.
-static inline bool IRAM_ATTR surveyElapsed(uint32_t now, uint32_t then, uint32_t span) {
-  return (uint32_t)(now - then) >= span;
-}
+static void limitStop(MacLimit* l) { free(macLimitDetach(l)); }
 
-// True when this MAC is due a row. Bounded probe from the hash: scanning the
-// table per frame would cost more than the parse it is protecting.
-static bool IRAM_ATTR surveyAllow(const uint8_t* mac, uint32_t nowMs) {
-  const size_t start = surveyHash(mac);
-  const size_t kProbe = 8;
-
-  size_t   freeIdx   = SURVEY_DEDUPE_SLOTS;
-  size_t   oldestIdx = start;
-  uint32_t oldestAge = 0;
-
-  for (size_t i = 0; i < kProbe; i++) {
-    const size_t idx = (start + i) % SURVEY_DEDUPE_SLOTS;
-    if (!surveySeenUsed[idx]) {
-      if (freeIdx == SURVEY_DEDUPE_SLOTS) freeIdx = idx;
-      continue;
-    }
-    if (memcmp(surveySeenMac[idx], mac, 6) == 0) {
-      if (surveyElapsed(nowMs, surveySeenAt[idx], SURVEY_DEDUPE_MS)) {
-        surveySeenAt[idx] = nowMs;
-        return true;
-      }
-      return false;
-    }
-    const uint32_t age = (uint32_t)(nowMs - surveySeenAt[idx]);
-    if (age >= oldestAge) { oldestAge = age; oldestIdx = idx; }
-  }
-
-  size_t idx;
-  if (freeIdx != SURVEY_DEDUPE_SLOTS) {
-    idx = freeIdx;
-  } else {
-    // Least-recently-seen, so a full table logs more often than the cap says
-    // rather than going silent. Only an eviction if the victim was still
-    // inside its window; replacing an expired entry costs nothing.
-    idx = oldestIdx;
-    if (!surveyElapsed(nowMs, surveySeenAt[idx], SURVEY_DEDUPE_MS)) {
-      coreSurveyEvictions = coreSurveyEvictions + 1;
-    }
-  }
-  memcpy(surveySeenMac[idx], mac, 6);
-  surveySeenAt[idx]   = nowMs;
-  surveySeenUsed[idx] = 1;
-  return true;
+// Returns 1 when the RX callback should queue a row for the address, 0 for no
+// match, and -1 for an infra match the per-MAC limit holds back. A -1 still
+// keeps the frame out of the survey path.
+static int IRAM_ATTR matchForQueue(const uint8_t* mac) {
+  const int i = matchOuiIndex(mac);
+  if (i < 0) return 0;
+  if (oui_table[i].cls == OUI_CLASS_INFRA
+      && !macLimitAllow(&infraLimit, mac, millis())) return -1;
+  return 1;
 }
 
 static volatile bool     surveyActive  = false;
 static unsigned long     surveyEndsAt  = 0;
-// Captured at the window's start so the report is the window's own delta and
-// not a session total. coreQueueDrops counts frames that never reached the log.
+// Captured when the window opens, so the report covers the window alone. coreQueueDrops counts frames that never reached the log.
 static uint32_t          surveyDropsAt = 0;
 volatile uint32_t        coreSurveyRows = 0;
 volatile uint32_t        coreSurveySuppressed = 0;
 
 bool coreSurveyActive() { return surveyActive; }
+
 
 uint32_t coreSurveyRemainingMs() {
   if (!surveyActive) return 0;
@@ -1261,23 +1364,24 @@ uint32_t coreSurveyRemainingMs() {
 }
 
 void coreSurveyStart() {
-  // No SD log means no sink for survey rows, so no window opens (spec O1). A
-  // plain condition rather than #if, so both arms compile on every board.
+  // Without an SD log survey rows have no sink, so no window opens (spec O1). A
+  // plain condition, so both arms compile on every board.
   if (!USE_SD) {
     dualPrintln("[bscope] SURVEY unavailable: no SD log on this board");
     return;
   }
-  // A press during an open window extends it to a full duration rather than
-  // stacking a second one, so the operator's last press decides when it ends.
+  // A press during an open window restarts its full duration, so the
+  // operator's last press decides when it ends.
   if (!surveyActive) {
-    surveyDropsAt        = coreQueueDrops;
+    surveyDropsAt        = coreQueueDrops + coreBleQueueDrops;
     coreSurveyRows       = 0;
     coreSurveySuppressed = 0;
-    coreSurveyEvictions  = 0;
     // Cleared per window, so a device seen at an earlier mark still yields a
-    // first row here (spec O6). Unlocked: this clear must complete before
-    // surveyActive is set, since that flag gates surveyAllow() in the callback.
-    memset(surveySeenUsed, 0, sizeof(surveySeenUsed));
+    // first row here (spec O6). Unlocked, so this clear must finish before
+    // surveyActive goes true, since that flag gates the survey limit in the
+    // callback.
+    macLimitReset(&surveyLimit);
+    macLimitReset(&bleSurveyLimit);
   }
   surveyEndsAt = millis() + (unsigned long)coreSurveySecs * 1000UL;
   surveyActive = true;   // must stay after the reset above
@@ -1290,24 +1394,34 @@ void coreSurveyTick() {
   if ((long)(millis() - surveyEndsAt) < 0) return;
   surveyActive = false;
 
-  uint32_t drops = coreQueueDrops - surveyDropsAt;
-  // Drops are every frame the queue refused during the window, matched ones
-  // included, so this bounds what the window missed rather than attributing
-  // each loss to it. Spec O7.
+  uint32_t drops = coreQueueDrops + coreBleQueueDrops - surveyDropsAt;
+  // Drops count every frame the queue refused during the window, matched ones
+  // included, so the figure is an upper bound on what the window missed. Spec
+  // O7.
   dualPrintf("[bscope] SURVEY closed: %u rows, %u frames rate-limited,"
              " %u dropped (queue full), %u evictions\n",
              (unsigned)coreSurveyRows, (unsigned)coreSurveySuppressed,
-             (unsigned)drops, (unsigned)coreSurveyEvictions);
+             (unsigned)drops,
+             (unsigned)(surveyLimit.evictions + bleSurveyLimit.evictions));
 #if USE_SD
   if (drops) {
-    roostLogDeviceEvent(ROOST_COMP_WIFI0, "buffer_full", drops, "during_survey");
+#if ROOST_CAP_BLE
+    const RoostComponent comp =
+        coreRadioMode == RADIO_MODE_BLE ? ROOST_COMP_BLE0 : ROOST_COMP_WIFI0;
+#else
+    const RoostComponent comp = ROOST_COMP_WIFI0;
+#endif
+    roostLogDeviceEvent(comp, "buffer_full", drops, "during_survey");
   }
 #endif
 }
 
 bool coreDequeueAlert(AlertEntry& out) {
   portENTER_CRITICAL(&queueMux);
-  if (alertTail == alertHead) { portEXIT_CRITICAL(&queueMux); return false; }
+  if (!alertQueue || alertTail == alertHead) {
+    portEXIT_CRITICAL(&queueMux);
+    return false;
+  }
   memcpy(&out, (const void*)&alertQueue[alertTail], sizeof(AlertEntry));
   alertTail = (alertTail + 1) % ALERT_QUEUE_SIZE;
   portEXIT_CRITICAL(&queueMux);
@@ -1350,28 +1464,27 @@ static const char* IRAM_ATTR frameSubtypeStr(wifi_promiscuous_pkt_type_t pkt_typ
   }
 }
 
-// Raw sniffer counters, described in core.h. Plain increments in the callback:
-// a lost count under contention costs nothing, and a lock here would be on the
-// hot path.
+// Raw sniffer counters, described in core.h. The callback increments them
+// without a lock, since a lost count under contention costs nothing.
 volatile uint32_t coreSeenFrames      = 0;
 volatile uint32_t coreCandidateFrames = 0;
 
-// Management subtype histogram. The only instrument that sees a frame the
-// matcher rejected: everything else in this firmware records matches, so a
-// subtype that never arrives and one that arrives and is never matched leave
-// the same artifact. Counted at two points so the two can be told apart.
+// Management subtype histogram, the only instrument that sees frames the
+// matcher rejected. Everything else records matches, where a subtype that never
+// arrives looks the same as one that arrives unmatched. The callback counts at
+// two points to separate them.
 //
-// DRAM_ATTR and no flash on the path, same constraint as the OUI census.
+// DRAM_ATTR and no flash on the path, the same constraint as the OUI census.
 DRAM_ATTR volatile uint32_t coreMgmtSeen[16]    = {0};
 DRAM_ATTR volatile uint32_t coreMgmtMatched[16] = {0};
 
 // ============================================================
-// OUI CENSUS: field instrument, compiled out unless DEBUG_OUI_CENSUS is set.
-// Records every distinct OUI the callback sees, dumped by the `census` verb.
+// OUI CENSUS, a field instrument that only DEBUG_OUI_CENSUS compiles in.
+// Records every distinct OUI the callback sees, and the `census` verb dumps it.
 // Spec G2-G3.
 //
-// DRAM_ATTR throughout and no flash reads on the record path, same constraint
-// as oui_table, since this runs in the promiscuous callback.
+// DRAM_ATTR throughout and no flash reads on the record path, the same
+// constraint as oui_table, since this runs in the promiscuous callback.
 // ============================================================
 
 #ifndef DEBUG_OUI_CENSUS
@@ -1384,7 +1497,7 @@ DRAM_ATTR volatile uint32_t coreMgmtMatched[16] = {0};
 #define CENSUS_MAX 192
 #endif
 
-// Which address field an OUI turned up in. Both are recorded, spec G2.
+// Which address field an OUI turned up in. The census records both, spec G2.
 #define CENSUS_ROLE_ADDR2 0x01
 #define CENSUS_ROLE_ADDR1 0x02
 
@@ -1394,8 +1507,8 @@ static DRAM_ATTR uint8_t  censusRole[CENSUS_MAX];
 static DRAM_ATTR uint16_t censusUsed = 0;
 static DRAM_ATTR uint16_t censusOverflow = 0;
 
-// Linear scan: a full table is 192 three-byte compares per frame, which is
-// invisible next to the parse that follows.
+// Linear scan. A full table costs 192 three-byte compares per frame, small next
+// to the parse that follows.
 static void IRAM_ATTR censusRecord(const uint8_t* mac, uint8_t role) {
   for (uint16_t i = 0; i < censusUsed; i++) {
     if (censusOui[i][0] == mac[0] && censusOui[i][1] == mac[1] &&
@@ -1414,8 +1527,8 @@ static void IRAM_ATTR censusRecord(const uint8_t* mac, uint8_t role) {
   censusUsed++;
 }
 
-// Marks rows the matcher would accept, and flags locally-administered
-// prefixes: a randomised camera MAC reads as a miss otherwise.
+// Marks rows the matcher would accept. Also flags locally administered
+// prefixes, since the matcher misses a randomised camera MAC.
 static void censusDump() {
   dualPrintf("[bscope] census: %u distinct OUIs (%u dropped, table full)\n",
              (unsigned)censusUsed, (unsigned)censusOverflow);
@@ -1436,9 +1549,9 @@ static void censusDump() {
 
 void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (!buf || sniffingStopped) return;
-  // Ahead of every filter below: counts what the radio delivered, not what
-  // survived. Zero here means the driver is not feeding us.
-  // Read-modify-write rather than ++, which C++20 deprecates on a volatile.
+  // Ahead of every filter below, so this counts what the radio delivered. Zero
+  // here means the driver delivers nothing. Read-modify-write, since C++20
+  // deprecates ++ on a volatile.
   coreSeenFrames = coreSeenFrames + 1;
 
 #if PROCESS_MGMT_FRAMES && PROCESS_DATA_FRAMES
@@ -1456,9 +1569,9 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   wifi_ieee80211_mac_hdr_t*    hdr = (wifi_ieee80211_mac_hdr_t*)pkt->payload;
   int8_t rssi = pkt->rx_ctrl.rssi;
 
-  // Ahead of the RSSI gate on purpose: a frame the threshold discards was
-  // still delivered, and the gap against coreMgmtMatched is what separates
-  // "never arrived" from "arrived and was not matched".
+  // Ahead of the RSSI gate, since a frame the threshold discards still arrived.
+  // The gap against coreMgmtMatched separates "never arrived" from "arrived
+  // unmatched".
   if (type == WIFI_PKT_MGMT) {
     const uint8_t st_ = (uint8_t)((hdr->frame_ctrl >> 4) & 0x0F);
     coreMgmtSeen[st_] = coreMgmtSeen[st_] + 1;
@@ -1471,15 +1584,15 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
 
 #if DEBUG_OUI_CENSUS
   censusRecord(hdr->addr2, CENSUS_ROLE_ADDR2);
-  // Same multicast guard the real addr1 path uses: addr1 is broadcast on
-  // beacons, which would otherwise bury the table in ff:ff:ff.
+  // The same multicast guard as the real addr1 path. addr1 is broadcast on
+  // beacons and would bury the table in `ff:ff:ff`.
   if (!isMulticast(hdr->addr1)) censusRecord(hdr->addr1, CENSUS_ROLE_ADDR1);
 #endif
 
   uint8_t ch = (uint8_t)pkt->rx_ctrl.channel;  // actual rx channel from driver
 
-  // Everything the row needs from the frame, captured while it still exists:
-  // the driver's buffer is gone once this callback returns.
+  // Capture everything the row needs now. The driver frees its buffer once
+  // this callback returns.
   FrameMeta fm;
   memcpy(fm.addr1, hdr->addr1, 6);
   memcpy(fm.addr2, hdr->addr2, 6);
@@ -1487,8 +1600,8 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   fm.seq      = hdr->seq_ctrl;
   fm.fcFlags  = (uint16_t)((hdr->frame_ctrl >> 8) & 0xFF);
   fm.frameLen = (uint16_t)pkt->rx_ctrl.sig_len;
-  // sig_mode 0 is non-HT, where the rate says DSSS/CCK from OFDM: the IDF's
-  // wifi_phy_rate_t puts the 1/2/5.5/11 Mbps rates at 0x00-0x07.
+  // sig_mode 0 is non-HT, where the rate tells DSSS/CCK from OFDM. The IDF's
+  // wifi_phy_rate_t puts the 1, 2, 5.5 and 11 Mbps rates at 0x00-0x07.
   switch (pkt->rx_ctrl.sig_mode) {
     case 1:  strcpy(fm.bbFormat, "ht");  break;
     case 3:  strcpy(fm.bbFormat, "vht"); break;
@@ -1502,56 +1615,53 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
 
   // The management body, bounded once for every consumer below. The driver's
   // sig_len still counts the FCS the hardware stripped, so parsing to it reads
-  // four bytes of checksum as another element; roostIeParseLen takes it off.
+  // four bytes of checksum as another element. roostIeParseLen() removes them.
   const size_t kHdr    = sizeof(wifi_ieee80211_mac_hdr_t);
   const size_t parseLen = roostIeParseLen(pkt->rx_ctrl.sig_len,
                                           pkt->rx_ctrl.sig_len);
   const uint8_t* body  = pkt->payload + kHdr;
   const size_t bodyLen = parseLen > kHdr ? parseLen - kHdr : 0;
 
-  // Every IE-bearing subtype, not only the branches that matched a target.
-  // Left to the branches it was empty on beacons, and a declared column that is
-  // always empty claims the radio had nothing to report (spec 7.1).
+  // Every IE-bearing subtype, whichever branch below handles the frame. A
+  // declared column holds data whenever the radio reported it (spec 7.1).
   RoostSsid ssid;
   roostIeSsidCapture(body, bodyLen, ftype, subtype, &ssid);
 
-  // --- OUI check: addr2 (transmitter/source) ---
+  // --- addr2 OUI check, the transmitter ---
   //
-  // For mgmt Probe Requests (type=0 subtype=4) from a matched OUI, tighten
-  // to the DeFlockJoplin wildcard-probe signature: SSID IE (tag 0) length
-  // must be zero. This reduces false positives dramatically (Michael's field
-  // test: 11/12 true-positive with only 2 false-positives in Joplin).
-  //
-  // Non-probe frames from the same OUI still emit the broad ADDR2 alert.
-  // See: https://github.com/DeflockJoplin/flock-you
+  // A probe request from a matched OUI splits into wildcard_probe, the
+  // DeFlockJoplin signature with a zero-length SSID IE, and directed_probe.
+  // Every other frame from the OUI raises oui_addr2. docs/detection_methods.md
+  // describes each method and its field results.
 
-  // Set beside every enqueue below, not per branch: a survey row is only
-  // written for a frame no matcher claimed, so an open window never doubles a
-  // matched frame's rows.
+  // Set beside every enqueue below. The survey path writes a row only for a
+  // frame no matcher claimed, so an open window never duplicates a matched
+  // frame's rows.
   bool anyAlert = false;
 
-  if (matchOuiRaw(hdr->addr2) >= 0) {
+  const int m2 = matchForQueue(hdr->addr2);
+  if (m2 < 0) anyAlert = true;
+  if (m2 > 0) {
     // Counted here, after the match and before the branch below decides what
     // kind of alert it is. A subtype that appears in coreMgmtSeen, appears
-    // here, and still produces no row is a fault between this point and the
-    // log rather than a frame that never arrived.
+    // here, and still produces no row points to a fault between here and the
+    // log.
     if (type == WIFI_PKT_MGMT)
       coreMgmtMatched[subtype] = coreMgmtMatched[subtype] + 1;
 
     bool emitted = false;
     if (type == WIFI_PKT_MGMT) {
       if (ftype == 0 && subtype == 4) {                        // Probe Request
-        // No FCS retry: the bound above already removed the checksum, so the
-        // walk cannot run past the elements. The walk happened once, above;
-        // this only reads its result.
+        // No FCS retry, since the bound above already removed the checksum.
+        // This reads the result of the walk above.
         if (ssid.present && ssid.len == 0) {
           enqueueAlert(ALERT_WILDCARD_PROBE, hdr->addr2, &fm, rssi, ch,
                        &ssid, "probe_req", fsub);
           emitted = true;
           anyAlert = true;
         } else if (ssid.present) {
-          // Directed probe: the probed name identifies configured backhaul
-          // networks, which is the field a target's SSID list is built from.
+          // Directed probe. The probed name identifies the configured backhaul
+          // network, the field target SSID lists draw from.
           enqueueAlert(ALERT_DIRECTED_PROBE, hdr->addr2, &fm, rssi, ch,
                        &ssid, "probe_req", fsub);
           emitted = true;
@@ -1566,33 +1676,36 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   }
 
 #if CHECK_ADDR1
-  // addr1 (receiver/destination): catches Flock STAs that appear only as the
-  // dst of probe responses and data frames, never transmitting in the capture
-  // window due to their burst-sleep duty cycle. Multicast guard is mandatory
-  // here since addr1 is broadcast (ff:ff:ff:ff:ff:ff) in beacons/broadcasts.
+  // addr1, the receiver, catches Flock stations that appear only as the
+  // destination of probe responses and data frames, because their burst-sleep
+  // duty cycle sends nothing in the capture window. The multicast guard is
+  // mandatory, since addr1 is broadcast on beacons and other broadcasts.
   //
-  // addr2 (the AP that sent this probe response) is passed as mac2 so the
-  // analysis pipeline can look up the AP's position and use it as a camera
-  // location proxy. The RSSI here reflects AP→scanner path loss, not
-  // camera→scanner, so it can't be used for triangulation directly.
-  if (!isMulticast(hdr->addr1) && matchOuiRaw(hdr->addr1) >= 0) {
+  // addr2, the AP that sent the probe response, goes in mac2 so analysis can
+  // use the AP's position as a proxy for the camera. The RSSI measures the
+  // AP-to-scanner path, so triangulation cannot use it directly.
+  const int m1 = isMulticast(hdr->addr1) ? 0 : matchForQueue(hdr->addr1);
+  if (m1 < 0) anyAlert = true;
+  if (m1 > 0) {
     enqueueAlert(ALERT_OUI_ADDR1, hdr->addr1, &fm, rssi, ch, &ssid, "addr1", fsub);
     anyAlert = true;
   }
 #endif
 
 #if CHECK_ADDR3
-  // addr3 fallback: catches cases where addr2 is randomised but addr3
-  // carries the real BSSID OUI (management frames only).
-  if (type == WIFI_PKT_MGMT && matchOuiRaw(hdr->addr3) >= 0) {
+  // addr3 fallback, for management frames only. Catches a randomised addr2
+  // when addr3 holds the real BSSID OUI.
+  const int m3 = (type == WIFI_PKT_MGMT) ? matchForQueue(hdr->addr3) : 0;
+  if (m3 < 0) anyAlert = true;
+  if (m3 > 0) {
     enqueueAlert(ALERT_OUI_ADDR3, hdr->addr3, &fm, rssi, ch, &ssid, "addr3", fsub);
     anyAlert = true;
   }
 #endif
 
 #if ENABLE_SSID_MATCH
-  // The name was already extracted above, by the one walker that knows each
-  // subtype's fixed-field offset. This branch only decides whether it matches.
+  // The walker above extracted the name, using each subtype's fixed-field
+  // offset. This branch only decides whether it matches.
   const char* ssidName = roostSsidPrintable(&ssid);
   if (ssidName && matchSsidKeyword(ssidName)) {
     const char* frameKind = (subtype == 8)   ? "beacon"
@@ -1604,10 +1717,10 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   }
 #endif
 
-  // Survey window: frames no matcher claimed, keyed on addr2, which is both the
-  // row's identity and what the per-MAC cap counts. Spec O3, O6.
+  // Survey window, for frames no matcher claimed. Keyed on addr2, which is both
+  // the row's identity and what the per-MAC cap counts. Spec O3, O6.
   if (surveyActive && !anyAlert) {
-    if (surveyAllow(hdr->addr2, millis())) {
+    if (macLimitAllow(&surveyLimit, hdr->addr2, millis())) {
       enqueueAlert(ALERT_SURVEY, hdr->addr2, &fm, rssi, ch, &ssid, "survey", fsub);
       coreSurveyRows = coreSurveyRows + 1;
     } else {
@@ -1617,14 +1730,13 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
 }
 
 // ============================================================
-// TIME SOURCE: a runtime priority chain of GPS once a module locks, then NTP
-// over WiFi if station creds are stored, then millis() since boot. GPS cannot
-// lock at boot, because cold-start is slow, so coreTimeSync() bridges the
-// pre-lock window with an NTP join. GPS then takes over automatically the moment
-// it locks: gpsTick() sets the GPS anchor and coreTimestampStr() prefers GPS
-// over NTP. On a board with no GPS module the NTP anchor stays the source. All
-// three anchor implementations live here so boards never duplicate the math.
-// See core.h.
+// TIME SOURCE. A runtime priority chain of GPS once a module locks, then NTP
+// over WiFi with stored station credentials, then millis() since boot. A
+// cold-start GPS cannot lock at boot, so coreTimeSync() bridges the pre-lock
+// window with an NTP join. GPS takes over when it locks, because gpsTick() sets
+// the GPS anchor and coreTimestampStr() prefers GPS over NTP. On a board with no
+// GPS module the NTP anchor stays the source. All three anchors live here. See
+// core.h.
 // ============================================================
 
 #if HAS_GPS
@@ -1633,8 +1745,8 @@ void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
 static TinyGPSPlus gpsParser;
 static bool        gpsReady        = false;
 static bool        gpsTimeAnchored = false;
-// Latches the first refused clock so the wait is reported once, not on every
-// fix. Never cleared: one report per boot is what the operator needs.
+// Latches the first refused clock, so the wait prints once per boot. Never
+// cleared.
 static bool        gpsAnchorRefused = false;
 static uint32_t    gpsAnchorUnix   = 0;
 static uint32_t    gpsAnchorMs     = 0;
@@ -1679,10 +1791,9 @@ static void unixToIso(uint32_t unix, char* buf, size_t len) {
            year, month, (uint8_t)(days + 1), hr, min, s);
 }
 
-// Which HardwareSerial the GPS module is wired to. Defaults to Serial2, and a
-// board overrides it when that UART is needed for something else, such as
-// putting the debug mirror on Serial2 and GPS on Serial1 to avoid a
-// double-begin() conflict on the same UART.
+// The HardwareSerial wired to the GPS module. Defaults to Serial2. A board
+// overrides it when Serial2 has another job, such as the debug mirror, since two
+// begin() calls on one UART conflict.
 #ifndef GPS_SERIAL
 #define GPS_SERIAL Serial2
 #endif
@@ -1709,9 +1820,9 @@ static void gpsSetup() {
 }
 
 // Raw sentence echo for antenna bring-up. The parsed counters cannot tell a
-// dead antenna feed from a weak signal, because both leave every field empty;
-// $GxGSV carries satellites in view and their C/N0, which separates them.
-// Time-limited rather than a toggle, so it cannot be left on in the field.
+// dead antenna feed from a weak signal, because both leave every field empty.
+// $GxGSV reports satellites in view and their C/N0, which separates them.
+// Time-limited, so it cannot stay on in the field.
 static uint32_t gpsEchoUntil = 0;
 static char     gpsEchoLine[100];
 static uint8_t  gpsEchoLen  = 0;
@@ -1721,9 +1832,8 @@ static void gpsEchoFor(uint32_t ms) {
   gpsEchoLen   = 0;
 }
 
-// Assembled into whole sentences rather than echoed per byte: NMEA is
-// line-oriented and a per-byte print would cost more than the 9600 baud it is
-// reading. A sentence longer than the buffer is dropped, not split.
+// Echoes whole sentences, since a per-byte print costs more than the 9600 baud
+// it reads. Drops a sentence longer than the buffer.
 static void gpsEchoByte(char c) {
   if (c == '\r') return;
   if (c == '\n') {
@@ -1735,7 +1845,8 @@ static void gpsEchoByte(char c) {
   if (gpsEchoLen < sizeof(gpsEchoLine) - 1) gpsEchoLine[gpsEchoLen++] = c;
 }
 
-// Non-blocking: drain whatever bytes arrived since last call into the parser.
+// Non-blocking. Drains whatever bytes arrived since the last call into the
+// parser.
 static void gpsTick() {
   if (!gpsReady) return;
   if (gpsEchoUntil && (int32_t)(millis() - gpsEchoUntil) >= 0) {
@@ -1750,10 +1861,10 @@ static void gpsTick() {
 
   static unsigned long gpsLastDiag = 0;
   if (millis() - gpsLastDiag >= 5000) {
-    // ok = valid NMEA sentences (passed checksum), bad = corrupt (failed),
-    // together they tell garbage-on-the-wire (ok≈0, bad climbing) apart from
-    // valid-NMEA-but-no-fix-yet (ok climbing, fixsent still 0). fixsent only
-    // counts fix-carrying sentences, so it stays 0 until a lock.
+    // ok counts sentences that passed checksum and bad those that failed.
+    // Together they separate garbage on the wire (ok near 0, bad climbing) from
+    // valid NMEA with no fix yet (ok climbing, fixsent 0). fixsent counts only
+    // fix-carrying sentences, so it stays 0 until a lock.
     dualPrintf("[gps] chars=%lu ok=%lu bad=%lu fixsent=%lu fix=%d sats=%d\n",
                (unsigned long)gpsParser.charsProcessed(),
                (unsigned long)gpsParser.passedChecksum(),
@@ -1787,10 +1898,10 @@ static void gpsTick() {
       // its own epoch. isValid() is true for that default even alongside a good
       // position fix, so plausibility is the only test that catches it.
       //
-      // A capture cannot predate the build that produced it, which makes the
-      // build stamp a floor no correct clock can fail. Staying unanchored is a
-      // designed state: empty timestamp_utc, the boot-numbered directory, and
-      // clock_source "none". Adopting a wrong time is not.
+      // A capture cannot predate the build that produced it, so the build
+      // stamp is a floor no correct clock fails. Until a time clears it the
+      // session has no anchor, with an empty timestamp_utc, the boot-numbered
+      // directory and clock_source "none".
       if (unix_ < BIRDOSCOPE_BUILD_UNIX) {
         if (!gpsAnchorRefused) {
           gpsAnchorRefused = true;
@@ -1829,13 +1940,12 @@ void coreGpsStats(unsigned long& good, unsigned long& bad,
   sats    = gpsParser.satellites.isValid() ? (int)gpsParser.satellites.value() : -1;
 }
 
-// GPS presence probe: the runtime check for whether a module is actually wired.
-// Drains the UART into the parser for up to GPS_PRESENCE_PROBE_MS and returns
-// true the moment a checksum-valid NMEA sentence lands. passedChecksum(), rather
-// than charsProcessed(), is the signal, because an open or floating RX pin frames
-// line noise as bytes, so charsProcessed climbs even with no module. Noise cannot
-// forge a valid `$…*XX` checksum. Returns fast on a healthy module, around 1s,
-// and only burns the full window when GPS is genuinely absent.
+// GPS presence probe, the runtime check for a wired module. Drains the UART
+// into the parser for up to GPS_PRESENCE_PROBE_MS and returns true as soon as a
+// checksum-valid NMEA sentence arrives. The test uses passedChecksum(), since a
+// floating RX pin frames line noise as bytes and charsProcessed() climbs with
+// no module attached. A healthy module answers in about 1 s, and only a missing
+// one costs the full window.
 static bool gpsProbePresent() {
   unsigned long start = millis();
   while (millis() - start < GPS_PRESENCE_PROBE_MS) {
@@ -1849,9 +1959,9 @@ static bool gpsProbePresent() {
 #endif  // HAS_GPS
 
 // ============================================================
-// WIFI STATION CREDENTIALS (see core.h): {"ssid","pass"} on SPIFFS, set from
-// the web console. Used only by the NTP fallback below. Always compiled: any
-// board can fall back to NTP when its GPS module is absent.
+// WIFI STATION CREDENTIALS (see core.h). `{"ssid","pass"}` on SPIFFS, set from
+// the web console. Only the NTP fallback below reads them. Always compiled,
+// since any board can fall back to NTP when its GPS module is absent.
 // ============================================================
 
 bool coreWifiCredsHave() {
@@ -1891,13 +2001,12 @@ bool coreWifiCredsSave(const char* ssid, const char* pass) {
 }
 
 // ============================================================
-// PERSISTED SETTINGS: web-console tuning that has to survive a power cycle, in
-// one shared JSON file rather than one per setting, so the next knob costs no
-// extra loader.
+// PERSISTED SETTINGS. Web-console tuning that survives a power cycle, in one
+// shared JSON file.
 //
-// coreSettingsLoad() runs once from setup() after SPIFFS is up, and nothing reads
-// it lazily. Skip that call and the compiled-in defaults quietly stand, while
-// saving and reading back still appear to work within a single boot.
+// setup() must call coreSettingsLoad() once after SPIFFS is up, since nothing
+// loads it lazily. Without that call the compiled-in defaults stay in force,
+// though saving and reading back still work within one boot.
 // ============================================================
 
 void coreSetEnvDensity(uint8_t density) {
@@ -1905,14 +2014,14 @@ void coreSetEnvDensity(uint8_t density) {
 }
 
 void coreSetRssiAt1mDbm(int8_t dbm) {
-  // Clamped rather than rejected, so a mistyped value cannot produce absurd ranges.
+  // Clamp, so a mistyped value cannot produce absurd ranges.
   if (dbm > RSSI_AT_1M_MAX) dbm = RSSI_AT_1M_MAX;
   if (dbm < RSSI_AT_1M_MIN) dbm = RSSI_AT_1M_MIN;
   coreRssiAt1mDbm = dbm;
 }
 
 void coreNudgeRssiAt1mDbm(int8_t db) {
-  // int, not int8_t: a large step wraps and clamps to the wrong end.
+  // int, since an int8_t wraps on a large step and clamps to the wrong end.
   int v = (int)coreRssiAt1mDbm + (int)db;
   if (v > RSSI_AT_1M_MAX) v = RSSI_AT_1M_MAX;
   if (v < RSSI_AT_1M_MIN) v = RSSI_AT_1M_MIN;
@@ -1964,15 +2073,15 @@ void coreWifiCredsClear() {
 }
 
 // ============================================================
-// NTP FALLBACK: joins the saved station network, pulls UTC, and anchors time
-// via the libc clock. Runs only from coreTimeSync() when no GPS module was
-// detected. The no-creds path returns without touching the radio, so the sniffer
-// inits from cold. A join-attempted path always leaves WiFi OFF on exit.
+// NTP FALLBACK. Joins the saved station network, pulls UTC, and anchors time
+// through the libc clock. Runs only from coreTimeSync(), and only while GPS has
+// no anchor. Without credentials it returns without touching the radio, so the
+// sniffer inits from cold. After a join attempt it always leaves WiFi off.
 // ============================================================
 
 static bool     ntpTimeAnchored = false;
-// The anchor moment, not just the fact of it: the manifest needs the pair
-// that places every pre-anchor row retroactively.
+// The anchor moment. The manifest needs this pair to place every pre-anchor
+// row after the fact.
 static uint32_t ntpAnchorUnix = 0;
 static uint32_t ntpAnchorMs   = 0;
 
@@ -1980,17 +2089,15 @@ static void ntpSync() {
   String ssid, pass;
   if (!coreWifiCredsLoad(ssid, pass)) {
     dualPrintln("[bscope] no saved WiFi network - timestamping from boot");
-    return;   // never bring WiFi up: leave the radio clean for the sniffer
+    return;   // WiFi stays down, so the sniffer starts from a clean radio
   }
 
   WiFi.mode(WIFI_STA);
 
-  // Pre-scan before committing to the (blocking) join: on a GPS board this runs
-  // every boot to bridge the pre-lock window, and when mobile the saved network
-  // is usually out of range, so a short scan skips straight to millis() instead of
-  // burning the full NTP_JOIN_TIMEOUT_MS of dead air before scanning starts. A
-  // scan *failure* (not "absent") shouldn't permanently deny NTP, so fall through
-  // and attempt the join best-effort in that case.
+  // Scan before the blocking join. On a GPS board this runs every boot, and on
+  // the move the saved network is usually out of range, so a short scan skips
+  // to millis() without spending NTP_JOIN_TIMEOUT_MS first. A failed scan says
+  // nothing about range, so the join still runs, best effort.
   dualPrintf("[bscope] scanning for \"%s\"...\n", ssid.c_str());
   int  n       = WiFi.scanNetworks();
   bool inRange = (n < 0);   // scan failed → attempt join anyway
@@ -2042,16 +2149,13 @@ void coreTimeSync() {
     dualPrintln("[bscope] GPS module present - it will master timing once it locks");
   else
     dualPrintln("[bscope] no GPS module detected");
-  // A GPS module can't have a lock this early (cold-start takes far longer than
-  // the boot probe), so bridge the pre-lock window with NTP either way. If GPS
-  // is onboard it takes over the instant it locks, since gpsTick() sets the
-  // anchor and coreTimestampStr() prefers GPS over NTP, so this is a bridge
-  // rather than a demotion.
-  // Without a saved network ntpSync() is an instant no-op and we ride millis()
-  // until (if) GPS locks.
+  // GPS cannot lock this early, since a cold start takes far longer than the
+  // boot probe, so NTP bridges the pre-lock window either way. GPS takes over
+  // when it locks (see TIME SOURCE). Without a saved network ntpSync() returns
+  // at once, and timestamps count from millis() until GPS locks.
   if (!gpsTimeAnchored) ntpSync();
 #else
-  ntpSync();   // joins only if credentials are stored; otherwise millis()
+  ntpSync();   // joins only with stored credentials
 #endif
 }
 
@@ -2090,19 +2194,17 @@ static void coreTimestampStr(char* buf, size_t len) {
 // ============================================================
 // SD CARD
 //
-// SD logging is a session directory of roost record files, written in
-// lib/birdoscope_core/roost_session.cpp. Only the load counters below live
-// here: they measure the write path rather than format it.
+// roost_session.cpp writes the SD log, a session directory of roost record
+// files.
 // ============================================================
 
 // ============================================================
 // SERIAL JSON EMISSION
 // ============================================================
 //
-// Emits one JSON object per detection, one per line, over USB CDC serial. Any
-// serial consumer can ingest it, whether a downstream analysis tool reading the
-// port or a plain terminal. Schema inherited from upstream flock-you. GPS, when
-// present, comes from this board's own fix. A board without GPS emits "gps":null.
+// Emits one JSON object per detection per line over USB CDC serial, in the
+// upstream flock-you schema. GPS comes from this board's own fix, and a board
+// without GPS emits `"gps":null`.
 
 static void emitDetectionJSON(const char* mac, const char* method,
                               int8_t rssi, uint8_t ch, const char* ssid,
@@ -2115,8 +2217,9 @@ static void emitDetectionJSON(const char* mac, const char* method,
          &mbytes[0], &mbytes[1], &mbytes[2], &mbytes[3], &mbytes[4], &mbytes[5]);
   ouiFromMac(mbytes, oui, sizeof(oui));
 
-  // ap_mac: only present for oui_addr1, naming the AP whose probe response revealed
-  // the camera. Its position (from wardriving data) bounds the camera location.
+  // ap_mac appears only on an oui_addr1 hit, and names the AP whose probe
+  // response revealed the camera. Its position, from wardriving data, bounds
+  // the camera location.
   char apMacField[28];
   if (apMac && apMac[0])
     snprintf(apMacField, sizeof(apMacField), "\"%s\"", apMac);
@@ -2162,22 +2265,21 @@ static void emitDetectionJSON(const char* mac, const char* method,
 }
 
 // ============================================================
-// RSSI -> DISTANCE: log-distance path loss, with Environment Density picking n
+// RSSI TO DISTANCE. Log-distance path loss, with Environment Density picking n
 // and coreRssiAt1mDbm as the reference level.
 //
-// Callers skip addr1 hits, whose RSSI describes the AP->scanner path rather than
-// target->scanner; coreHandleAlert() already does. Both settings are runtime and
-// persisted, so this is not a pure function of the board config. RSSI_AT_1M and
-// the PATH_LOSS_N_* presets near the top of this file are only the defaults.
-// The model, calibration, and the invariants that fail quietly are documented
-// in docs/distance_estimation.md.
+// Callers skip addr1 hits, whose RSSI describes the AP-to-scanner path, and
+// coreHandleAlert() already does. Both settings are runtime and persisted, so
+// the result depends on more than the board config. RSSI_AT_1M and the
+// PATH_LOSS_N_* presets near the top of this file are only defaults.
+// docs/distance_estimation.md documents the model, calibration, and the
+// invariants that fail quietly.
 // ============================================================
 
 volatile uint8_t coreEnvDensity = DENSITY_MEDIUM;
 volatile int8_t  coreRssiAt1mDbm = RSSI_AT_1M;
 
-// Set after the dedupe gate, so it tracks readings the user was actually shown
-// rather than every rate-limited repeat.
+// Set after the dedupe gate, so it tracks only readings the user saw.
 static volatile int8_t lastDetectionRssi = 0;
 
 int8_t coreLastDetectionRssi() { return lastDetectionRssi; }
@@ -2206,19 +2308,17 @@ float coreRssiToDistanceM(int8_t rssi) {
                      / (10.0f * corePathLossExponent()));
 }
 
-// Defined further down alongside the rest of the notification module,
-// forward-declared here since coreHandleAlert() calls it directly instead
-// of leaving detection feedback to the board.
+// Defined with the notification module below. coreHandleAlert() calls it
+// directly.
 static void notifyDetection(bool chirpWorthy, bool rangeable, int8_t vendor);
 static void notifyProximity(int8_t vendor);
 
 // ============================================================
-// PROXIMITY ALERT: latched range ring, described in core.h. Three things keep
-// one ring from becoming a stream of chirps: the EMA absorbs the 6-10 dB
-// multipath swing, the latch makes a crossing an event rather than a state,
-// and the hysteresis band stops the latch re-arming on what jitter is left.
-// What the constants have to absorb is in docs/alerts.md, under the proximity
-// ring.
+// PROXIMITY ALERT, a latched range ring described in core.h. Three things stop
+// one ring from turning into a stream of chirps. The EMA absorbs the 6-10 dB
+// multipath swing, the latch makes a crossing an event, and the hysteresis band
+// stops the latch re-arming on leftover jitter. docs/alerts.md, under the
+// proximity ring, gives what the constants must absorb.
 // ============================================================
 
 const uint8_t PROX_RING_OPTIONS[PROX_RING_OPTION_COUNT] = { 0, 10, 25, 50, 100 };
@@ -2241,7 +2341,7 @@ int coreProxRingIndex() {
 // Updates the smoothed RSSI for one detection and returns true when this
 // reading is the inward crossing of the ring.
 static bool proximityEvaluate(int idx, AlertType type, int8_t rssi) {
-  if (idx < 0) return false;                    // table full: no row to hold state
+  if (idx < 0) return false;                    // table full, no row to hold state
   if (coreProxRingM == 0) return false;         // ring off
   // addr1 measures the AP that answered the probe, not the target. Same
   // exclusion coreHandleAlert() already applies to distM.
@@ -2252,10 +2352,9 @@ static bool proximityEvaluate(int idx, AlertType type, int8_t rssi) {
   if (seeding) {
     d.emaRssi = rssi;
   } else {
-    // Floored at 1 dB: a bare shift truncates differences under
-    // 2^PROX_EMA_SHIFT to zero and the average parks short of the reading
-    // forever, leaving a stationary target inside the ring silent. Computed in
-    // int space so the intermediate cannot wrap.
+    // The step floors at 1 dB. A bare shift truncates differences under
+    // 2^PROX_EMA_SHIFT to zero, so the average would never reach a steady
+    // reading. Computed in int space so the intermediate cannot wrap.
     int diff = (int)rssi - (int)d.emaRssi;
     int step = diff >> PROX_EMA_SHIFT;
     if (step == 0 && diff != 0) step = (diff > 0) ? 1 : -1;
@@ -2272,16 +2371,16 @@ static bool proximityEvaluate(int idx, AlertType type, int8_t rssi) {
   }
   if (d.proxLatched) return false;
   d.proxLatched = 1;
-  // A row seeded already inside latches silently: the new-detection chirp is
-  // firing for the same frame.
+  // A row seeded inside the ring latches silently, since the new-detection
+  // chirp fires for the same frame.
   return !seeding;
 }
 
 // ============================================================
-// coreHandleAlert: the shareable middle of drainAlertQueue(), covering detection
-// table update, SD log append, dedupe gate, serial DETECT line, JSON emit,
-// LED/buzzer notification. Boards call this once per dequeued AlertEntry
-// and use the result for display state.
+// coreHandleAlert(), the shared middle of drainAlertQueue(). It updates the
+// detection table, appends the SD log row, applies the dedupe gate, prints the
+// DETECT line, emits JSON and notifies on the LED and buzzer. Boards call it
+// once per dequeued AlertEntry and use the result for display state.
 // ============================================================
 
 CoreAlertResult coreHandleAlert(const AlertEntry& e) {
@@ -2302,18 +2401,35 @@ CoreAlertResult coreHandleAlert(const AlertEntry& e) {
     return r;
   }
 
+  // Re-matched here to keep AlertEntry small. -1 for an ALERT_SSID hit, which
+  // matched on name.
+  const int ouiIdx = matchOuiIndex(e.mac);
+  r.vendor = ouiIdx < 0 ? -1 : (int8_t)oui_table[ouiIdx].vendor;
+
+  // An infra match writes its row and nothing else. It takes no detection
+  // table slot, refreshes no active-target state and never alerts, spec M8.
+  if (ouiIdx >= 0 && oui_table[ouiIdx].cls == OUI_CLASS_INFRA) {
+#if USE_SD
+    roostLogWifiObs(e, method);
+#endif
+    r.detIdx     = -1;
+    r.suppressed = true;
+    r.type       = e.type;
+    return r;
+  }
+
   char apMacStr[18] = "";
   if (e.type == ALERT_OUI_ADDR1) macToStr(e.addr2, apMacStr, sizeof(apMacStr));
 
   float distM = (e.type != ALERT_OUI_ADDR1) ? coreRssiToDistanceM(e.rssi) : -1.0f;
 
   bool chirpWorthy = false;
-  // Direct: the camera itself transmitted, so the RSSI describes the path to
-  // it. Only an addr1 hit does not.
+  // Direct when the camera itself transmitted, so the RSSI describes the path
+  // to it. Every type except an addr1 hit is direct.
   bool direct = (e.type != ALERT_OUI_ADDR1);
-  // The detection table is a display surface and holds a printable name; the
-  // record column takes the octets and the length instead. One conversion,
-  // here, rather than each consumer deciding what an empty SSID means.
+  // The detection table feeds the display and holds a printable name. The
+  // record column takes the octets and the length. Convert once here, so no
+  // consumer decides for itself what an empty SSID means.
   int idx = fyAddDetection(r.macStr, method, e.rssi, e.channel,
                             roostSsidPrintable(&e.ssid),
                             direct, &chirpWorthy);
@@ -2326,8 +2442,7 @@ CoreAlertResult coreHandleAlert(const AlertEntry& e) {
   // dedupe gate below rate-limits its serial/JSON/display output.
   fyLastTargetSeen = millis();
 
-  // Same reasoning: the tallies count what the radio heard, not what the
-  // device announced.
+  // The tallies likewise count what the radio heard, ahead of the dedupe gate.
   tallyFrame(e.type);
 
   r.detIdx      = idx;
@@ -2339,9 +2454,6 @@ CoreAlertResult coreHandleAlert(const AlertEntry& e) {
   r.type        = e.type;
   strlcpy(r.frameKind, e.frameKind, sizeof(r.frameKind));
   ouiFromMac(e.mac, r.oui, sizeof(r.oui));
-  // Re-matched rather than carried on the queue, keeping AlertEntry small. -1 for
-  // an ALERT_SSID hit, which matched on name rather than OUI.
-  r.vendor = (int8_t)matchOuiRaw(e.mac);
 
   // Ahead of the dedupe gate, which would swallow the crossing, and outside
   // it, since that gate owns the DETECT line and the JSON emit. Skipped when
@@ -2355,7 +2467,7 @@ CoreAlertResult coreHandleAlert(const AlertEntry& e) {
     return r;
   }
   r.suppressed = false;
-  lastDetectionRssi = e.rssi;   // calibration reference; see coreLastDetectionRssi()
+  lastDetectionRssi = e.rssi;   // calibration reference, see coreLastDetectionRssi()
 
   // The printable name, once, for every display consumer below.
   const char* name = roostSsidPrintable(&e.ssid);
@@ -2372,21 +2484,20 @@ CoreAlertResult coreHandleAlert(const AlertEntry& e) {
   }
 
   emitDetectionJSON(r.macStr, method, e.rssi, e.channel, name, apMacStr);
-  // distM is already -1 for exactly the addr1 hits, so it is the predicate
-  // rather than a second copy of the type test.
+  // distM is -1 for exactly the addr1 hits, so it serves as the predicate.
   notifyDetection(r.chirpWorthy, r.distM >= 0.0f, r.vendor);
   return r;
 }
 
 // ============================================================
-// NOTIFICATIONS: LED (NeoPixel) and buzzer.
+// NOTIFICATIONS, LED (NeoPixel) and buzzer.
 //
-// A detection encodes two facts at once. Colour carries the vendor, so which
-// fleet was seen is readable without looking at the panel, and pulse count
-// carries whether the MAC is new. Trains are stepped from ledTick() rather than
-// blocking, since notifyDetection() runs in the alert drain path. Both the
-// detection and heartbeat paths honour coreLedEnabled and coreBuzzerEnabled; the
-// boot jingle, RGB cycle and on-demand replay hooks do not. See docs/alerts.md.
+// A detection shows two facts at once. Colour shows the vendor, so the fleet is
+// readable without the panel, and pulse count shows whether the MAC is new.
+// ledTick() steps the pulse trains, since notifyDetection() runs in the alert
+// drain path and must not block. The detection and heartbeat paths honour
+// coreLedEnabled and coreBuzzerEnabled. The boot jingle, RGB cycle and replay
+// hooks ignore them. See docs/alerts.md.
 // ============================================================
 
 // Per-vendor detection colours, overridable per board alongside the other
@@ -2437,8 +2548,8 @@ static inline void ledSet(uint8_t r, uint8_t g, uint8_t b) {
 #endif
 }
 
-// Equal on/off intervals of ledPulseMs until ledPulsesLeft is exhausted, then
-// parks the LED off and goes idle. Called from coreNotifyTick() every loop().
+// Equal on/off intervals of ledPulseMs until ledPulsesLeft reaches zero, then
+// parks the LED off and goes idle. coreNotifyTick() calls it every loop().
 static void ledTick() {
 #if USE_LED
   if (!ledNextAt) return;                              // idle
@@ -2465,7 +2576,7 @@ static void ledBlink(uint8_t r, uint8_t g, uint8_t b, unsigned ms, uint8_t pulse
   ledPulseMs = ms;
   ledPulsesLeft = pulses;
   ledLit = false;
-  ledNextAt = 1;    // any nonzero past time; the tick below lights pulse one
+  ledNextAt = 1;    // any nonzero past time, so the tick below lights pulse one
   ledTick();        // light it now instead of up to one loop() later
 #endif
 }
@@ -2474,7 +2585,7 @@ static void ledFlash(uint8_t r, uint8_t g, uint8_t b, unsigned ms) {
   ledBlink(r, g, b, ms, 1);
 }
 
-// Two fast ascending beeps, played on the FIRST sighting of a MAC.
+// Two fast ascending beeps, played on the first sighting of a MAC.
 static void newDetectChirp() {
 #if USE_BUZZER
   tone(BUZZER_PIN, NEW_CHIRP_LO_HZ); delay(NEW_CHIRP_NOTE_MS); noTone(BUZZER_PIN);
@@ -2484,7 +2595,7 @@ static void newDetectChirp() {
 }
 
 // Three descending beeps on a ring crossing, against the new-detection
-// chirp's two ascending. Tones default off NEW_CHIRP_*, so a board that tuned
+// chirp's two ascending. Tones default to NEW_CHIRP_*, so a board that tuned
 // its chirp for its own piezo gets a matching one here.
 #if USE_BUZZER
 #ifndef PROX_CHIRP_HI_HZ
@@ -2514,22 +2625,22 @@ static void proximityChirp() {
 #endif
 }
 
-// Silent despite the name: a purple LED pulse while a target is still in range
-// (last seen within HB_DEVICE_ACTIVE_MS). Uncalled on screen models, spec A1.
+// Silent despite the name. Pulses the LED purple while a target stays in range,
+// last seen within HB_DEVICE_ACTIVE_MS. Uncalled on screen models, spec A1.
 __attribute__((unused))
 static void heartbeatBeep() {
 #if USE_LED
-  if (!coreLedEnabled) return;   // Alerts menu: LED off
+  if (!coreLedEnabled) return;   // LED off in the Alerts menu
   ledFlash(LED_COLOR_HB_R, LED_COLOR_HB_G, LED_COLOR_HB_B, LED_FLASH_MS);
 #endif
 }
 
 // ---- Boot call --------------------------------------------------------------
 //
-// Bird calls approximated on a single-square-wave element by cadence and pitch
-// glide, with a frequency wobble standing in for rasp. Tones are transposed
-// into the element's efficient band rather than set at a call's true pitch.
-// Spec A5; see docs/alerts.md for the acoustics and the tuning knobs.
+// Approximates bird calls on a single square-wave element by cadence and pitch
+// glide, with a frequency wobble standing in for rasp. Each call plays in the
+// element's efficient band, transposed from its true pitch.
+// Spec A5. docs/alerts.md covers the acoustics and the tuning knobs.
 #define BOOT_SOUND_JINGLE 0   // six-note descending motif, the original
 #define BOOT_SOUND_CROW   1   // "ca-CAW ca-CAW"
 #define BOOT_SOUND_HAWK   2   // "kee-ahrrr", a single descending scream
@@ -2546,8 +2657,8 @@ static void heartbeatBeep() {
 #define BIRD_STEP_MS  6
 #endif
 
-// One syllable: glides f0 to f1 over ms, roughened by raspPct. Blocking, like
-// every other player here, and boot/serial context is the only caller.
+// One syllable, a glide from f0 to f1 over ms, roughened by raspPct. Blocking
+// like every other player here, so only boot and serial context call it.
 static void birdSyllable(uint16_t f0, uint16_t f1, uint16_t ms, uint8_t raspPct) {
 #if USE_BUZZER
   const uint16_t steps = ms / BIRD_STEP_MS;
@@ -2563,7 +2674,7 @@ static void birdSyllable(uint16_t f0, uint16_t f1, uint16_t ms, uint8_t raspPct)
 }
 
 // A clipped grace note into a longer accented one that falls away, twice. The
-// repeat is what reads as a call rather than as two unrelated beeps.
+// repeat makes it read as a call.
 static void crowCall() {
   for (int i = 0; i < 2; i++) {
     birdSyllable(1450, 1330,  60, BIRD_RASP_PCT);   // "ca"
@@ -2583,7 +2694,7 @@ static void hawkCall() {
 static void legacyJingle() {
 #if USE_BUZZER
   // First 6 notes of SMB World 1-2 (underground). Koji Kondo's descending
-  // pattern: C5 → C4 → A4 → A3 → G#4 → G#3 (alternating-octave pairs).
+  // pattern, C5 C4 A4 A3 G#4 G#3, in alternating-octave pairs.
   static const uint16_t notes[6] = { 523, 262, 440, 220, 415, 208 };
   for (int i = 0; i < 6; i++) {
     tone(BUZZER_PIN, notes[i]);
@@ -2613,11 +2724,11 @@ void corePlayProximityChirp() { proximityChirp(); }
 void corePlayCrowCall()       { crowCall(); }
 void corePlayHawkCall()       { hawkCall(); }
 
-// Uncalled on any board with a display, per spec A1. Retained for display-less
-// boards: call heartbeatTick() from coreNotifyTick() to re-enable.
-// fyLastHeartbeatAt is kept current by notifyDetection() so the phase survives.
+// Uncalled on any board with a display, per spec A1. A display-less board
+// re-enables it by calling heartbeatTick() from coreNotifyTick().
+// notifyDetection() keeps fyLastHeartbeatAt current, so the phase survives.
 
-// Last time the heartbeat pulse fired. When nothing has been seen for
+// Last time the heartbeat pulse fired. When no target appears for
 // HB_DEVICE_ACTIVE_MS the heartbeat stops until the next new detection.
 static unsigned long fyLastHeartbeatAt = 0;
 
@@ -2645,13 +2756,13 @@ static void vendorLedColor(int8_t vendor, uint8_t& r, uint8_t& g, uint8_t& b) {
 }
 #endif
 
-// New MAC chirps and blinks twice; a repeat is silent and blinks once. Colour
-// carries vendor, pulse count carries new-versus-repeat. See docs/alerts.md.
+// A new MAC chirps and blinks twice, and a repeat blinks once in silence. See
+// docs/alerts.md.
 //
-// `rangeable` gates the buzzer only, never the LED: spec A2 and A3.
+// `rangeable` gates the buzzer and never the LED, spec A2 and A3.
 static void notifyDetection(bool chirpWorthy, bool rangeable, int8_t vendor) {
   if (chirpWorthy && rangeable) {
-    if (coreBuzzerEnabled) newDetectChirp();   // Alerts menu: buzzer mute
+    if (coreBuzzerEnabled) newDetectChirp();   // buzzer muted in the Alerts menu
     // Reset the heartbeat phase so the first follow-up beep lands
     // HB_BEEP_INTERVAL_MS after the initial chirp, not mid-window.
     fyLastHeartbeatAt = millis();
@@ -2667,8 +2778,8 @@ static void notifyDetection(bool chirpWorthy, bool rangeable, int8_t vendor) {
 #endif
 }
 
-// A ring crossing: three pulses against two-for-new and one-for-repeat, with
-// colour still carrying the vendor.
+// A ring crossing pulses three times, against two for new and one for repeat.
+// Colour still shows the vendor.
 static void notifyProximity(int8_t vendor) {
   if (coreBuzzerEnabled) proximityChirp();
 #if USE_LED
@@ -2692,7 +2803,8 @@ void coreNotifyBoot() {
   startupBeep();
 
 #if USE_LED
-  // RGB sanity check: cycle R → G → B so a wiring or dead-pixel fault is obvious.
+  // RGB sanity check. Cycles red, green, blue so a wiring or dead-pixel fault
+  // is obvious.
   ledSet(255, 0,   0);   delay(200);
   ledSet(0,   255, 0);   delay(200);
   ledSet(0,   0,   255); delay(200);
@@ -2721,7 +2833,7 @@ void coreLedBlink(uint8_t r, uint8_t g, uint8_t b,
 }
 
 // ============================================================
-// INPUT: plain debounced buttons
+// INPUT, plain debounced buttons
 // ============================================================
 
 #if HAS_BUTTONS
@@ -2764,9 +2876,9 @@ InputEvent coreInputTick() {
 }
 
 // ============================================================
-// SEMANTIC NAV LAYER, described in core.h. A small event queue fed by both the serial
-// injector (coreInjectNav) and the physical buttons (coreNavTick, 3-button
-// scheme only), plus the screen-carousel state machine (coreNavApply).
+// SEMANTIC NAV LAYER, described in core.h. The serial injector (coreInjectNav)
+// and the three- or four-button schemes (coreNavTick) feed a small event queue.
+// coreNavApply() runs the screen-carousel state machine.
 // ============================================================
 
 #define NAV_QUEUE_SIZE 8
@@ -2790,7 +2902,7 @@ static NavEvent navQPop() {
 NavEvent coreNavTick() {
 #if NAV_BTN_COUNT
   // Per-button edge + long-press tracker. Index i = BTN_(i+1). A short press
-  // fires on release, so it can be distinguished from a long. A long press
+  // fires on release, so the tracker can tell it from a long one. A long press
   // fires the moment it crosses NAV_LONG_PRESS_MS while still held, so
   // MARK/BACK feel immediate. Buttons are active-LOW (INPUT_PULLUP).
   static bool          initialized = false;
@@ -2799,6 +2911,7 @@ NavEvent coreNavTick() {
   static unsigned long pressedAt[NAV_BTN_COUNT];
   static bool          longFired[NAV_BTN_COUNT];
   static bool          holdFired[NAV_BTN_COUNT];
+  static unsigned long lastBackMs[NAV_BTN_COUNT];   // 0 = no press pending a pair
 #if NAV_SCHEME_4BTN
   // A dedicated BACK button frees BTN_3 of its long press.
   static const uint8_t  pins[4]    = { BTN_PIN_1, BTN_PIN_2, BTN_PIN_3, BTN_PIN_4 };
@@ -2814,7 +2927,7 @@ NavEvent coreNavTick() {
     for (int i = 0; i < NAV_BTN_COUNT; i++) {
       pinMode(pins[i], INPUT_PULLUP);
       last[i] = HIGH; changedAt[i] = 0; pressedAt[i] = 0;
-      longFired[i] = false; holdFired[i] = false;
+      longFired[i] = false; holdFired[i] = false; lastBackMs[i] = 0;
     }
     initialized = true;
   }
@@ -2831,6 +2944,15 @@ NavEvent coreNavTick() {
         holdFired[i] = false;
       } else if (!longFired[i]) {               // release without a prior long → short
         coreInjectNav(shortEv[i]);
+        // Two Back presses inside NAV_BACK_DOUBLE_MS also emit NAV_BACK_HOLD.
+        if (shortEv[i] == NAV_BACK) {
+          if (lastBackMs[i] != 0 && now - lastBackMs[i] <= NAV_BACK_DOUBLE_MS) {
+            coreInjectNav(NAV_BACK_HOLD);
+            lastBackMs[i] = 0;                  // consume, no triple-press retrigger
+          } else {
+            lastBackMs[i] = now;
+          }
+        }
       }
     }
     // Long press fires once, while still held, as soon as the threshold passes.
@@ -2842,7 +2964,7 @@ NavEvent coreNavTick() {
     // Whichever button carries BACK, on either scheme, also emits NAV_BACK_HOLD
     // once held this long. Setting longFired suppresses the short-press BACK on
     // release, so a 4-button hold is never also a click. A 3-button BACK has
-    // already fired by this point and is discarded by the only consumer.
+    // already fired by this point, and its only consumer discards it.
     if (last[i] == LOW && !holdFired[i]
         && (shortEv[i] == NAV_BACK || longEv[i] == NAV_BACK)
         && now - pressedAt[i] >= NAV_EXIT_HOLD_MS) {
@@ -2850,16 +2972,16 @@ NavEvent coreNavTick() {
       holdFired[i] = true;
       longFired[i] = true;
     }
+    if (lastBackMs[i] != 0 && now - lastBackMs[i] > NAV_BACK_DOUBLE_MS) lastBackMs[i] = 0;
   }
 #endif
   return navQPop();
 }
 
 // ------------------------------------------------------------
-// SCREEN CAROUSEL + MENU DRILL-IN: top-level Up/Down cycle the six screens.
-// SELECT on a menu screen (SCAN_MODES / CONFIG) drills into an option list, and
-// selecting Single opens a channel picker. MARK is available at every level.
-// See docs/menu_ux.md.
+// SCREEN CAROUSEL AND MENU DRILL-IN. Up and Down cycle the top-level screens.
+// SELECT on a menu screen opens its option list, and selecting Single or
+// Proximity opens a picker. MARK works at every level. See docs/menu_ux.md.
 // ------------------------------------------------------------
 
 ScreenId  coreCurrentScreen = SCREEN_OVERVIEW;
@@ -2872,7 +2994,7 @@ WipeScope coreWipeSelectedScope() { return g_wipeScope; }
 
 NavAction coreNavApply(NavEvent ev) {
   // Available on every screen and menu except an armed wipe, where only Select
-  // and Back are live and a mark would write a row about to be erased.
+  // and Back work and a mark would write a row the wipe then erases.
   if (ev == NAV_MARK)
     return (coreMenuState == MENU_CONFIRM_WIPE) ? NAV_ACT_NONE : NAV_ACT_MARK;
 
@@ -2881,10 +3003,10 @@ NavAction coreNavApply(NavEvent ev) {
   case MENU_NONE:
     switch (ev) {
       case NAV_UP:      // advance forward through the screens (wraps at SCREEN_COUNT)
-        coreCurrentScreen = (ScreenId)((coreCurrentScreen + 1) % SCREEN_COUNT);
+        coreCurrentScreen = coreStepScreen(coreCurrentScreen, +1);
         return NAV_ACT_REDRAW;
       case NAV_DOWN:    // go back a screen (wraps)
-        coreCurrentScreen = (ScreenId)((coreCurrentScreen + SCREEN_COUNT - 1) % SCREEN_COUNT);
+        coreCurrentScreen = coreStepScreen(coreCurrentScreen, -1);
         return NAV_ACT_REDRAW;
       case NAV_SELECT:
         if (coreCurrentScreen == SCREEN_SCAN_MODES) {
@@ -2898,6 +3020,11 @@ NavAction coreNavApply(NavEvent ev) {
           coreMenuSel   = (t >= 0) ? t : 0;           // start on the active set
           return NAV_ACT_REDRAW;
         }
+        if (coreCurrentScreen == SCREEN_RADIO) {
+          coreMenuState = MENU_LIST;
+          coreMenuSel   = (int)coreRadioMode;         // the enum is the row index
+          return NAV_ACT_REDRAW;
+        }
         if (coreCurrentScreen == SCREEN_ALERTS) {
           coreMenuState = MENU_LIST;
           coreMenuSel   = 0;                          // start on the Buzzer row
@@ -2905,7 +3032,7 @@ NavAction coreNavApply(NavEvent ev) {
         }
         if (coreCurrentScreen == SCREEN_CONFIG) {
           coreMenuState = MENU_LIST;
-          coreMenuSel   = 1;                          // Off, the portal is closed while browsing Detect
+          coreMenuSel   = 1;                          // Off, since the portal stays closed while browsing Detect
           return NAV_ACT_REDRAW;
         }
         if (coreCurrentScreen == SCREEN_WIPE) {
@@ -2913,9 +3040,9 @@ NavAction coreNavApply(NavEvent ev) {
           coreMenuSel   = 0;                          // the narrower scope, device only
           return NAV_ACT_REDRAW;
         }
-        return NAV_ACT_NONE;                           // info screens: nothing to select
+        return NAV_ACT_NONE;                           // info screens have nothing to select
       default:
-        return NAV_ACT_NONE;                           // BACK at top level: nothing
+        return NAV_ACT_NONE;                           // BACK at top level does nothing
     }
 
   case MENU_LIST: {
@@ -2923,7 +3050,8 @@ NavAction coreNavApply(NavEvent ev) {
     int n;
     switch (coreCurrentScreen) {
       case SCREEN_SCAN_MODES: n = 3; break;
-      case SCREEN_TARGETS:    n = 3; break;
+      case SCREEN_TARGETS:    n = TARGET_ROW_COUNT; break;
+      case SCREEN_RADIO:      n = RADIO_MODE_COUNT; break;
       case SCREEN_ALERTS:     n = 3; break;   // Buzzer / LED / Proximity
       default:                n = 2; break;   // CONFIG / WIPE
     }
@@ -2933,27 +3061,33 @@ NavAction coreNavApply(NavEvent ev) {
       case NAV_BACK: coreMenuState = MENU_NONE;               return NAV_ACT_REDRAW;
       case NAV_SELECT:
         if (coreCurrentScreen == SCREEN_ALERTS) {
-          // Toggle the highlighted gate in place and stay in the list so both
-          // rows can be flipped before long-Back pops out (unlike the act-and-
-          // close Scan Mode / Config menus).
+          // Toggle the highlighted gate and stay in the list, so the operator
+          // can flip several rows before Back steps out.
           if (coreMenuSel == 0)      coreBuzzerEnabled = !coreBuzzerEnabled;  // Buzzer
           else if (coreMenuSel == 1) coreLedEnabled    = !coreLedEnabled;     // LED
           else {
-            // Proximity is a range rather than a gate, so it drills into a
-            // picker instead of flipping. Same shape as Single → channel.
+            // Proximity is a range, so it opens a picker, like Single and its
+            // channel picker.
             coreMenuState = MENU_PICK_PROX;
             const int p   = coreProxRingIndex();
             coreMenuSel   = (p >= 0) ? p : 0;
           }
           return NAV_ACT_REDRAW;
         }
+        if (coreCurrentScreen == SCREEN_RADIO) {
+          // Act-and-close. coreSetRadioMode() ignores a repeat of the active
+          // mode.
+          if (coreMenuSel >= 0 && coreMenuSel < RADIO_MODE_COUNT)
+            coreSetRadioMode((RadioMode)coreMenuSel);
+          coreMenuState = MENU_NONE;
+          return NAV_ACT_REDRAW;
+        }
         if (coreCurrentScreen == SCREEN_TARGETS) {
           // Act-and-close, like Scan Mode. Switching the mask is a single byte
           // store, so the sniffer keeps running across the change.
-          if (coreMenuSel >= 0 && coreMenuSel < 3) {
+          if (coreMenuSel >= 0 && coreMenuSel < TARGET_ROW_COUNT) {
             coreSetVendorMask(TARGET_MASKS[coreMenuSel]);
-            dualPrintf("[bscope] targets -> %s\n",
-                       coreMenuSel == 0 ? "flock" : coreMenuSel == 1 ? "axon" : "all");
+            dualPrintf("[bscope] targets -> %s\n", coreTargetRowName(coreMenuSel));
           }
           coreMenuState = MENU_NONE;
           return NAV_ACT_REDRAW;
@@ -2970,8 +3104,8 @@ NavAction coreNavApply(NavEvent ev) {
           return NAV_ACT_REDRAW;
         }
         if (coreCurrentScreen == SCREEN_WIPE) {
-          // Selecting a scope only arms the confirmation; nothing is erased
-          // until WIPE_CONFIRM_PRESSES more Selects land.
+          // Selecting a scope only arms the confirmation. The wipe waits for
+          // WIPE_CONFIRM_PRESSES more Selects.
           g_wipeScope          = (coreMenuSel == 1) ? WIPE_DEVICE_AND_CARD : WIPE_DEVICE;
           coreWipeConfirmCount = 0;
           coreMenuState        = MENU_CONFIRM_WIPE;
@@ -2998,13 +3132,13 @@ NavAction coreNavApply(NavEvent ev) {
         coreMenuState        = MENU_LIST;
         return NAV_ACT_REDRAW;
       default:
-        return NAV_ACT_NONE;   // Up/Down inert: an armed wipe takes no navigation
+        return NAV_ACT_NONE;   // Up and Down do nothing while a wipe is armed
     }
 
   case MENU_PICK_PROX:
     switch (ev) {
-      // Wraps, unlike the channel picker: this is a short option list, not a
-      // dialled number with meaningful ends.
+      // Wraps, since this is a short option list. The channel picker dials a
+      // number with meaningful ends.
       case NAV_UP:
         coreMenuSel = (coreMenuSel + PROX_RING_OPTION_COUNT - 1) % PROX_RING_OPTION_COUNT;
         return NAV_ACT_REDRAW;
@@ -3014,8 +3148,8 @@ NavAction coreNavApply(NavEvent ev) {
       case NAV_SELECT:
         if (coreMenuSel >= 0 && coreMenuSel < PROX_RING_OPTION_COUNT) {
           coreSetProxRingM(PROX_RING_OPTIONS[coreMenuSel]);
-          // Persisted on the spot: it is calibration-class, like density and
-          // rssi_1m, not a session gate like the Buzzer and LED rows above it.
+          // Persisted at once. It is a calibration setting like density and
+          // rssi_1m, where the Buzzer and LED rows are session gates.
           coreSettingsSave();
           dualPrintf("[bscope] proximity ring -> %um\n", (unsigned)coreProxRingM);
         }
@@ -3052,10 +3186,10 @@ NavAction coreNavApply(NavEvent ev) {
   return NAV_ACT_NONE;
 }
 
-// Anytime BOOT double-press detector, described in core.h. Watches for two debounced
-// presses within BOOT_DOUBLE_PRESS_MS and fires once per gesture. Works at any
-// time (not a post-boot window) so Detect↔Admin can be hopped repeatedly. BOOT
-// is active-LOW (INPUT_PULLUP, idles HIGH).
+// Anytime BOOT double-press detector, described in core.h. Watches for two
+// debounced presses within BOOT_DOUBLE_PRESS_MS and fires once per gesture.
+// Works at any time, so the operator can hop between Detect and Admin
+// repeatedly. BOOT is active-LOW (INPUT_PULLUP, idles HIGH).
 bool coreAdminTriggerCheck() {
 #if !BOOT_ADMIN_TRIGGER
   return false;
@@ -3082,7 +3216,7 @@ bool coreAdminTriggerCheck() {
         lastPressMs = 0;                                    // consume, no triple-press retrigger
         return true;
       }
-      lastPressMs = now;                                    // first press; wait for the second
+      lastPressMs = now;                                    // first press, wait for the second
     }
   }
   // Expire a lone first press so it can't pair with a much-later press.
@@ -3091,12 +3225,11 @@ bool coreAdminTriggerCheck() {
 #endif
 }
 
-// Raw-IDF promiscuous capture bring-up, described in core.h. Factored out of every
-// board's setup() so webPortalStop() can re-run it verbatim when it releases
-// the AP and resumes Detect (the portal deinits this driver to hand the radio
-// to Arduino WiFi). Idempotent from a clean/deinit'd driver state.
-// Reports a failed bring-up step instead of aborting on it, spec G1. Without
-// this a dead radio reports itself healthy: sniffing=1 and no frames.
+// Raw-IDF promiscuous capture bring-up, described in core.h. coreRadioStart()
+// calls it in 2.4 GHz mode, so it re-runs when webPortalStop() releases the AP,
+// since the portal deinits this driver to hand the radio to Arduino WiFi.
+// Idempotent from a clean or deinit'd driver. Reports each failed bring-up step
+// and continues, spec G1, so a dead radio cannot report itself healthy.
 #define WIFI_TRY(call)                                                  \
   do {                                                                  \
     esp_err_t _e = (call);                                              \
@@ -3105,8 +3238,20 @@ bool coreAdminTriggerCheck() {
   } while (0)
 
 void coreWifiSnifferStart() {
-  // Left unwrapped: returns ESP_ERR_INVALID_STATE whenever the loop already
-  // exists, which is the normal path when webPortalStop() hands the radio back.
+  // Before the driver allocates, while the largest block is still free.
+  if (!alertQueue) {
+    AlertEntry* q = (AlertEntry*)radioAlloc(ALERT_QUEUE_SIZE * sizeof(AlertEntry),
+                                            "alert queue");
+    portENTER_CRITICAL(&queueMux);
+    alertHead = alertTail = 0;
+    alertQueue = q;
+    portEXIT_CRITICAL(&queueMux);
+  }
+  limitStart(&surveyLimit, SURVEY_DEDUPE_SLOTS, SURVEY_DEDUPE_MS, "survey limit", false);
+  limitStart(&infraLimit, INFRA_DEDUPE_SLOTS, INFRA_DEDUPE_MS, "infra limit", false);
+
+  // Left unwrapped. It returns ESP_ERR_INVALID_STATE whenever the loop already
+  // exists, the normal path when webPortalStop() hands the radio back.
   esp_event_loop_create_default();
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   WIFI_TRY(esp_wifi_init(&cfg));
@@ -3114,8 +3259,8 @@ void coreWifiSnifferStart() {
   WIFI_TRY(esp_wifi_set_mode(WIFI_MODE_NULL));
   WIFI_TRY(esp_wifi_start());
 
-  // Its esp_wifi_set_channel() runs before promiscuous mode is enabled and can
-  // fail there legitimately; updateChannelMode() sets the channel a hop later.
+  // Its esp_wifi_set_channel() runs before promiscuous mode starts and can fail
+  // there legitimately. updateChannelMode() sets the channel a hop later.
   applyInitialChannel();
 
   wifi_promiscuous_filter_t filt = {
@@ -3133,12 +3278,415 @@ void coreWifiSnifferStart() {
   sniffingStopped = false;
 }
 
+void coreWifiSnifferStop() {
+  sniffingStopped = true;
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_stop();
+  esp_wifi_deinit();
+
+  // The callback has stopped, so the rows still queued are the last ones.
+  // They reach the log before the queue goes.
+  AlertEntry e;
+  while (coreDequeueAlert(e)) coreHandleAlert(e);
+  portENTER_CRITICAL(&queueMux);
+  AlertEntry* q = alertQueue;
+  alertQueue = nullptr;
+  portEXIT_CRITICAL(&queueMux);
+  free(q);
+  limitStop(&surveyLimit);
+  limitStop(&infraLimit);
+}
+
+// BLE counters exist on every build, so `status` and the manifest read the same
+// fields whether or not the board scans.
+#ifndef BLE_QUEUE_SIZE
+#define BLE_QUEUE_SIZE 64
+#endif
+
+volatile uint32_t coreBleReports = 0;
+volatile uint32_t coreBlePhy1M = 0;
+volatile uint32_t coreBlePhyCoded = 0;
+volatile uint32_t coreBleQueueDrops = 0;
+volatile uint8_t  coreBleQueueDepthMax = 0;
+
+uint8_t coreBleQueueSize() { return BLE_QUEUE_SIZE; }
+
+BleDetection coreBleDet[MAX_BLE_DETECTIONS];
+uint16_t     coreBleDetCount  = 0;
+uint16_t     coreBleDetMissed = 0;
+int16_t      coreBleDetLast   = -1;
+
+#if HAS_BLE_SCAN
+
+// BLE capture needs extended advertising for the coded PHY and every extended
+// report. A legacy-only build misses both, so the build refuses it.
+#if !defined(CONFIG_BT_NIMBLE_EXT_ADV) || CONFIG_BT_NIMBLE_EXT_ADV != 1
+#error "CONFIG_BT_NIMBLE_EXT_ADV=1 is required for BLE capture"
+#endif
+
+// Window equal to interval is a 100% duty cycle. Radio modes are exclusive, so
+// nothing shares the dwell.
+#ifndef BLE_SCAN_INTERVAL_MS
+#define BLE_SCAN_INTERVAL_MS 100
+#endif
+#ifndef BLE_SCAN_WINDOW_MS
+#define BLE_SCAN_WINDOW_MS 100
+#endif
+
+static portMUX_TYPE bleMux = portMUX_INITIALIZER_UNLOCKED;
+
+// ---- BLE detection table ---------------------------------------------------
+//
+// Fed from coreBleDrain() in loop() context, the same context that draws it.
+
+// Records a target row and alerts on it. A new device, or one silent for
+// REDISCOVER_MS, chirps. Repeats inside ALERT_COOLDOWN_MS stay silent, through
+// the gate the 802.11 path uses. BLE has no proximity ring and no distance
+// estimate, since the path-loss calibration is the 802.11 one. Spec B4.
+static bool bleRecordDetection(const BleObsEntry& e) {
+  char macStr[18];
+  macToStr(e.mac, macStr, sizeof(macStr));
+  const char* key = e.id[0] ? e.id : macStr;
+  const uint32_t now = millis();
+
+  bool chirpWorthy = false;
+  int idx = -1;
+  for (int i = 0; i < coreBleDetCount; i++) {
+    if (strcmp(coreBleDet[i].key, key) == 0) { idx = i; break; }
+  }
+  if (idx >= 0) {
+    BleDetection& d = coreBleDet[idx];
+    chirpWorthy = (now - d.lastSeen) > REDISCOVER_MS;
+    if (d.count < 0xFFFF) d.count++;
+    d.lastSeen = now;
+    d.rssi     = e.rssi;
+    strlcpy(d.mac, macStr, sizeof(d.mac));
+  } else if (coreBleDetCount < MAX_BLE_DETECTIONS) {
+    idx = coreBleDetCount++;
+    BleDetection& d = coreBleDet[idx];
+    strlcpy(d.key, key, sizeof(d.key));
+    strlcpy(d.mac, macStr, sizeof(d.mac));
+    d.vendor    = e.vendor;
+    d.accessory = e.accessory;
+    d.rssi      = e.rssi;
+    d.count     = 1;
+    d.firstSeen = now;
+    d.lastSeen  = now;
+    chirpWorthy = true;
+  } else {
+    // No eviction, so a full table counts what it refused [S4].
+    if (coreBleDetMissed < 0xFFFF) coreBleDetMissed++;
+    return false;
+  }
+  coreBleDetLast   = (int16_t)idx;
+  fyLastTargetSeen = now;
+
+  if (shouldSuppressDuplicate(key)) return true;
+  dualPrintf("[bscope] DETECT-BLE %s key=%s mac=%s vendor=%s%s rssi=%d count=%u\n",
+             e.method, key, macStr, vendorName((uint8_t)e.vendor),
+             e.accessory ? " accessory" : "", (int)e.rssi,
+             (unsigned)coreBleDet[idx].count);
+  notifyDetection(chirpWorthy, true, e.vendor);
+  return true;
+}
+
+// ---- BLE row ring -----------------------------------------------------------
+//
+// NimBLE host task to loop(), apart from the 802.11 alert queue. A target row
+// may take any free slot. The ring refuses an infra row once it is three
+// quarters full, so infra sheds first under load. Spec B3.
+// The ring and the infra limiter exist only while the BLE scan runs.
+static BleObsEntry* bleQueue = nullptr;
+static size_t       bleHead = 0;   // written by the NimBLE host task
+static size_t       bleTail = 0;   // read by loop()
+
+
+static void bleEnqueue(const BleObsEntry& e, bool target) {
+  portENTER_CRITICAL(&bleMux);
+  if (!bleQueue) {   // the scan runs without its ring when allocation failed
+    coreBleQueueDrops = coreBleQueueDrops + 1;
+    portEXIT_CRITICAL(&bleMux);
+    return;
+  }
+  const size_t depth = (bleHead + BLE_QUEUE_SIZE - bleTail) % BLE_QUEUE_SIZE;
+  const size_t limit = target ? BLE_QUEUE_SIZE - 1 : (BLE_QUEUE_SIZE * 3) / 4;
+  if (depth >= limit) {
+    coreBleQueueDrops = coreBleQueueDrops + 1;
+    portEXIT_CRITICAL(&bleMux);
+    return;
+  }
+  bleQueue[bleHead] = e;
+  bleHead = (bleHead + 1) % BLE_QUEUE_SIZE;
+  if (depth + 1 > coreBleQueueDepthMax) coreBleQueueDepthMax = (uint8_t)(depth + 1);
+  portEXIT_CRITICAL(&bleMux);
+}
+
+bool coreBleDrain() {
+  BleObsEntry e;
+  bool changed = false;
+  for (;;) {
+    portENTER_CRITICAL(&bleMux);
+    if (!bleQueue || bleTail == bleHead) { portEXIT_CRITICAL(&bleMux); break; }
+    e = bleQueue[bleTail];
+    bleTail = (bleTail + 1) % BLE_QUEUE_SIZE;
+    portEXIT_CRITICAL(&bleMux);
+#if USE_SD
+    roostLogBleObs(e);
+#endif
+    if (e.target) changed |= bleRecordDetection(e);
+  }
+  return changed;
+}
+
+static const char* blePhyName(uint8_t phy) {
+  switch (phy) {
+    case BLE_HCI_LE_PHY_1M:    return "1m";
+    case BLE_HCI_LE_PHY_2M:    return "2m";
+    case BLE_HCI_LE_PHY_CODED: return "coded";
+    default:                   return "";
+  }
+}
+
+// The registry's ble_pdu_type. getAdvType() returns the HCI report event type,
+// so the cases use BLE_HCI_ADV_RPT_EVTYPE_*. The ADV_TYPE_* family overlaps it
+// numerically and would label every scan response adv_direct_ind.
+static const char* blePduTypeName(const NimBLEAdvertisedDevice *d) {
+  if (!d->isLegacyAdvertisement()) return "ext_adv_ind";
+  switch (d->getAdvType()) {
+    case BLE_HCI_ADV_RPT_EVTYPE_ADV_IND:     return "adv_ind";
+    case BLE_HCI_ADV_RPT_EVTYPE_DIR_IND:     return "adv_direct_ind";
+    case BLE_HCI_ADV_RPT_EVTYPE_SCAN_IND:    return "adv_scan_ind";
+    case BLE_HCI_ADV_RPT_EVTYPE_NONCONN_IND: return "adv_nonconn_ind";
+    case BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP:    return "scan_rsp";
+    default:                                 return "unknown";
+  }
+}
+
+// Runs on the NimBLE host task. Counts, matches and queues advertisements, and
+// queues an unmatched one only inside a survey window, spec B2.
+class BleScanCb : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice *d) override {
+    const uint8_t phy = d->getPrimaryPhy();
+    portENTER_CRITICAL(&bleMux);
+    coreBleReports = coreBleReports + 1;
+    if (phy == BLE_HCI_LE_PHY_CODED)   coreBlePhyCoded = coreBlePhyCoded + 1;
+    else if (phy == BLE_HCI_LE_PHY_1M) coreBlePhy1M = coreBlePhy1M + 1;
+    portEXIT_CRITICAL(&bleMux);
+
+    // NimBLE stores the address little-endian. Reverse it to wire order for the
+    // OUI table.
+    uint8_t mac[6];
+    const uint8_t *val = d->getAddress().getVal();
+    for (int i = 0; i < 6; i++) mac[i] = val[5 - i];
+
+    const std::vector<uint8_t> &payload = d->getPayload();
+    BleMatch m;
+    const char* method;
+    bool target;
+    m.vendor = -1; m.accessory = false; m.id[0] = '\0';
+    if (coreBleMatch(mac, d->getAddress().getType(),
+                     payload.data(), payload.size(), &m)) {
+      if (m.infra && !macLimitAllow(&bleInfraLimit, mac, millis())) return;
+      if (!m.infra) {
+        portENTER_CRITICAL(&bleMux);
+        coreBleMatched = coreBleMatched + 1;
+        portEXIT_CRITICAL(&bleMux);
+      }
+      method = m.method;
+      target = !m.infra;
+    } else {
+      if (!surveyActive) return;
+      if (!macLimitAllow(&bleSurveyLimit, mac, millis())) {
+        coreSurveySuppressed = coreSurveySuppressed + 1;
+        return;
+      }
+      coreSurveyRows = coreSurveyRows + 1;
+      method = "operator_survey";   // spec O3
+      target = false;
+    }
+
+    // Refuses a payload that does not fit and never truncates it [L7].
+    if (payload.size() > BLE_ADV_MAX) {
+      portENTER_CRITICAL(&bleMux);
+      coreBleQueueDrops = coreBleQueueDrops + 1;
+      portEXIT_CRITICAL(&bleMux);
+      return;
+    }
+
+    BleObsEntry e;
+    e.uptimeMs     = millis();
+    memcpy(e.mac, mac, 6);
+    e.addrType     = d->getAddress().getType();
+    e.rssi         = (int8_t)d->getRSSI();
+    e.hasTxPower   = d->haveTXPower();
+    e.txPower      = e.hasTxPower ? (int8_t)d->getTXPower() : 0;
+    e.extended     = !d->isLegacyAdvertisement();
+    e.sid          = e.extended ? d->getSetId() : 0;
+    e.method       = method;
+    e.target       = target;
+    e.vendor       = m.vendor;
+    e.accessory    = m.accessory;
+    strlcpy(e.id, m.id, sizeof(e.id));
+    e.pduType      = blePduTypeName(d);
+    e.phyPrimary   = blePhyName(phy);
+    e.phySecondary = e.extended ? blePhyName(d->getSecondaryPhy()) : "";
+    e.payloadLen   = (uint16_t)payload.size();
+    memcpy(e.payload, payload.data(), payload.size());
+    bleEnqueue(e, target);
+  }
+};
+
+static BleScanCb g_bleScanCb;
+static NimBLEScan *g_bleScan = nullptr;
+
+static void bleScanStart() {
+  // Before NimBLE allocates, while the largest block is still free. All three
+  // prefer PSRAM, since only the NimBLE host task and loop() touch them.
+  if (!bleQueue) {
+    BleObsEntry* q = (BleObsEntry*)radioAlloc(BLE_QUEUE_SIZE * sizeof(BleObsEntry),
+                                              "ble ring", true);
+    portENTER_CRITICAL(&bleMux);
+    bleHead = bleTail = 0;
+    bleQueue = q;
+    portEXIT_CRITICAL(&bleMux);
+  }
+  limitStart(&bleInfraLimit, BLE_LIMIT_SLOTS, INFRA_DEDUPE_MS, "ble infra limit", true);
+  limitStart(&bleSurveyLimit, BLE_LIMIT_SLOTS, SURVEY_DEDUPE_MS, "ble survey limit", true);
+  NimBLEDevice::init("");
+  g_bleScan = NimBLEDevice::getScan();
+  g_bleScan->setScanCallbacks(&g_bleScanCb, /*wantDuplicates=*/true);
+  // Passive, since active scanning transmits a SCAN_REQ that makes the device
+  // detectable.
+  g_bleScan->setActiveScan(false);
+  g_bleScan->setInterval(BLE_SCAN_INTERVAL_MS);
+  g_bleScan->setWindow(BLE_SCAN_WINDOW_MS);
+  // Every advertisement, since repeat sightings form the RSSI series that
+  // path-loss fitting needs.
+  g_bleScan->setDuplicateFilter(false);
+  g_bleScan->setMaxResults(0);   // the callback is the only output
+  g_bleScan->setPhy(NimBLEScan::SCAN_ALL);
+  g_bleScan->start(0, false);    // 0 = no duration, no restart on completion
+}
+
+// `drain` logs the rows still queued. Device wipe passes false, since it is about
+// to erase the card those rows would land on.
+static void bleScanStop(bool drain) {
+  if (g_bleScan) {
+    g_bleScan->stop();
+    g_bleScan = nullptr;
+  }
+  NimBLEDevice::deinit(true);
+
+  // The callback has stopped, so the rows still queued are the last ones.
+  if (drain) (void)coreBleDrain();
+  portENTER_CRITICAL(&bleMux);
+  BleObsEntry* q = bleQueue;
+  bleQueue = nullptr;
+  portEXIT_CRITICAL(&bleMux);
+  free(q);
+  limitStop(&bleInfraLimit);
+  limitStop(&bleSurveyLimit);
+}
+
+#else   // HAS_BLE_SCAN
+
+bool coreBleDrain() { return false; }
+static void     bleScanStart() {}
+static void     bleScanStop(bool) {}
+
+#endif  // HAS_BLE_SCAN
+
+RadioMode coreRadioMode = RADIO_MODE_WIFI;
+
+const char* radioModeName(RadioMode mode) {
+  switch (mode) {
+    case RADIO_MODE_WIFI: return "wifi";
+    case RADIO_MODE_BLE:  return "ble";
+    default:              return "unknown";
+  }
+}
+
+static uint16_t sampledRate(uint32_t count, uint32_t *lastMs,
+                            uint32_t *lastCount, uint16_t *rate) {
+  const uint32_t now = millis();
+  const uint32_t dt = now - *lastMs;   // wrap-safe
+  if (dt >= 1000) {
+    *rate = (uint16_t)(((uint64_t)(count - *lastCount) * 1000u) / dt);
+    *lastCount = count;
+    *lastMs = now;
+  }
+  return *rate;
+}
+
+uint16_t coreSeenRate() {
+  static uint32_t lastMs = 0, lastCount = 0;
+  static uint16_t rate = 0;
+  return sampledRate(coreSeenFrames, &lastMs, &lastCount, &rate);
+}
+
+uint16_t coreBleRate() {
+  static uint32_t lastMs = 0, lastCount = 0;
+  static uint16_t rate = 0;
+  return sampledRate(coreBleReports, &lastMs, &lastCount, &rate);
+}
+
+bool coreScreenVisible(ScreenId s) {
+  // The channel plan is 802.11 only. BLE covers its three advertising channels
+  // itself.
+  if (s == SCREEN_SCAN_MODES) return coreRadioMode == RADIO_MODE_WIFI;
+  if (s == SCREEN_RADIO)      return HAS_BLE_SCAN;
+  return true;
+}
+
+// Steps to the next visible screen, wrapping. Returns `from` when no other
+// screen is visible.
+ScreenId coreStepScreen(ScreenId from, int dir) {
+  int s = (int)from;
+  for (int i = 0; i < SCREEN_COUNT; i++) {
+    s = (s + dir + SCREEN_COUNT) % SCREEN_COUNT;
+    if (coreScreenVisible((ScreenId)s)) return (ScreenId)s;
+  }
+  return from;
+}
+
+void coreRadioStart() {
+  switch (coreRadioMode) {
+    case RADIO_MODE_BLE: bleScanStart();         break;
+    default:             coreWifiSnifferStart(); break;
+  }
+}
+
+void coreRadioStop() {
+  switch (coreRadioMode) {
+    case RADIO_MODE_BLE: bleScanStop(true);     break;
+    default:             coreWifiSnifferStop(); break;
+  }
+}
+
+// Logs the row in the setter [L1], and roostLogConfigChange() handles L6. The
+// early return keeps a repeat of the active mode from restarting a working
+// driver.
+void coreSetRadioMode(RadioMode mode) {
+  if (mode >= RADIO_MODE_COUNT || mode == coreRadioMode) return;
+  if (mode == RADIO_MODE_BLE && !HAS_BLE_SCAN) {
+    dualPrintln("[bscope] radio: this board has no BLE capture");
+    return;
+  }
+  coreRadioStop();
+  coreRadioMode = mode;
+  coreRadioStart();
+  if (!coreScreenVisible(coreCurrentScreen))
+    coreCurrentScreen = coreStepScreen(coreCurrentScreen, +1);
+  roostLogConfigRadioMode();
+  dualPrintf("[bscope] radio -> %s\n", radioModeName(coreRadioMode));
+}
+
 // ============================================================
 // SESSION PROVENANCE
 //
-// What the manifest needs and only core can answer. Kept here rather than in
-// roost_session.cpp so the GPS parser, the OUI table and the clock anchor stay
-// private to this translation unit.
+// What the manifest needs that only core knows. It lives here so the GPS
+// parser, the OUI table and the clock anchor stay private to this translation
+// unit.
 // ============================================================
 
 void coreGpsFix(CoreGpsFix* o) {
@@ -3190,9 +3738,9 @@ void coreUnixToIso(uint32_t unix, char* buf, size_t len) {
 bool coreTimestampAt(uint32_t uptimeMs, char* buf, size_t len) {
   uint32_t au = 0, am = 0;
   if (strcmp(coreClockAnchor(&au, &am), "none") == 0) return false;
-  // Shared, so the row arithmetic and the manifest's agree, and so the
-  // pre-anchor case is refused rather than underflowing. A row stamped before
-  // the anchor leaves timestamp_utc empty and is placed at ingest.
+  // Shared, so the row arithmetic agrees with the manifest's and a pre-anchor
+  // time returns false without underflowing. A row stamped before the anchor
+  // leaves timestamp_utc empty, and ingest places it.
   return roostTimestampAt(au, am, uptimeMs, buf, len) != 0;
 }
 
@@ -3256,16 +3804,16 @@ bool coreSessionDirName(char* buf, size_t len) {
                          yr, mo, dy, n);
     if (!SD.exists(buf)) { g_sessionSeq = n; return true; }
   }
-  // Refuse rather than hand back a name the loop just proved exists. Renaming
-  // into an occupied directory merges two boots under one manifest, which makes
-  // their rows unattributable rather than merely misnamed. Spec 6.2.
+  // Refuse a name the loop just found taken. Renaming into an occupied
+  // directory merges two boots under one manifest and leaves their rows
+  // unattributable. Spec 6.2.
   buf[0] = '\0';
   g_sessionSeq = 0;
   return false;
 }
 
-// FNV-1a over the compiled table. Captures either side of a table change are
-// not comparable, and this is what says so at ingest.
+// FNV-1a over the compiled table. Ingest compares it to tell that captures on
+// either side of a table change are not comparable.
 uint32_t coreOuiTableHash() {
   uint32_t h = 2166136261u;
   const uint8_t* p = (const uint8_t*)oui_table;
@@ -3306,10 +3854,9 @@ const char* coreCountryCode() {
   return cc;
 }
 
-// The direct answer to what was reachable: a device never heard on a channel
-// it never tuned.
-// The channel plan in effect. Single mode reports the channel the picker holds,
-// not the build's compile-time default.
+// The channel plan in effect, which says what was reachable, since the device
+// hears nothing on a channel it never tunes. Single mode reports the channel
+// the picker holds, not the build's compile-time default.
 static void currentChannelPlan(const uint8_t** list, size_t* n) {
   switch (coreScanModeIndex()) {
     case 1:  *list = fullHopChannels;    *n = fullHopChannelCount; break;
@@ -3318,9 +3865,9 @@ static void currentChannelPlan(const uint8_t** list, size_t* n) {
   }
 }
 
-// The config_change `channels` value. The registry declares it a `list`, so the
-// rendering is roost_value.h's and not this device's; false means it did not
-// fit, which the caller must not write as an empty value.
+// The config_change `channels` value, which the registry declares a `list`
+// and roost_value.h renders. A false return means the value did not fit, and the
+// caller must not write it as an empty value.
 // See vendor/jellybeans/roost_logging/runtime/roost_value.h.
 bool coreChannelListRoost(char* buf, size_t len) {
   const uint8_t* list; size_t n;
@@ -3351,26 +3898,23 @@ void coreChannelListJson(char* buf, size_t len) {
   buf[o] = '\0';
 }
 
-// A session with no Axon rows may mean Axon was masked out rather than absent.
-//
-// The config_change `vendor_mask` value. A registry `list` of vendor names,
-// empty when nothing is matched. Never a word like "none", which would be a
-// value standing in for absence, and never a bitmask, which cannot be read
-// without this build's bit assignments. See
-// vendor/jellybeans/roost_logging/runtime/roost_value.h for the `list`
-// rendering, and .../roost_logging/docs/design_spec.md 6.5 on placeholders.
+// The config_change `vendor_mask` value, a registry `list` of vendor slugs,
+// empty when the mask is clear. It tells a session with Axon masked out from one
+// where Axon was absent. Never a placeholder like "none", and never a bitmask,
+// which needs this build's bit assignments to read. See
+// vendor/jellybeans/roost_logging/runtime/roost_value.h and
+// vendor/jellybeans/roost_logging/docs/design_spec.md 6.5.
 bool coreVendorMaskStr(char* buf, size_t len) {
-  static const char* kNames[VENDOR_COUNT] = { "flock", "axon", "axis", "utility" };
   RoostValue v;
   roostValueBegin(&v, buf, len);
   for (int i = 0; i < VENDOR_COUNT; i++)
-    if (coreVendorMask & (1u << i)) roostValueAddText(&v, kNames[i]);
+    if (coreVendorMask & (1u << i)) roostValueAddText(&v, kVendorSlugs[i]);
   return roostValueDone(&v) != 0;
 }
 
 // ============================================================
-// DEVICE WIPE (see core.h): scope to NVS first, NVS erased last, so the only
-// two states a boot can find are "nothing asked for" and "asked for, run it".
+// DEVICE WIPE (see core.h). Writes the scope to NVS first and erases NVS last,
+// so a boot finds only two states, no wipe requested or a wipe to resume.
 // ============================================================
 
 #define WIPE_NVS_NAMESPACE "bscope"
@@ -3378,19 +3922,19 @@ bool coreVendorMaskStr(char* buf, size_t len) {
 
 #if USE_SD
 // Recursion limit. Session directories sit one level below the root, so this is
-// slack rather than a working depth; anything deeper is reported and left.
+// slack. The walk reports anything deeper and leaves it.
 #define WIPE_SD_MAX_DEPTH 3
-// Names held per pass, and the room each gets. Both are bounded because these
-// buffers are stack-resident at every level of the recursion.
+// Names held per pass, and the room each gets. Both stay small because these
+// buffers sit on the stack at every level of the recursion.
 #define WIPE_SD_BATCH    6
 #define WIPE_SD_PATH_MAX 96
 
 // Empties `path` and removes it, returning false if anything survived.
 //
-// Names are read in batches and deleted after the listing is closed, never
-// through an open iterator, whose position is undefined across a removal. A
-// pass that removes nothing ends the walk, so an entry that refuses to unlink
-// costs the rest of the card nothing and cannot spin.
+// Reads names in batches and deletes them after closing the listing, since an
+// open iterator's position is undefined across a removal. A pass that removes
+// nothing ends the walk, so an entry that refuses to unlink cannot spin the loop
+// or block the rest of the card.
 static bool wipeSdPurge(const char* path, uint8_t depth) {
   if (depth > WIPE_SD_MAX_DEPTH) {
     dualPrintf("[bscope] wipe: %s below depth %u, left in place\n",
@@ -3462,13 +4006,18 @@ void coreDeviceWipe(WipeScope scope) {
   // and manifest snapshot recreate files that were just deleted.
   esp_wifi_set_promiscuous(false);
   sniffingStopped = true;
+  if (coreRadioMode == RADIO_MODE_BLE) bleScanStop(false);
   memset(fyDet, 0, sizeof(fyDet));
   fyDetCount      = 0;
   fyLastSaveCount = 0;
   fyDroppedNew    = 0;
   fyDirty         = false;
+  memset(coreBleDet, 0, sizeof(coreBleDet));
+  coreBleDetCount  = 0;
+  coreBleDetMissed = 0;
+  coreBleDetLast   = -1;
 #if USE_SD
-  roostSessionEnd();   // closes the open row files; a no-op if none are open
+  roostSessionEnd();   // closes any open row files
 #endif
 
 #if USE_SD
@@ -3483,9 +4032,7 @@ void coreDeviceWipe(WipeScope scope) {
   }
 #endif
 
-  // Format rather than a list of paths to unlink: the list would need editing
-  // every time a file is added, and a missed one is a leak that looks like a
-  // clean device.
+  // Format, so a file added later cannot survive the wipe.
   fySpiffsReady = false;
   SPIFFS.end();
   if (SPIFFS.format()) dualPrintln("[bscope] wipe: SPIFFS formatted");
@@ -3493,7 +4040,7 @@ void coreDeviceWipe(WipeScope scope) {
 
   // Last, and the step that clears the resume record. Also drops the WiFi
   // driver's own NVS entries, so the radio comes up from cold on the next boot.
-  // The driver has to be down first: it holds handles into this partition.
+  // The driver must be down first, since it holds handles into this partition.
   esp_wifi_stop();
   esp_wifi_deinit();
   nvs_flash_deinit();

@@ -1,10 +1,10 @@
 // Copyright (C) 2026 Lone Crow Design, LLC
 // Licensed under the MIT License. See LICENSE.
 //
-// Shared main file for the sprite-graphics TFT boards. Detection logic and the
+// Main file for the sprite-graphics TFT boards. Detection logic and the
 // notification and input peripherals live in lib/birdoscope_core, so this file
 // covers display drawing plus setup() and loop() orchestration only.
-// Another TFT board would reuse this file, differing only via board_config.h.
+// Another TFT board reuses this file and differs only in its board_config.h.
 #include <Arduino.h>
 #include <string.h>
 #include "esp_wifi.h"
@@ -15,8 +15,9 @@
 #include <TFT_eSPI.h>
 
 // ============================================================
-// CONFIG: pins, feature flags, tuning constants for this exact board.
-// Selected per-env via the -I build flag in platformio.ini.
+// CONFIG
+// Pins, feature flags and tuning constants for this exact board. The -I build
+// flag in platformio.ini selects the board_config.h for each env.
 // ============================================================
 
 #include "board_config.h"
@@ -31,10 +32,9 @@
 static TFT_eSPI    tft;
 static TFT_eSprite  spr = TFT_eSprite(&tft);   // full-screen 8bpp sprite, fits easily in SRAM (57.6KB)
 
-// Board-local two-screen toggle (scan view / detection-count view). Prefixed
-// to avoid clashing with core's shared ScreenId carousel (SCREEN_COUNT there is
-// the enum cardinality). This TFT board keeps its two-screen toggle until it
-// adopts the shared carousel. See docs/board_parity.md.
+// Board-local two-screen toggle (scan view / detection-count view). The TFT_
+// prefix avoids clashing with core's shared ScreenId carousel, where
+// SCREEN_COUNT is the enum cardinality. See docs/board_parity.md.
 typedef enum { TFT_SCREEN_SCAN = 0, TFT_SCREEN_COUNT = 1 } TftScreen;
 static TftScreen currentScreen = TFT_SCREEN_SCAN;
 
@@ -45,15 +45,16 @@ static uint8_t dispCh       = 0;
 static float   dispDistM    = -1.0f;   // -1 = not estimable (e.g. addr1 hit)
 static bool    dispDirty    = false;
 static unsigned long dispLastRefresh = 0;
-// Short interval, rather than event-driven alone, since the scan screen's red/black
-// state has to expire on its own as HB_DEVICE_ACTIVE_MS elapses, not only
-// on a new detection event.
+// The scan screen's red/black state expires as HB_DEVICE_ACTIVE_MS elapses,
+// with no event to trigger the redraw, so the display also refreshes on a
+// short interval.
 #define DISPLAY_REFRESH_MS 500
 
 // ============================================================
-// DRAIN QUEUE: pops core's alert queue, calls coreHandleAlert() for the
-// shareable table/SD/JSON/notification middle, then updates display state
-// from the result.
+// DRAIN QUEUE
+// Pops core's alert queue, hands each entry to coreHandleAlert() for the table,
+// SD, JSON and notification work, then updates the display state from the
+// result.
 // ============================================================
 
 static void drainAlertQueue() {
@@ -72,28 +73,27 @@ static void drainAlertQueue() {
 }
 
 // ============================================================
-// DISPLAY: GC9A01 240x240 round, full-screen sprite (double-buffered)
+// DISPLAY
+// GC9A01 240x240 round, full-screen sprite (double-buffered).
 // ============================================================
 //
-// 240x240 @ 8bpp = 57.6KB, comfortably fits classic-ESP32 SRAM alongside
-// the WiFi promiscuous driver. Sprite avoids visible tearing/flicker on
-// every redraw vs. drawing straight to the panel.
+// 240x240 @ 8bpp = 57.6KB, which fits classic-ESP32 SRAM alongside the WiFi
+// promiscuous driver. The sprite keeps redraws free of tearing and flicker.
 
 #define DISP_CX 120
 #define DISP_CY 120
 
-// "Active" window for the scan screen's red/ring state. Reuses the same
-// definition of "still in range" as core's fyLastTargetSeen update, so the
-// visual signal always agrees with what coreHandleAlert() last processed.
+// "Active" window for the scan screen's red/ring state. A target counts as
+// active for HB_DEVICE_ACTIVE_MS after coreHandleAlert() or
+// triggerManualAlert() last stamped fyLastTargetSeen.
 static inline bool targetActive() {
   return fyLastTargetSeen != 0 &&
          (millis() - fyLastTargetSeen) <= HB_DEVICE_ACTIVE_MS;
 }
 
-// RSSI to angle on a 270° gauge swept from GAUGE_START. No bearing information
-// is available (single omni antenna, no AoA hardware), so this maps signal
-// strength to a position on the ring as a proximity indicator, not a true
-// compass direction.
+// RSSI to angle on a 270° gauge swept from GAUGE_START. The hardware has a
+// single omni antenna and no AoA, so the ring position indicates proximity
+// and carries no bearing.
 #define GAUGE_START 135.0f
 #define GAUGE_SWEEP 270.0f
 
@@ -109,19 +109,17 @@ static void xyFromAngle(float deg, int len, int& x, int& y) {
   y = DISP_CY - (int)(len * cosf(rad));
 }
 
-// Single chevron "bird", a wide-lined V. Shared by the idle scan screen's
-// flock and the boot splash so they look like the same graphic. bg must match
-// whatever fillSprite() color is currently behind it, because drawWideLine
-// blends its anti-aliased edge against that color.
+// Single chevron "bird", a wide-lined V. The scan screen's flock and the boot
+// splash both draw it. bg must match the fillSprite() color behind it, because
+// drawWideLine blends its anti-aliased edge against that color.
 static void drawBird(int bx, int by, int wingSpan, uint16_t bg = TFT_BLACK) {
   spr.drawWideLine(bx - wingSpan, by, bx, by - wingSpan / 2, 3, TFT_WHITE, bg);
   spr.drawWideLine(bx, by - wingSpan / 2, bx + wingSpan, by, 3, TFT_WHITE, bg);
 }
 
-// Small procedural flock, a handful of birds scattered around center. Drawn
-// fresh each frame, cheap enough not to need caching. Stays on screen during an
-// active detection too (red background) so the flock does not disappear, with
-// only the ring pointer added on top of it.
+// Small procedural flock, a handful of birds scattered around center.
+// drawScanScreen() redraws it every frame, idle or during an active detection
+// (red background), and adds only the ring pointer on top.
 static void drawBirdFlock(uint16_t bg = TFT_BLACK) {
   static const int8_t offs[][3] = {   // {dx, dy, wingSpan}
     {  0, -14, 20 }, { -38,  8, 14 }, {  32,  18, 15 },
@@ -132,9 +130,8 @@ static void drawBirdFlock(uint16_t bg = TFT_BLACK) {
   }
 }
 
-// Pointer marker on the ring at the edge of the screen, position driven by
-// rssiToAngle(). As above, this is a proximity gauge, not a directional
-// bearing.
+// Pointer marker on the ring at the edge of the screen, positioned by
+// rssiToAngle().
 static void drawRingPointer(int8_t rssi) {
   const int ringR = 104;
   float angle = rssiToAngle(rssi);
@@ -162,9 +159,9 @@ static void displayInit() {
   spr.fillSprite(TFT_BLACK);
   spr.setTextColor(TFT_WHITE, TFT_BLACK);
 
-  // Three small birds above the title. "Birdoscope Mini" is too wide for
-  // the round bezel at one line, so it's split across two. Small top-left,
-  // medium top-right, large in the middle (lower and front of the other two).
+  // Three small birds above the title. "Birdoscope Mini" is too wide for the
+  // round bezel on one line, so it takes two. Small top-left, medium
+  // top-right, large in the middle (lower and in front of the other two).
   drawBird(DISP_CX - 26, DISP_CY - 74, 7);
   drawBird(DISP_CX + 32, DISP_CY - 68, 10);
   drawBird(DISP_CX + 2,  DISP_CY - 56, 13);
@@ -184,7 +181,7 @@ static void drawScanScreen() {
   uint16_t bg = active ? TFT_RED : TFT_BLACK;
   spr.fillSprite(bg);
 
-  drawBirdFlock(bg);   // stays centered whether idle (black) or detected (red)
+  drawBirdFlock(bg);   // centered, idle (black) or detected (red)
 
   if (active) {
     drawRingPointer(dispRssi);
@@ -208,8 +205,8 @@ static void drawCountScreen() {
   spr.setTextSize(1);   // reset so other screens aren't affected next frame
 }
 
-// Admin (AP) screen, shown once when the web portal comes up. Static: the
-// portal pauses scanning, so there's nothing to refresh until power-cycle.
+// Admin (AP) screen, drawn once when the web portal comes up. The portal
+// pauses scanning, so nothing refreshes it until the portal stops.
 static void displayAdmin() {
   spr.fillSprite(TFT_BLACK);
   spr.setTextDatum(MC_DATUM);
@@ -238,14 +235,13 @@ static void displayTick() {
   spr.pushSprite(0, 0);
 }
 
-// Manual "area of interest" marker. Simulates a detection on the scan screen,
-// using the same red background and ring pointer a real hit would trigger, and
-// writes one operator_mark row to the SD log. It never touches the real
-// detection table or SPIFFS, since no camera was seen and the count must not be
-// inflated. The row carries only real data, the timestamp and the current
-// channel; mac/ssid/ap_mac/dist_m stay blank rather than fabricated.
+// Manual "area of interest" marker. Shows the red background and ring pointer
+// a real hit would, and writes one operator_mark row to the SD log. It leaves
+// the detection table and SPIFFS alone, so the detection count stays a count
+// of cameras. The row holds only the timestamp and current channel, and leaves
+// mac/ssid/ap_mac/dist_m blank.
 //
-// The mark is written before the survey window opens, per spec O1.
+// This logs the mark before it opens the survey window, per spec O1.
 static void triggerManualAlert() {
   fyLastTargetSeen = millis();   // drives the scan screen's red/ring window
   dispRssi  = RSSI_MAX;          // pointer parks at the gauge's near end
@@ -259,8 +255,8 @@ static void triggerManualAlert() {
   coreSurveyStart();
 }
 
-// Switching screens only changes what is drawn. Scanning, logging, and
-// persistence all keep running regardless of currentScreen.
+// Switching screens changes only the drawing. Scanning, logging, and
+// persistence keep running on either screen.
 static void checkInput() {
   InputEvent ev = coreInputTick();
   if (ev == INPUT_TOGGLE_SCREEN) {
@@ -272,8 +268,9 @@ static void checkInput() {
 }
 
 // ============================================================
-// SERIAL COMMANDS: 'status' is board-specific, since it reports ntp_time=.
-// 'log' is available wherever USE_SD is set. Core handles the shared verbs.
+// SERIAL COMMANDS
+// 'status' is board-specific, since it reports ntp_time=. 'log' exists on
+// every USE_SD build. Core handles the shared verbs.
 // ============================================================
 
 static void printStatus() {
@@ -291,9 +288,8 @@ static void printStatus() {
 
 // Injects a synthetic addr2 detection through the same alert queue the real
 // promiscuous callback uses, so the display, SD, and SPIFFS path can run
-// without a live camera nearby. Cycles through a fixed RSSI sweep on each call,
-// so successive calls walk the ring pointer around the gauge from RSSI_MIN to
-// RSSI_MAX.
+// without a live camera nearby. Successive calls walk the ring pointer around
+// the gauge from RSSI_MAX down to RSSI_MIN.
 static void injectTestDetection() {
   static const int8_t sweep[] = { -30, -45, -60, -75, -95 };
   static size_t sweepIdx = 0;
@@ -333,7 +329,7 @@ static void printSerialHelp() {
 #if USE_SD
   dualPrintln("  log               dump SD log");
 #endif
-  corePrintSerialHelp();   // core-owned: dump/prev/nav (+ chirp/jingle on buzzer boards)
+  corePrintSerialHelp();   // core's shared verbs
   dualPrintln("  help              this help (also '?')");
 }
 
@@ -362,9 +358,9 @@ void setup() {
 
   displayInit();
 
-  // SPIFFS first: coreTimeSync()'s NTP fallback reads the saved WiFi creds off
-  // it when no GPS module is present. Format on first boot if missing.
-  // Non-fatal.
+  // SPIFFS first, since coreTimeSync()'s NTP join reads the saved WiFi
+  // credentials off it. SPIFFS formats on first boot if missing, and a failure
+  // is non-fatal.
   if (SPIFFS.begin(true)) {
     fySpiffsReady = true;
     dualPrintln("[bscope] SPIFFS ready");
@@ -374,25 +370,23 @@ void setup() {
   }
 
   // One-shot time anchor, before any promiscuous setup. coreTimeSync() probes
-  // for a GPS module. Finding none, it joins the saved WiFi network, syncs over
-  // NTP, then disconnects and leaves the WiFi driver initialized but stopped,
-  // which the raw esp_wifi_* promiscuous setup later in this function accepts.
-  // With no saved network it falls through to millis() without touching WiFi.
+  // for a GPS module, then bridges the time until GPS locks. It joins the saved
+  // WiFi network, syncs over NTP, then disconnects and leaves the WiFi driver
+  // initialized but stopped, which the raw esp_wifi_* promiscuous setup later
+  // in this function accepts. With no saved network it falls through to
+  // millis() without touching WiFi.
   coreTimeSync();
 
   precompileOuis();
 
 #if USE_SD
   // micro SD shares the TFT's SPI bus and differs only in CS. It must reuse
-  // TFT_eSPI's own SPIClass instance via getSPIinstance(), and must not call
-  // SPI.begin() on the global `SPI` object. TFT_eSPI owns its own
-  // private SPIClass (HSPI/VSPI), and a second begin() on a different
-  // SPIClass with the same physical pins re-routes them via the GPIO matrix
-  // to that second peripheral, silently disconnecting TFT_eSPI from the bus
-  // (display freezes on whatever was last pushed). TFT_MISO is wired in
-  // platformio.ini build_flags specifically so this shared instance already
-  // has MISO when SD needs to read the card.
-  if (SD.begin(SD_CS_PIN, tft.getSPIinstance())) {
+  // TFT_eSPI's private SPIClass (HSPI/VSPI) via getSPIinstance() and never call
+  // SPI.begin() on the global `SPI` object. A second begin() on another
+  // SPIClass with the same pins makes the GPIO matrix route them to that
+  // peripheral, which disconnects TFT_eSPI from the bus. platformio.ini
+  // build_flags define TFT_MISO so this shared instance has MISO for SD reads.
+  if (SD.begin(SD_CS_PIN, tft.getSPIinstance(), 4000000, "/sd", SD_MAX_OPEN_FILES)) {
     fySDReady = true;
     dualPrintln("[bscope] SD card ready");
     roostSessionBegin();
@@ -402,8 +396,8 @@ void setup() {
   }
 #endif
 
-  // Raw-IDF promiscuous capture bring-up (Detect mode). Shared with
-  // webPortalStop()'s resume path. See coreWifiSnifferStart() in core.
+  // Raw-IDF promiscuous capture bring-up (Detect mode). webPortalStop() reruns
+  // it through coreRadioStart() on resume.
   coreWifiSnifferStart();
 
   dualPrintln("[bscope] esp32round WiFi detector started");
@@ -414,9 +408,9 @@ void setup() {
 
 void loop() {
   static bool wasAdmin = false;
-  // Admin (AP) mode: service only the portal. It releases back to Detect on a
-  // web "return to scan" command or an idle timeout (webPortalTick may end it),
-  // so this is not a latch. Detect and Admin can alternate freely.
+  // Admin (AP) mode services only the portal. A web "return to scan" command
+  // or an idle timeout in webPortalTick() releases it back to Detect, so Detect
+  // and Admin can alternate freely.
   if (webPortalActive()) {
     webPortalTick();                                             // may release (web / idle timeout)
     if (webPortalActive() && coreAdminTriggerCheck()) webPortalStop();   // BOOT double-press also exits
@@ -426,8 +420,8 @@ void loop() {
   }
   if (wasAdmin) { wasAdmin = false; dispDirty = true; }   // resumed, so force a redraw
 
-  // Anytime BOOT double-press enters Admin. This board has no dedicated Admin
-  // gesture, so BOOT serves that role.
+  // A BOOT double press enters Admin from any screen. This board has no other
+  // Admin gesture.
   if (coreAdminTriggerCheck()) {
     webPortalStart(WEB_PORTAL_AP_SSID, WEB_PORTAL_AP_PASSWORD);
     displayAdmin();

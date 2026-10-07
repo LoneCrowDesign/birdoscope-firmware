@@ -76,7 +76,6 @@
 // drive nothing. CS is the only required define if it is enabled; MOSI/MISO/SCK
 // can be remapped via SPI.begin(). Pins UNVERIFIED.
 #define USE_SD          0
-#define SD_SELFTEST   0   // set 1 to run wiring verification at boot (independent of USE_SD)
 #define SD_CS_PIN     5
 #define SD_MOSI_PIN   6
 #define SD_MISO_PIN   2
@@ -139,9 +138,6 @@ static const size_t SSID_KEYWORD_COUNT = sizeof(target_ssid_keywords) / sizeof(t
 #define FY_SESSION_TMP       "/session.tmp"
 #define FY_PREV_FILE         "/prev_session.json"
 #define AUTOSAVE_INTERVAL_MS 15000
-// SD card append-only event log, one CSV row per detection event. SD_LOG_FILE
-// is the pre-GPS-fix buffer. Once GPS time is anchored the log moves to a
-// canonically-named file for the rest of the session.
-#define SD_LOG_FILE          "/log.csv"
-// Canonical post-anchor SD log filename: /bscope-M-D-YY-N.csv
+// Prefix of every SD session directory name. coreSessionDirName() and
+// roost_session.cpp build the rest.
 #define LOG_PREFIX      "bscope-"

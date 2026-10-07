@@ -1,8 +1,9 @@
 // Copyright (C) 2026 Lone Crow Design, LLC
 // Licensed under the MIT License. See LICENSE.
 //
-// See roost_session.h. Contract:
-// vendor/jellybeans/roost_logging/docs/design_spec.md.
+// See roost_session.h. Numbered spec citations below (6.2, 7.1) refer to the
+// contract, vendor/jellybeans/roost_logging/docs/design_spec.md. Lettered ones
+// (L3, M9) refer to the firmware design spec.
 
 #include "roost_session.h"
 
@@ -10,13 +11,22 @@
 
 #include <Arduino.h>
 #include <SD.h>
+#include "ble_ad.h"
 
 // ============================================================
 // ARDUINO SD BACKEND
 //
-// The shared writer takes storage as function pointers so its buffering can be
-// tested on a host. This is the half only the device can supply.
+// The shared writer takes storage as function pointers, so a host can test its
+// buffering. These are the device's implementations.
 // ============================================================
+
+// Every declared record file stays open for the session, and the manifest
+// snapshot opens one more.
+#if USE_SD && (ROOST_EMITS_WIFI_OBS + ROOST_EMITS_BLE_OBS + ROOST_EMITS_GPS_TRACK \
+               + ROOST_EMITS_DEVICE_EVENT + ROOST_EMITS_CONFIG_CHANGE        \
+               + ROOST_EMITS_OPERATOR_MARK + 1) > SD_MAX_OPEN_FILES
+#error "SD_MAX_OPEN_FILES leaves the manifest snapshot no file handle"
+#endif
 
 static File g_files[SD_MAX_OPEN_FILES];
 static bool g_used[SD_MAX_OPEN_FILES];
@@ -26,8 +36,8 @@ static int sdIoMkdir(void*, const char* path) {
   return SD.mkdir(path) ? 0 : -1;
 }
 
-// FILE_APPEND, never FILE_WRITE: on ESP32 FILE_WRITE is "w" and truncates, so
-// reopening after the anchor rename would destroy every pre-anchor row.
+// Opens with FILE_APPEND. On ESP32 FILE_WRITE is "w" and truncates, which would
+// destroy every pre-anchor row when a file reopens after the anchor rename.
 static int sdIoOpen(void*, const char* path) {
   for (int i = 0; i < SD_MAX_OPEN_FILES; i++) {
     if (g_used[i]) continue;
@@ -71,53 +81,59 @@ static const RoostSdIo kSdIo = {
 // SESSION STATE
 // ============================================================
 
-// wifi_obs is the only high-rate file. gps_track gets a smaller buffer on
-// purpose: at 1 Hz a full 4 KB block is forty seconds of position, and this
-// device's power is pulled rather than shut down. The three event records take
-// no buffer at all and are write-through.
+// wifi_obs and ble_obs are the high-rate files. gps_track gets a smaller
+// buffer because the device has no clean shutdown, and at 1 Hz a 4 KB block
+// holds forty seconds of position. The three event records are write-through
+// with no buffer.
 static uint8_t g_bufWifi[4096];
 static uint8_t g_bufTrack[1024];
+#if ROOST_CAP_BLE
+static uint8_t g_bufBle[4096];
+#endif
 
 static RoostSdLog  g_log;
 static bool        g_open      = false;
 static uint32_t    g_fixSeq    = 0;
 static uint32_t    g_lastManifestMs = 0;
-// 40, not 32: /bscope-TAG-boot-BOOT-K fills 32 exactly at a u32 boot_count.
+// Holds /bscope-TAG-boot-BOOT-K, which needs all 32 bytes at the largest u32
+// boot_count. Keep it above 32.
 static char        g_dir[40]   = "";
 static bool        g_named     = false;
 static bool        g_ended     = false;
 
-// Watermarks for the degradation events in spec 6.4. Compared on the manifest
-// cadence rather than raised from the failing write itself, which would try to
-// write a device_event through the storage that just failed.
+// Watermarks for the degradation events in spec 6.4. reportDegradation()
+// compares them on the manifest cadence, so no device_event goes out through
+// the write that just failed.
 static uint32_t    g_seenStorageErrors = 0;
 static uint32_t    g_seenOverflowRows  = 0;
 static uint32_t    g_seenQueueDrops    = 0;
 static bool        g_inStorageError    = false;
 
 // A session opens under its boot number, because rows precede the clock anchor
-// and the dated name is not knowable at first write. It is renamed to
-// /bscope-TAG-YYMMDD-N once time anchors.
+// and the date is unknown at first write. roostSessionAnchor() renames it to
+// /bscope-TAG-YYMMDD-N once time anchors. An unanchored session keeps the boot
+// name for good, with clock_source=none in its manifest.
 //
-// Keyed by boot, not a fixed name: a fixed provisional name lets successive
-// boots append to one directory, which makes their rows unattributable and
-// leaves one manifest describing only the last. boot_count comes from NVS and
-// survives a reflash, which is what makes it a usable key.
-//
-// This is a final name, not a placeholder. An unanchored session has no date to
-// be given, so it keeps this one and says clock_source=none in its manifest.
-// The tag sits between the shortcode and "boot": boot_count counts per device,
-// so two units collide on it alone. An empty tag gives /bscope-boot-N. Spec 6.2.
+// boot_count comes from NVS and survives a reflash, so each boot gets its own
+// directory and manifest. The tag goes before "boot" because boot_count counts
+// per device and two units collide on it alone. An empty tag gives
+// /bscope-boot-N. Spec 6.2.
 #define ROOST_DIR_BOOT_PREFIX "/" LOG_PREFIX
 #define MANIFEST_SNAPSHOT_MS 15000
+
+// Board revision for the manifest. A board config without a revision reports
+// "unknown".
+#ifndef HW_REVISION
+#define HW_REVISION "unknown"
+#endif
 
 bool roostSessionOpen()      { return g_open; }
 const char* roostSessionDir(){ return g_dir; }
 uint32_t roostFixSeq()       { return g_fixSeq; }
 bool roostHasFix()           { return gpsHasFix; }
 
-// Derived from this board's capability macros by the generated header. A board
-// declares capabilities; it never restates which files it writes.
+// The generated header derives the file list from this board's capability
+// macros. A board declares capabilities and never lists its files.
 static RoostFileDecl g_decls[ROOST_MAX_DECLARED_FILES];
 static size_t        g_declCount = 0;
 
@@ -138,14 +154,13 @@ static void writeManifest() {
   RoostSdStats st;
   roostSdGetStats(&g_log, &st);
 
-  // Everything the contract defines is rendered by the shared renderer from
-  // these facts. This device spells no key, formats no timestamp and decides
-  // nothing about null: those were the parts that differed between devices.
+  // The shared renderer spells every key, formats every timestamp and decides
+  // every null. This device supplies the values.
   RoostSessionInfo info;
   memset(&info, 0, sizeof(info));
   info.deviceModel  = "birdoscope_analyze";
   info.deviceSerial = coreDeviceSerial();
-  info.hwRevision   = "HWr0.1";
+  info.hwRevision   = HW_REVISION;
   info.fwVersion    = BIRDOSCOPE_VERSION " " BIRDOSCOPE_GIT_REV;
   info.builtAt      = BIRDOSCOPE_BUILD_TS;
 
@@ -165,38 +180,34 @@ static void writeManifest() {
 
   info.ouiTableHash = coreOuiTableHash();
   info.ieTableHash  = nullptr;   // no IE matcher table in this build
-  // Null is load-bearing: this device applies no dedup to the log, so every
-  // repeat observation is in the file. The cooldown ring gates the display and
-  // the detection JSON, not wifi_obs.
+  // Null because this device applies no dedup to the log, and the file holds
+  // every repeat observation. The cooldown ring gates only the display and the
+  // detection JSON.
   info.dedupPolicy  = nullptr;
   info.storageTier  = "sd";
 
-  // observations_suppressed is a true zero for the same reason, not a stand-in
-  // for a figure this device does not keep. coreQueueDrops is the only loss the
-  // writer cannot see: alerts discarded before the drain reached them.
-  roostSessionCounters(&g_log, &info.counters, 0, coreQueueDrops);
+  // observations_suppressed is a true zero for the same reason. The two queue
+  // drop counts are the only loss the writer cannot see, entries discarded
+  // before the drain reached them.
+  roostSessionCounters(&g_log, &info.counters, 0,
+                       coreQueueDrops + coreBleQueueDrops);
 
   info.files    = g_decls;
   info.numFiles = g_declCount;
 
-  // Loss split into its three causes, which the contract has no key for:
-  // queue drops, refused rows and buffer overflows. Manifest v2 names
-  // device_diagnostics as where a device puts a counter the contract does not
-  // define.
-  //
-  // queue_depth_max against queue_size is what says whether a drop count means
-  // the ring is undersized or that something blocked the drain. Without it in
-  // the artifact, a capture cannot answer that question after the fact.
-  // Summed from the writer's per-record counts, not a tally kept beside them.
+  // device_diagnostics holds counters the contract does not define, as manifest
+  // v2 allows. It splits loss into queue drops, voided rows and buffer
+  // overflows. queue_depth_max against queue_size tells an undersized queue
+  // from a blocked drain. The voided total sums the writer's per-record
+  // counts.
   uint32_t voided = 0;
   for (int i = 0; i < ROOST_REC_COUNT; i++)
     voided += roostSdRowsVoided(&g_log, (RoostRecord)i);
 
-  // frames_seen and mgmt_* are the only figures here describing traffic the
-  // matcher rejected. Without them a subtype that never reached the radio and
-  // one that reached it and matched nothing produce the same capture, which is
-  // what made a missing probe_req unanswerable from the artifact alone.
-  char diag[512];
+  // frames_seen and mgmt_* are the only counts of traffic the matcher rejected.
+  // They tell a subtype the radio never received from one it received and did
+  // not match.
+  char diag[768];
   const int dn = snprintf(diag, sizeof(diag),
            "\"queue_drops\":%u,\"rows_voided\":%u,\"row_buffer_overflows\":%u,"
            "\"wifi_obs_written\":%u,\"wifi_obs_voided\":%u,"
@@ -204,7 +215,11 @@ static void writeManifest() {
            "\"frames_seen\":%u,\"frames_candidate\":%u,"
            "\"mgmt_probe_req_seen\":%u,\"mgmt_probe_req_matched\":%u,"
            "\"mgmt_probe_resp_seen\":%u,\"mgmt_probe_resp_matched\":%u,"
-           "\"mgmt_beacon_seen\":%u,\"mgmt_beacon_matched\":%u",
+           "\"mgmt_beacon_seen\":%u,\"mgmt_beacon_matched\":%u,"
+           "\"ble_adv_seen\":%u,\"ble_adv_matched\":%u,"
+           "\"ble_obs_written\":%u,\"ble_obs_voided\":%u,"
+           "\"ble_queue_drops\":%u,\"ble_queue_depth_max\":%u,"
+           "\"ble_queue_size\":%u",
            (unsigned)coreQueueDrops, (unsigned)voided,
            (unsigned)st.overflowRows,
            (unsigned)roostSdRowsWritten(&g_log, ROOST_REC_WIFI_OBS),
@@ -213,9 +228,14 @@ static void writeManifest() {
            (unsigned)coreSeenFrames, (unsigned)coreCandidateFrames,
            (unsigned)coreMgmtSeen[4],  (unsigned)coreMgmtMatched[4],
            (unsigned)coreMgmtSeen[5],  (unsigned)coreMgmtMatched[5],
-           (unsigned)coreMgmtSeen[8],  (unsigned)coreMgmtMatched[8]);
-  // A truncated block is invalid JSON and voids the whole manifest, so it is
-  // dropped rather than written short. The return was discarded before this.
+           (unsigned)coreMgmtSeen[8],  (unsigned)coreMgmtMatched[8],
+           (unsigned)coreBleReports, (unsigned)coreBleMatched,
+           (unsigned)roostSdRowsWritten(&g_log, ROOST_REC_BLE_OBS),
+           (unsigned)roostSdRowsVoided(&g_log, ROOST_REC_BLE_OBS),
+           (unsigned)coreBleQueueDrops, (unsigned)coreBleQueueDepthMax,
+           (unsigned)coreBleQueueSize());
+  // A truncated block is invalid JSON and voids the whole manifest, so the
+  // manifest omits a block that does not fit.
   if (dn < 0 || (size_t)dn >= sizeof(diag)) {
     dualPrintln("[roost] device_diagnostics did not fit - omitting the block");
     info.deviceDiagnostics = nullptr;
@@ -225,9 +245,9 @@ static void writeManifest() {
 
   static char json[4096];
   const size_t n = roostSessionJson(json, sizeof(json), &info);
-  // Render first, write second. A manifest that did not fit is not written at
-  // all: a truncated one asserts a file set and a column list the session does
-  // not have, and it fails validation for the whole capture.
+  // Render first, write second. A truncated manifest lists files and columns
+  // the session lacks and fails validation for the whole capture, so a manifest
+  // that does not fit leaves the previous snapshot in place.
   if (!n) {
     dualPrintln("[roost] manifest did not fit - keeping the previous one");
     return;
@@ -235,19 +255,28 @@ static void writeManifest() {
 
   char path[64];
   snprintf(path, sizeof(path), "%s/manifest.json", g_dir);
-  // FILE_WRITE truncates, which is right here and wrong everywhere else in
-  // this file: the manifest is a snapshot to be replaced, not a log to append.
+  // FILE_WRITE truncates. Each write replaces the manifest snapshot, unlike the
+  // appended record files.
   File f = SD.open(path, FILE_WRITE);
-  if (!f) return;
+  if (!f) {
+    // Reported once per session. The previous snapshot stays on the card.
+    static bool reported = false;
+    if (!reported) {
+      reported = true;
+      dualPrintln("[roost] manifest open failed - snapshot not written");
+      roostLogDeviceEvent(ROOST_COMP_SYS, "storage_error", 1, "manifest open");
+    }
+    return;
+  }
   f.write((const uint8_t*)json, n);
   f.flush();
   f.close();
 }
 
-// Spec 6.4: a write failure or a full buffer is a device_event, not just a
-// counter. Raised here on the snapshot cadence, after the flush, so a failing
-// card is reported by the write-through path rather than from inside the write
-// that failed.
+// Spec 6.4 makes a write failure or a full buffer a device_event as well as a
+// counter. This runs on the snapshot cadence after the flush, so the
+// write-through event file reports a failing card outside the write that
+// failed.
 static void reportDegradation() {
   RoostSdStats st;
   roostSdGetStats(&g_log, &st);
@@ -262,14 +291,14 @@ static void reportDegradation() {
     g_inStorageError = false;
   }
 
-  // Two ways to lose an observation with the card healthy: the row buffer had
-  // no room, or the alert queue filled before the drain reached it.
+  // With the card healthy, the device loses an observation when the row buffer
+  // has no room or a queue fills before the drain reaches it.
   const uint32_t overflow = st.overflowRows;
-  const uint32_t drops    = coreQueueDrops;
+  const uint32_t drops    = coreQueueDrops + coreBleQueueDrops;
   if (overflow > g_seenOverflowRows || drops > g_seenQueueDrops) {
     roostLogDeviceEvent(ROOST_COMP_SYS, "buffer_full",
                         (overflow - g_seenOverflowRows) + (drops - g_seenQueueDrops),
-                        overflow > g_seenOverflowRows ? "row buffer" : "alert queue");
+                        overflow > g_seenOverflowRows ? "row buffer" : "queue");
     g_seenOverflowRows = overflow;
     g_seenQueueDrops   = drops;
   }
@@ -285,11 +314,13 @@ bool roostSessionBegin() {
   roostSdInit(&g_log, &kSdIo);
   roostSdAttachBuffer(&g_log, ROOST_REC_WIFI_OBS,  g_bufWifi,  sizeof(g_bufWifi));
   roostSdAttachBuffer(&g_log, ROOST_REC_GPS_TRACK, g_bufTrack, sizeof(g_bufTrack));
+#if ROOST_CAP_BLE
+  roostSdAttachBuffer(&g_log, ROOST_REC_BLE_OBS,   g_bufBle,   sizeof(g_bufBle));
+#endif
 
-  // Never adopt an existing directory. boot_count restarts at 1 if NVS is
-  // erased, which would otherwise reopen an earlier unanchored session and
-  // merge two captures under one manifest - the defect this key exists to
-  // prevent.
+  // Each session takes a directory that does not exist yet. boot_count
+  // restarts at 1 when an erase clears NVS, and an earlier unanchored session
+  // may already hold the name.
   const unsigned boot = (unsigned)coreBootCount();
   const char* tag = coreDeviceTag();
   const char* sep = tag[0] ? "-" : "";
@@ -301,9 +332,8 @@ bool roostSessionBegin() {
                     tag, sep, boot);
     free_ = !SD.exists(g_dir);
   }
-  // Refuse rather than fall back to a name already in use. Sharing a container
-  // makes rows unattributable rather than merely misnamed, because nothing in
-  // the artifact says where one boot ended and the next began. Spec 6.2, D41.
+  // With every name taken, no session opens. Two boots in one directory leave
+  // their rows unattributable. Spec 6.2.
   if (!free_) {
     dualPrintln("[roost] no free session name - refusing to share one");
     return false;
@@ -314,8 +344,8 @@ bool roostSessionBegin() {
   }
   g_open = true;
 
-  // The one component check the preprocessor cannot make: it cannot compare
-  // string literals to find two ids the same.
+  // Duplicate component ids need a runtime check, because the preprocessor
+  // cannot compare string literals.
   if (!roostComponentsValid())
     roostLogDeviceEvent(ROOST_COMP_SYS, "config_error", 0, "components invalid");
 
@@ -335,9 +365,8 @@ void roostSessionAnchor() {
 
   char want[40];
   if (!coreSessionDirName(want, sizeof(want))) {
-    // The day's names are used up. Keep the boot name: a failed rename is not a
-    // failed capture, and the manifest carries the anchor either way, so the
-    // only thing lost is a cosmetic name. Spec 6.2.
+    // No dated name is free today, so the session keeps its boot name. The
+    // manifest records the anchor either way. Spec 6.2.
     dualPrintln("[roost] no free dated name today - keeping the boot name");
     roostLogDeviceEvent(ROOST_COMP_SYS, "config_error", 0, "no free session name");
     g_named = true;                   // do not retry on every tick
@@ -345,16 +374,16 @@ void roostSessionAnchor() {
     return;
   }
 
-  // FatFs requires that a renamed object not be open, so close first and
-  // reopen after. Reopening appends, so no header is re-emitted and each
-  // record type stays one continuous file across the anchor.
+  // FatFs cannot rename an open object, so the files close first and reopen
+  // after. Reopening appends without a second header, and each record type
+  // stays one continuous file across the anchor.
   roostSdCloseSession(&g_log);
   if (SD.rename(g_dir, want)) {
     snprintf(g_dir, sizeof(g_dir), "%s", want);
     g_named = true;
   } else {
-    // Keep capturing under the provisional name rather than losing the
-    // session. The manifest still carries the anchor, so it remains placeable.
+    // Capture continues under the provisional name. The manifest still records
+    // the anchor, so the session stays placeable.
     dualPrintf("[roost] rename %s -> %s failed, staying put\n", g_dir, want);
     roostLogDeviceEvent(ROOST_COMP_SYS, "config_error", 0, "session rename failed");
   }
@@ -394,8 +423,7 @@ void roostSessionStats(uint32_t* rowsWritten, uint32_t* rowsDropped,
   if (rowsWritten) *rowsWritten = st.rowsWritten;
   if (rowsDropped) *rowsDropped = st.rowsDropped;
   if (worstFlushMs) *worstFlushMs = st.worstFlushMs;
-  // From the writer, not a second tally beside it: two counters of one fact
-  // disagree eventually, and the manifest reads the writer's.
+  // Reads the writer's count, the same one the manifest reports.
   if (fixes) *fixes = roostSdRowsWritten(&g_log, ROOST_REC_GPS_TRACK);
 }
 
@@ -403,13 +431,13 @@ void roostSessionStats(uint32_t* rowsWritten, uint32_t* rowsDropped,
 // ROW WRITERS
 // ============================================================
 
-// Fills the columns every record shares. timestamp_utc is left empty when the
-// clock has not anchored; uptime_ms alone places the row, and the manifest's
-// anchor triple resolves it afterwards. Never a stand-in value.
+// Fills the columns every record shares. timestamp_utc stays empty until the
+// clock anchors, and the manifest's anchor triple places the row from uptime_ms
+// afterwards.
+//
 // fix_seq sits between uptime_ms and cap_component in every record that has
-// it, so it is written here rather than by the caller: a column already passed
-// cannot be revisited, and on gps_track it is required, so writing it late
-// voids the row rather than misplacing a value.
+// it, so this function writes it. RoostRow cannot go back to a column it has
+// passed, and gps_track requires fix_seq.
 static void setCommon(RoostRow* w, uint8_t iTs, uint8_t iUp, uint8_t iFix,
                       uint8_t iComp, uint32_t uptimeMs, RoostComponent comp,
                       uint32_t fixSeq) {
@@ -420,10 +448,9 @@ static void setCommon(RoostRow* w, uint8_t iTs, uint8_t iUp, uint8_t iFix,
   roostRowSetText(w, iComp, roostComponentId(comp));
 }
 
-// A refusal means a required column was never written, so the row does not
-// exist and nothing downstream can tell that from a quiet capture. The first
-// refusal per record type is reported on the serial line rather than only
-// reaching a manifest counter.
+// A refused row is missing a required column and never reaches the card, which
+// downstream cannot tell from a quiet capture. The first refusal per record
+// type goes to the serial line as well as the manifest counter.
 static bool finishAndAppend(RoostRow* w, RoostRecord rec, const char* row) {
   if (!roostRowFinish(w)) {
     if (!roostSdRowsVoided(&g_log, rec))
@@ -445,32 +472,32 @@ void roostLogWifiObs(const AlertEntry& e, const char* method) {
             ROOST_WIFI_OBS_FIX_SEQ, ROOST_WIFI_OBS_CAP_COMPONENT,
             e.uptimeMs, ROOST_COMP_WIFI0, g_fixSeq);
   roostRowSetEnum(&w, ROOST_WIFI_OBS_OBS_MODE, ROOST_OBS_MODE_PROMISCUOUS);
-  // A mac column takes the bytes, not a formatted string. The text setter is
-  // refused on it, and mac is required, so that refusal voids the whole row.
+  // A mac column takes the raw bytes. RoostRow refuses text on it, and the
+  // record requires mac, so a text write voids the row.
   roostRowSetMac(&w, ROOST_WIFI_OBS_MAC, e.mac);
   roostRowSetEnumByName(&w, ROOST_WIFI_OBS_DETECTION_METHOD, method);
   if (e.frameSubtype[0])
     roostRowSetEnumByName(&w, ROOST_WIFI_OBS_FRAME_SUBTYPE, e.frameSubtype);
   roostRowSetInt(&w, ROOST_WIFI_OBS_RSSI, e.rssi);
   roostRowSetUInt(&w, ROOST_WIFI_OBS_CHANNEL, e.channel);
-  // Derived through the shared helper, never declared per device. A channel
-  // this build cannot place leaves the column empty rather than guess a band.
+  // The shared helper derives the band. It leaves the column empty for a
+  // channel it cannot place.
   const RoostChannelBand cb = roostBandForChannel(e.channel);
   if (cb.known) roostRowSetEnum(&w, ROOST_WIFI_OBS_BAND, cb.band);
-  // Whenever the frame carried one. The alert type does not decide this: a
-  // beacon is not a name-bearing alert and still broadcasts its SSID. Length,
-  // not strlen: the octets may contain 0x00 and a cloaked name is all zeros.
-  // A zero-length element renders empty here, same as no element; frame_subtype
-  // is what separates them at ingest (spec 7.1).
+  // Written whenever the frame had an SSID element, whatever the alert type. A
+  // beacon broadcasts its SSID without a name-bearing alert. Uses the length,
+  // since the octets may contain 0x00 and a cloaked name is all zeros. A
+  // zero-length element and a missing one both render empty, and ingest tells
+  // them apart by frame_subtype (spec 7.1).
   if (e.ssid.len)
     roostRowSetTextN(&w, ROOST_WIFI_OBS_SSID, e.ssid.text, e.ssid.len);
-  // By position, never by role. The pipeline derives roles from type and
-  // subtype; a role name varies per frame and cannot be a column.
+  // Addresses go by position. Roles vary per frame, and the pipeline derives
+  // them from type and subtype.
   roostRowSetMac(&w, ROOST_WIFI_OBS_ADDR1, e.addr1);
   roostRowSetMac(&w, ROOST_WIFI_OBS_ADDR2, e.addr2);
   roostRowSetMac(&w, ROOST_WIFI_OBS_ADDR3, e.addr3);
   roostRowSetUInt(&w, ROOST_WIFI_OBS_SEQ, e.seq);
-  // The flags byte only: the type/subtype half is already frame_subtype.
+  // Only the flags byte. frame_subtype already holds the type and subtype.
   const uint8_t fc = (uint8_t)e.fcFlags;
   roostRowSetHex(&w, ROOST_WIFI_OBS_FC_FLAGS, &fc, 1);
   roostRowSetUInt(&w, ROOST_WIFI_OBS_FRAME_LEN, e.frameLen);
@@ -480,6 +507,47 @@ void roostLogWifiObs(const AlertEntry& e, const char* method) {
   if (w.unknownEnums)
     roostLogDeviceEvent(ROOST_COMP_SYS, "vocabulary_error", w.unknownEnums, "wifi_obs");
   finishAndAppend(&w, ROOST_REC_WIFI_OBS, row);
+}
+
+void roostLogBleObs(const BleObsEntry& e) {
+#if ROOST_CAP_BLE
+  if (!g_open) return;
+  // A full extended payload is 510 hex characters before any other column.
+  char row[768];
+  RoostRow w;
+  roostRowBegin(&w, row, sizeof(row), ROOST_REC_BLE_OBS,
+                ROOST_BLE_OBS_COLUMNS_MASK);
+  setCommon(&w, ROOST_BLE_OBS_TIMESTAMP_UTC, ROOST_BLE_OBS_UPTIME_MS,
+            ROOST_BLE_OBS_FIX_SEQ, ROOST_BLE_OBS_CAP_COMPONENT,
+            e.uptimeMs, ROOST_COMP_BLE0, g_fixSeq);
+  // One row per advertisement, which the registry calls promiscuous.
+  roostRowSetEnum(&w, ROOST_BLE_OBS_OBS_MODE, ROOST_OBS_MODE_PROMISCUOUS);
+  roostRowSetMac(&w, ROOST_BLE_OBS_MAC, e.mac);
+  roostRowSetEnumByName(&w, ROOST_BLE_OBS_ADDR_TYPE, bleAddrTypeName(e.addrType));
+  roostRowSetEnumByName(&w, ROOST_BLE_OBS_DETECTION_METHOD, e.method);
+  roostRowSetInt(&w, ROOST_BLE_OBS_RSSI, e.rssi);
+  if (e.hasTxPower) roostRowSetInt(&w, ROOST_BLE_OBS_TX_POWER, e.txPower);
+  uint8_t nameLen = 0;
+  const uint8_t* name = bleLocalName(e.payload, e.payloadLen, &nameLen);
+  if (name && nameLen)
+    roostRowSetTextN(&w, ROOST_BLE_OBS_DEVICE_NAME, (const char*)name, nameLen);
+  roostRowSetEnumByName(&w, ROOST_BLE_OBS_PDU_TYPE, e.pduType);
+  if (e.phyPrimary[0])
+    roostRowSetEnumByName(&w, ROOST_BLE_OBS_PHY_PRIMARY, e.phyPrimary);
+  if (e.phySecondary[0])
+    roostRowSetEnumByName(&w, ROOST_BLE_OBS_PHY_SECONDARY, e.phySecondary);
+  if (e.extended) roostRowSetUInt(&w, ROOST_BLE_OBS_SID, e.sid);
+  roostRowSetBool(&w, ROOST_BLE_OBS_ACTIVE_SCAN, 0);   // passive only, spec M9
+  // The authoritative payload. Analysis re-derives every decoded column above
+  // from it.
+  roostRowSetHex(&w, ROOST_BLE_OBS_ADV_DATA_HEX, e.payload, e.payloadLen);
+
+  if (w.unknownEnums)
+    roostLogDeviceEvent(ROOST_COMP_SYS, "vocabulary_error", w.unknownEnums, "ble_obs");
+  finishAndAppend(&w, ROOST_REC_BLE_OBS, row);
+#else
+  (void)e;
+#endif
 }
 
 void roostLogGpsFix() {
@@ -509,19 +577,18 @@ void roostLogGpsFix() {
     roostRowSetEnumByName(&w, ROOST_GPS_TRACK_FIX_TYPE, fx.fixType);
     roostRowSetUInt(&w, ROOST_GPS_TRACK_FIX_AGE_MS, fx.ageMs);
   }
-  // position_source and fix_type are set by name, so they can drift from the
-  // registry. Spec 6.3: an unexplained empty column reads as nothing to record.
+  // position_source and fix_type go in by name and can drift from the registry.
+  // Spec 6.3 requires reporting the miss, since an unexplained empty column
+  // reads as nothing to record.
   if (w.unknownEnums)
     roostLogDeviceEvent(ROOST_COMP_SYS, "vocabulary_error", w.unknownEnums, "gps_track");
   finishAndAppend(&w, ROOST_REC_GPS_TRACK, row);
 }
 
-// Last value written per setting. Spec 6.4: a setting re-applied to the value
-// it already holds is not a change and writes nothing, so a menu that reasserts
-// its state does not fill the file with rows saying nothing happened.
-// Keyed on the pair, not on the setting alone: two components report the same
-// setting under different values, and a setting-only key suppresses the second
-// component's row as a repeat of the first's.
+// Last value written per component and setting. Spec 6.4 says a setting
+// re-applied to its current value writes nothing, so a menu that reasserts its
+// state adds no rows. The key includes the component because two components
+// report the same setting with different values.
 #define CFG_SLOTS ((int)ROOST_COMPONENT_COUNT * (int)ROOST_CONFIG_SETTING_COUNT)
 static struct {
   RoostComponent comp;
@@ -535,14 +602,13 @@ static bool configUnchanged(RoostComponent comp, const char* setting,
   for (size_t i = 0; i < g_cfgUsed; i++)
     if (g_cfg[i].comp == comp && strcmp(g_cfg[i].setting, setting) == 0)
       return strcmp(g_cfg[i].value, value) == 0;
-  // A setting seen for the first time is a change: its boot row is what makes
-  // config_change self-contained from its first row.
+  // A setting seen for the first time counts as a change, which gives
+  // config_change its boot row.
   return false;
 }
 
-// Called only once the row reached the card. Recording the value before the
-// append means a refused row leaves the table claiming a value the artifact
-// never carried, and every later write of it is then suppressed as a repeat.
+// Call only after the row reaches the card, so the table holds only values the
+// file contains.
 static void configRemember(RoostComponent comp, const char* setting,
                            const char* value) {
   for (size_t i = 0; i < g_cfgUsed; i++) {
@@ -578,9 +644,9 @@ void roostLogConfigChange(RoostComponent component,
     configRemember(component, setting, v);
 }
 
-// The channel plan and the vendor mask are rendered rather than fixed, so both
-// can refuse. An empty value means the setting does not apply on this build
-// (spec L3), so a refusal must not be written as one: drop the row and say so.
+// The channel plan and vendor mask render their values, so both can refuse. An
+// empty value means the setting does not apply on this build (spec L3), so a
+// refusal writes a config_error event in place of the row.
 void roostLogConfigChannels() {
   char buf[64];
   if (coreChannelListRoost(buf, sizeof(buf)))
@@ -597,11 +663,16 @@ void roostLogConfigVendorMask() {
     roostLogDeviceEvent(ROOST_COMP_WIFI0, "config_error", 0, "vendor_mask too long");
 }
 
+// Logs under sys, since the setting selects among radios. Spec L4.
+void roostLogConfigRadioMode() {
+  roostLogConfigChange(ROOST_COMP_SYS, "radio_mode", radioModeName(coreRadioMode));
+}
+
 void roostLogConfigBoot() {
-  char buf[64];
-  // Every setting in the vocabulary, in registry order, empty where it does not
-  // apply: the boot dump is then a fixed length across the fleet and a reader
-  // never has to tell "not applicable" from "this device forgot". Spec L5.
+  char buf[96];
+  // Writes every setting in the vocabulary in registry order, empty where it
+  // does not apply. The boot dump then has the same length on every device, and
+  // an empty value always means not applicable. Spec L5.
   roostLogConfigChange(ROOST_COMP_WIFI0, "obs_mode", "promiscuous");
   roostLogConfigChannels();
   roostLogConfigChange(ROOST_COMP_WIFI0, "country_code", coreCountryCode());
@@ -614,10 +685,21 @@ void roostLogConfigBoot() {
   roostValueBegin(&f, buf, sizeof(buf));
   roostValueAddKeyInt(&f, "rssi_min", RSSI_MIN);
   roostValueAddKeyUInt(&f, "cooldown_ms", ALERT_COOLDOWN_MS);
+  roostValueAddKeyUInt(&f, "infra_dedupe_ms", coreInfraDedupeMs());
   if (roostValueDone(&f))
     roostLogConfigChange(ROOST_COMP_WIFI0, "filters", buf);
   else
     roostLogDeviceEvent(ROOST_COMP_WIFI0, "config_error", 0, "filters too long");
+#if ROOST_CAP_BLE
+  roostLogConfigChange(ROOST_COMP_BLE0, "obs_mode", "promiscuous");
+  roostValueBegin(&f, buf, sizeof(buf));
+  roostValueAddKeyUInt(&f, "infra_dedupe_ms", coreInfraDedupeMs());
+  if (roostValueDone(&f))
+    roostLogConfigChange(ROOST_COMP_BLE0, "filters", buf);
+  else
+    roostLogDeviceEvent(ROOST_COMP_BLE0, "config_error", 0, "filters too long");
+#endif
+  roostLogConfigRadioMode();
 }
 
 void roostLogDeviceEvent(RoostComponent component,
@@ -633,9 +715,9 @@ void roostLogDeviceEvent(RoostComponent component,
   roostRowSetEnumByName(&w, ROOST_DEVICE_EVENT_EVENT_KIND, kind);
   roostRowSetUInt(&w, ROOST_DEVICE_EVENT_EVENT_COUNT, count);
   if (detail) roostRowSetText(&w, ROOST_DEVICE_EVENT_EVENT_DETAIL, detail);
-  // event_kind is required, so an unresolvable one voids the row rather than
-  // emptying a column: report it on the serial line, which is the only channel
-  // left. Never by recursing into this function with another unknown kind.
+  // The record requires event_kind, so an unknown kind voids the row. The
+  // serial line is the only channel left to report it, since a device_event
+  // here would recurse.
   if (w.unknownEnums)
     dualPrintf("[roost] device_event kind \"%s\" not in the registry\n", kind);
   finishAndAppend(&w, ROOST_REC_DEVICE_EVENT, row);
@@ -664,11 +746,13 @@ const char* roostSessionDir() { return ""; }
 uint32_t roostFixSeq() { return 0; }
 bool roostHasFix() { return false; }
 void roostLogWifiObs(const AlertEntry&, const char*) {}
+void roostLogBleObs(const BleObsEntry&) {}
 void roostLogGpsFix() {}
 void roostLogConfigChange(RoostComponent, const char*, const char*) {}
 void roostLogConfigBoot() {}
 void roostLogConfigChannels() {}
 void roostLogConfigVendorMask() {}
+void roostLogConfigRadioMode() {}
 void roostLogDeviceEvent(RoostComponent, const char*, uint32_t, const char*) {}
 void roostLogOperatorMark() {}
 void roostSessionStats(uint32_t* a, uint32_t* b, uint32_t* c, uint32_t* d) {

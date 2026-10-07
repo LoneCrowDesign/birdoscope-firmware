@@ -1,43 +1,40 @@
-# Board parity: functional sync versus UX divergence
+# Board Parity, Functional Sync and UX Divergence
 
-Birdoscope boards fall into two display families over one detection engine:
+Birdoscope boards fall into two display families over one detection engine.
 
-- `src/main_oled.cpp`: the u8g2 status-line OLED boards, including the Heltec
-  V4, the S3 DevKitC builds, and the Analyze r0.1 (ESP32-S3).
-- `src/main_tft.cpp`: the round GC9A01 TFT board (`esp32round`), a richer and
-  differently laid out UI.
+- `src/main_oled.cpp` drives the u8g2 status-line OLED boards, including the
+  Heltec V4, the S3 DevKitC builds, and the Analyze r0.1 and r0.4 boards.
+- `src/main_tft.cpp` drives the round GC9A01 TFT board (`esp32round`), a richer
+  and differently laid out UI.
 
 Both are thin presentation layers over `lib/birdoscope_core`, which holds the
 detection engine and the shared state. The two behave identically but present
-that state differently, and either can be built without the other.
+that state differently, and either one builds without the other.
 
-Keep this split when you modify the code. It is what keeps the firmware
-portable across boards. Implementation details are below.
+Keep this split when you modify the code, since it keeps the firmware portable
+across boards.
 
-## How behavior and rendering are split
+## Splitting Behavior from Rendering
 
-1. **Behavior lives in core.** Anything that changes what the device does is
-   implemented in `lib/birdoscope_core`: detection, persistence, radio handoff,
-   storage fallback, time sync, alert semantics, and board-agnostic signaling.
-   Core is the single source of truth, so device behavior doesn't drift between
-   builds.
+1. **Behavior lives in core.** `lib/birdoscope_core` implements anything that
+   changes what the device does, including detection, persistence, radio
+   handoff, storage fallback, time sync, alert semantics, and board-agnostic
+   signaling.
 2. **`src/main_*.cpp` files only render.** Each one draws core state on
-   its display and wires that board's peripherals to core hooks. It holds no
-   behavior of its own.
+   its display and wires that board's peripherals to core hooks.
 3. **New capability goes into core first.** A feature that needs per-board
    rendering gets its functional hook in core, so every board behaves the same
-   as soon as the feature exists. A board whose on-screen rendering is not
-   finished still gets the behavior, and the missing interface is listed below
-   as UX debt.
+   as soon as the feature exists. A board without finished on-screen rendering
+   still gets the behavior, and the table below marks its interface pending.
 
 A change affecting only how something looks on one display needs no matching
-change on the other. Notable differences below.
+change on the other.
 
-## UX parity table
+## UX Parity Table
 
-The OLED and TFT columns show whether that board renders the capability: yes,
-pending where the interface is still unfinished, or n/a where there is nothing
-to draw.
+The OLED and TFT columns show whether that board renders the capability, as
+yes, pending where the board has no interface for it yet, or n/a where there
+is nothing to draw.
 
 | Capability                         | Shared behavior                                   | OLED | TFT     | Note |
 |------------------------------------|---------------------------------------------------|------|---------|------|
@@ -47,7 +44,7 @@ to draw.
 | Admin (SoftAP) mode screen         | yes, core hop logic                               | yes  | yes     |      |
 | Word-based serial commands         | yes, core tokenizer plus per-board verbs          | yes  | yes     | 3    |
 | Semantic nav layer (`NavEvent`)    | yes, core                                         | yes  | n/a     | 4    |
-| Nine-screen carousel, five menus   | yes, core state (`ScreenId`, `MenuState`)         | yes  | n/a     | 5    |
+| Ten-screen carousel, six menus     | yes, core state (`ScreenId`, `MenuState`)         | yes  | n/a     | 5    |
 | Runtime alert gates                | yes, core (`coreBuzzerEnabled`, `coreLedEnabled`) | yes  | yes     | 6    |
 | Runtime scan-mode switch           | yes, core (`coreSetScanMode`)                     | yes  | yes     | 7    |
 | Runtime target switch              | yes, core (`coreSetVendorMask`)                   | yes  | n/a     | 8    |
@@ -56,61 +53,67 @@ to draw.
 | Vendor-colored detection blink     | yes, core (`notifyDetection`)                     | n/a  | n/a     | 11   |
 | Proximity ring, persisted          | yes, core (`coreSetProxRingM`)                    | yes  | pending | 12   |
 | Device wipe and power off          | yes, core (`coreDeviceWipe`, `corePowerOff`)      | yes  | pending | 13   |
+| Runtime radio switch, BLE capture  | yes, core (`coreSetRadioMode`)                    | yes  | n/a     | 14   |
 
 1. The OLED path blinks blue five times and shows "SD Card Not Found / Saving to
-   SPIFFS", then blocks until Confirm on a board with buttons so the missing
-   card cannot pass unnoticed. A board without buttons holds the notice and
-   carries on. `esp32round` has no LED and still needs an on-screen notice.
+   SPIFFS". A board with nav buttons then waits for Confirm, so the missing
+   card cannot pass unnoticed. A board without them holds the notice for 1.5
+   seconds and carries on. `esp32round` has no LED and still needs an on-screen
+   notice.
 2. Audio and LED only, so neither board file renders anything.
 3. `nav`, `dump`, and `prev` live in core. `status`, `inject`, `log`, and `help`
    are per board file.
-4. Gated on `NAV_BTN_COUNT`, so only an Analyze board running `NAV_SCHEME_3BTN`
+4. `NAV_BTN_COUNT` gates it, so only an Analyze board running `NAV_SCHEME_3BTN`
    or `NAV_SCHEME_4BTN` reads physical buttons through it. The serial injector
    works on every board, and boards with two buttons keep `coreInputTick()`.
-5. Covers menu drill-in: Scan Mode with its channel picker, Targets, Alerts,
-   Web Config, and Device Wipe with its confirmation. The round TFT board shares the core screen and menu state but
-   renders its own round-screen UX, which is divergent by design rather than
-   pending work. Other OLED boards show the single status view until they gain
-   controls. See [Menu UX](menu_ux.md).
+5. Covers menu drill-in for Scan Mode with its channel picker, Targets, Radio,
+   Alerts, Web Config, and Device Wipe with its confirmation. Scan Mode exists
+   only while 802.11 is the selected radio, and the carousel skips it in BLE
+   mode. The round TFT board shares the core screen and menu state but
+   renders its own round-screen UX, by design. OLED boards without nav buttons
+   show a single status view. See [Menu UX](menu_ux.md).
 6. The gates live in core, so every board's chirp and flash obey them. Only the
-   three-button OLED board can toggle them live. Held in RAM, resetting to
-   enabled on reboot.
-7. Both board files already show the mode name via `channelModeName()`. Only the
-   three-button OLED board can change it live. Held in RAM, resetting to the
+   Analyze boards can toggle them live. Core holds them in RAM, and they reset
+   to enabled on reboot.
+7. Both board files show the mode name through `channelModeName()`. Only the
+   Analyze boards can change it live. Core holds it in RAM, and it resets to the
    board default on reboot.
-8. The mask is consulted inside `matchOuiRaw()`, so every board's detections obey
-   it, but only the three-button OLED board has a Targets screen and neither
-   board file displays the active target. Held in RAM, resetting to All on
-   reboot.
-9. Reported as `CoreAlertResult::distM` for every board and every detection where
-   the geometry is valid.
-   The OLED Overview screen shows it as `dst:`; the round TFT has no row for it
-   yet. Only `wildcard_probe` and `oui_addr2` hits get a value, since `oui_addr1`
+8. Both matchers, `matchOuiRaw()` and `coreBleMatch()`, read the mask, so every
+   board's detections obey it, but only the Analyze boards have a Targets screen
+   and neither board file displays the active target. Core holds the mask in
+   RAM, and it resets to All on reboot.
+9. `coreHandleAlert()` reports it as `CoreAlertResult::distM` for every board.
+   The OLED Overview screen shows it as `dst:`, and the round TFT has no row for
+   it yet. Every 802.11 hit except `oui_addr1` gets a value, since `oui_addr1`
    RSSI describes the AP link. See
    [Distance estimation](distance_estimation.md).
 10. Environment Density and the expected RSSI at 1 m, both set from the web
-    console's `calibrate` command. They persist to SPIFFS at `/settings.json`,
-    so unlike the scan-mode and alert gates above they survive a reboot.
+    console's `calibrate` command. Core persists them to SPIFFS at
+    `/settings.json`, so unlike the scan-mode and alert gates above they survive
+    a reboot.
 
-    They are not a screen: they are set once for a site and antenna, not
-    adjusted while walking. Neither board file draws them, hence n/a for the
-    OLED.
+    You set them once for a site and antenna, so they have no screen. Neither
+    board file draws them, hence n/a for the OLED.
 
-    `main_tft.cpp` is pending because it never calls `coreSettingsLoad()`, so
-    the saved values are ignored there until the backport. See
+    `main_tft.cpp` is pending because it never calls `coreSettingsLoad()`, so it
+    ignores the saved values. See
     [Distance estimation](distance_estimation.md).
-11. Blue for Flock, yellow for Axon, with new versus repeat carried by pulse count
-    rather than color. Driven entirely by core's NeoPixel path, so it needs no
-    board rendering; a board without `USE_LED` compiles it out. `esp32round` has
+11. Blue for Flock, yellow for Axon, and pulse count for new versus repeat.
+    Core's NeoPixel path drives it, so it needs no board rendering. A board
+    without `USE_LED` compiles it out. `esp32round` has
     no LED at all. See [Alert behavior](alerts.md).
 12. The chirp when a tracked target closes inside the ring. Core evaluates it in
-    `coreHandleAlert()`, so the alert fires on both board files; only the Alerts
-    menu row that sets the range is OLED-only. `main_tft.cpp` is pending for the
-    same reason as note 10: it never calls `coreSettingsLoad()`, so the persisted
-    range is ignored there and the compiled-in `PROX_RING_M` stands. See
-    [Alert behavior](alerts.md).
-13. The erase itself is core's and board-independent, but only `main_oled.cpp`
-    reaches it: the menu row lives on the shared carousel, and the interrupted
-    wipe check runs in that board's `setup()`. `main_tft.cpp` renders its own UX
-    with no carousel, so it can neither start a wipe nor resume one. See
+    `coreHandleAlert()`, so the alert fires on both board files. Only the OLED
+    boards have the Alerts menu row that sets the range. `main_tft.cpp` is
+    pending for the same reason as note 10, so it ignores the persisted range
+    and uses the compiled-in `PROX_RING_M`. See [Alert behavior](alerts.md).
+13. Core runs the erase on any board, but only `main_oled.cpp` reaches it. The
+    menu row lives on the shared carousel, and the interrupted wipe check runs
+    in that board's `setup()`. `main_tft.cpp` renders its own UX with no
+    carousel, so it can neither start a wipe nor resume one. See
     [Menu UX](menu_ux.md).
+14. Only boards with `HAS_BLE_SCAN` build BLE capture. They need a Bluetooth 5
+    controller for extended advertising, which `esp32round`'s classic ESP32
+    lacks, so that board compiles BLE out and refuses the switch. Of the boards
+    with a carousel, only the Analyze boards declare BLE logging. Core holds the
+    mode in RAM, and it resets to 802.11 on reboot. See [Menu UX](menu_ux.md).

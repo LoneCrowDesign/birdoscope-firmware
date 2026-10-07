@@ -74,7 +74,6 @@
 // micro SD card on its own SPI bus, shared with nothing else on this board, so
 // card access never contends with another peripheral.
 #define USE_SD        1
-#define SD_SELFTEST   0
 #define SD_CS_PIN     5
 #define SD_MOSI_PIN   11
 #define SD_MISO_PIN   13
@@ -131,8 +130,8 @@ static const size_t  fullHopChannelCount = sizeof(fullHopChannels) / sizeof(full
 #define FY_SESSION_TMP       "/session.tmp"
 #define FY_PREV_FILE         "/prev_session.json"
 #define AUTOSAVE_INTERVAL_MS 15000
-#define SD_LOG_FILE          "/log.csv"
-// Canonical post-anchor SD log filename: /bscope-M-D-YY-N.csv
+// Prefix of every SD session directory name. coreSessionDirName() and
+// roost_session.cpp build the rest.
 #define LOG_PREFIX            "bscope-"
 
 // ── Roost logging contract ─────────────────────────────────────────────────

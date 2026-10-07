@@ -2,181 +2,215 @@
 
 The on-device screens and menus. State, meaning the current screen and menu
 selection, lives in `lib/birdoscope_core` so every board renders the same model,
-and each board `main` owns only the pixels. The physical input hardware sits
-behind a semantic nav layer, so a later board revision can swap the buttons for
-an encoder, a 4-button pad, or a 5-way switch without touching this logic. See
-[Input hardware](#input-hardware).
+and each board `main` owns only the pixels. A semantic nav layer sits between
+the physical input and this logic, so a later board revision can swap the
+buttons for an encoder, a 4-button pad, or a 5-way switch without touching it.
+See [Input hardware](#input-hardware).
 
-The carousel and menus below are wired today on the Birdoscope Analyze boards
-(ESP32-S3). r0.1 has three buttons and `NAV_SCHEME_3BTN`, flashed with
-`analyze_r01_n8r2` or `analyze_r01_n16r8`. r0.2 has four and `NAV_SCHEME_4BTN`,
-flashed with `analyze_r02_n16r8_dev`. Boards with two buttons keep the
-older toggle and mark input (`coreInputTick`) and their single status view, and
-the round TFT board renders its own UX. See [Board parity](board_parity.md).
+The Birdoscope Analyze boards (ESP32-S3) run the carousel and menus below. r0.1
+has three buttons and `NAV_SCHEME_3BTN`, flashed with `analyze_r01_n8r2` or
+`analyze_r01_n16r8`. r0.4 has four and `NAV_SCHEME_4BTN`, flashed with
+`analyze_r04_n16r8_dev` or `analyze_r04_n16r8_bare`. Boards with two buttons
+keep the toggle and mark input (`coreInputTick`) and their single status view,
+and the round TFT board renders its own UX. See
+[Board parity](board_parity.md).
 
-## Top-level screens (carousel)
+## Top-Level Screens (Carousel)
 
-Up and Down cycle through nine screens, wrapping at both ends. Four are
-read-only detail views and five are menus you drill into with Select.
+Up and Down cycle through ten screens, wrapping at both ends. Four show
+read-only detail and six are menus you drill into with Select. Scan Mode
+applies to 802.11 only, so the carousel skips it while BLE is the selected
+radio.
 
-1. Overview: detection count, channel, GPS fix flag (Y/N), and for the last hit
-   its vendor, RSSI, channel, and a rough distance estimate. Shows `scanning...`
-   until the first detection.
+1. Overview shows the detection count, channel, GPS fix flag (Y/N), and for the
+   last hit its vendor, RSSI, channel, and a rough distance estimate. It reads
+   `scanning...` until the first detection. In BLE mode it shows the BLE device
+   count and, for the last device, its vendor, RSSI, advertisement count, and
+   serial or MAC. An accessory match reads `acc` after the vendor. BLE has no
+   channel or distance.
 
    ![Overview screen](../assets/images/carousel_demo/01_overview.png)
+   ![Overview screen, BLE mode](../assets/images/carousel_demo/21_overview_ble.png)
 
-2. GPS: fix status and satellite count, current position, and parser health
-   counters (ok and bad checksums, fix-carrying sentences), matching the `[gps]`
-   serial line.
+2. GPS shows fix status and satellite count, current position, and parser
+   health counters (ok and bad checksums, fix-carrying sentences), matching the
+   `[gps]` serial line.
 
    ![GPS screen](../assets/images/carousel_demo/02_gps.png)
 
-3. Detections: device count, the direct and indirect device counts, the last
-   detection MAC, and a frame baseline. `dir` and `ind` count cameras rather
-   than frames and overlap, so one seen both ways counts in each and their sum
-   can exceed the total. The `seen`/`cand` row counts all traffic rather than
-   matches, which is what separates a quiet area from a deaf radio. See
+3. Detections shows the device count, the direct and indirect device counts,
+   the last detection MAC, and a frame baseline. `dir` and `ind` count cameras
+   and overlap, so one seen both ways counts in each and their sum can exceed
+   the total. The bottom row counts all traffic, matched or not, with its rate
+   and the uptime, which separates a quiet area from a deaf radio. It reads
+   `seen:` for 802.11 frames and `adv:` for BLE advertisements. In BLE mode
+   `hits:` replaces `dir` and `ind`, since every BLE detection is direct. See
    [Detection methods](detection_methods.md).
 
    ![Detections screen](../assets/images/carousel_demo/03_detections.png)
+   ![Detections screen, BLE mode](../assets/images/carousel_demo/22_detections_ble.png)
 
-4. Scan: current channel, dwell time, and mode.
+4. Scan shows the current channel, dwell time, and mode. In BLE mode it reads
+   `mode: BLE passive` and shows the advertisement count and the 1M and coded
+   PHY split instead.
 
    ![Scan screen](../assets/images/carousel_demo/04_scan.png)
+   ![Scan screen, BLE mode](../assets/images/carousel_demo/23_scan_ble.png)
 
-5. Scan Mode (menu): Custom Scan, Full Channel, or Single, which opens a channel
-   picker.
+5. Scan Mode (menu) offers Custom Scan, Full Channel, or Single, which opens a
+   channel picker. 802.11 only.
 
    ![Scan Mode screen](../assets/images/carousel_demo/05_scan_mode.png)
 
-6. Targets (menu): Flock, Axon, or All, the vendors the OUI matcher accepts.
+6. Targets (menu) offers Flock, Axon, Motorola, or All, the vendors the matcher
+   accepts on both radios.
 
    ![Targets screen](../assets/images/carousel_demo/13_targets.png)
 
-7. Alerts (menu): Buzzer Muted/Unmuted and LED On/Off toggled in place, plus the
-   proximity ring, which opens a range picker.
+7. Radio (menu) offers 2.4GHz or BLE, the radio that captures.
+
+   ![Radio screen](../assets/images/carousel_demo/19_radio.png)
+
+8. Alerts (menu) toggles Buzzer Muted/Unmuted and LED On/Off in place, and
+   holds the proximity ring, which opens a range picker.
 
    ![Alerts screen](../assets/images/carousel_demo/08_alerts.png)
 
-8. Web Config (menu): Web Console On or Off, the Admin-mode entry.
+9. Web Config (menu) offers Web Console On or Off, the Admin-mode entry.
 
    ![Web Config screen](../assets/images/carousel_demo/10_web_config.png)
 
-9. Device Wipe (menu): Wipe Device or Wipe Device + Card, each behind a
-   three-press confirmation.
+10. Device Wipe (menu) offers Wipe Device or Wipe Device + Card, each behind a
+    three-press confirmation.
 
-   ![Device Wipe screen](../assets/images/carousel_demo/16_wipe.png)
+    ![Device Wipe screen](../assets/images/carousel_demo/16_wipe.png)
 
+### Scan Mode Menu
 
-### Scan Mode menu
+Switches the channel strategy live, and resets to the board default of Custom on
+reboot. `*` marks the active mode and `>` the cursor.
 
-Switches the channel strategy live, and resets to the board default of
-Custom on reboot. The active mode is marked `*` and the cursor is `>`.
+- **Custom Scan** hops the board's custom list (1, 6, 11) at the default dwell.
+- **Full Channel** hops channels 1 through 11.
+- **Single** locks to one channel for stationary close-listen capture. It opens
+  a channel picker, where Up and Down dial 1 to 13, Select sets the channel, and
+  Back returns to the list.
 
-- **Custom Scan**: hop the board's custom list (1, 6, 11) at the default dwell.
-- **Full Channel**: hop channels 1 through 11.
-- **Single**: lock to one channel for stationary close-listen capture. Selecting
-  it opens a channel picker, where Up and Down dial 1 to 13, Select sets the
-  channel, and long-Back cancels back to the list.
-
-### Targets menu
+### Targets Menu
 
 Selects which vendors the OUI matcher accepts, live and in RAM, resetting to All
-on reboot. Deliberately orthogonal to Scan Mode: Targets picks what to look for,
-Scan Mode picks where to listen. Act-and-close, the same idiom as Scan Mode, with
-the active target marked `*` and the cursor `>`.
+on reboot. Targets picks what to look for, and Scan Mode picks where to listen.
+Selecting an entry acts and closes the menu, as in Scan Mode, with `*` on the
+active target and `>` on the cursor.
 
-- **Flock**: the 31 Flock Safety prefixes only.
-- **Axon**: the four Axon prefixes only, covering the Axon, VieVu and Fusus
-  registrations.
-- **All**: every prefix in the table. The default, and the right choice for
-  discovery, since matching costs nothing extra and the narrower targets only
-  discard hits.
+- **Flock** matches Flock Safety prefixes, and the Penguin battery pack on BLE.
+- **Axon** matches the Axon, VieVu and Fusus registrations, and the Axon serial
+  rule on BLE.
+- **Motorola** matches Motorola Solutions, Avigilon Alta and WatchGuard Video,
+  and the Motorola Solutions company identifier on BLE.
+- **All** matches every vendor in the table, including those with no row of
+  their own. It is the default and the right choice for discovery, since
+  matching costs nothing extra and the narrower targets only discard hits.
 
-Narrowing does not speed up scanning or change channel behaviour. It exists to
-keep the logs and alerts from one drive attributable to a single vendor.
+Narrowing leaves scan speed and channel behavior unchanged. It keeps the logs
+and alerts from one drive attributable to a single vendor.
 
 ![Targets menu, drilled in](../assets/images/carousel_demo/14_targets_open.png)
 
-### Alerts menu
+### Radio Menu
 
-Sets the on-device alert feedback live. The two gates are session-only, both
-defaulting to enabled on reboot, the same convention as the scan mode. The
-proximity ring does persist: it is calibration-class, like the distance
+Selects which radio captures, live and in RAM, resetting to 2.4GHz on reboot.
+The two are exclusive, so a switch stops one radio fully before starting the
+other. Selecting an entry acts and closes the menu, with `*` on the active radio
+and `>` on the cursor.
+
+- **2.4GHz** runs 802.11 promiscuous capture under the Scan Mode channel plan.
+- **BLE** runs passive BLE scanning, and the device transmits nothing.
+
+A board without BLE capture hides this screen and refuses the switch.
+
+![Radio menu, drilled in](../assets/images/carousel_demo/20_radio_open.png)
+
+### Alerts Menu
+
+Sets the on-device alert feedback live. The two gates reset to enabled on
+reboot, like the scan mode. The proximity ring persists, like the distance
 settings.
 
 Each row shows its current state. Select flips the highlighted gate in place and
-stays in the list. The state lives in core
-(`coreBuzzerEnabled`, `coreLedEnabled`, `coreProxRingM`), so a board without the
-Alerts screen can use it as well.
+stays in the list. Core holds the state (`coreBuzzerEnabled`, `coreLedEnabled`,
+`coreProxRingM`), so a board without the Alerts screen can use it as well.
 
-- **Buzzer, Unmuted or Muted**: gates the new-detection and proximity chirps.
-  The boot jingle and the on-demand `chirp`, `prox` and `jingle` verbs are
-  unaffected.
-- **LED, On or Off**: gates the detection and proximity LED flashes. The boot
-  RGB cycle and the SD-init blink are unaffected. The heartbeat pulse does not
-  run on a board with a screen, so this menu never gates it.
-- **Prox, a range or Off**: opens a picker for the proximity ring (Off, 10 m,
-  25 m, 50 m, 100 m), the range at which a target already being tracked chirps
-  again as you close on it. Select applies and saves; long-Back leaves it
-  unchanged. See [Alert behavior](alerts.md).
+- **Buzzer, Unmuted or Muted** gates the new-detection and proximity chirps.
+  The boot call and the on-demand `chirp`, `prox` and `jingle` verbs ignore it.
+- **LED, On or Off** gates the detection and proximity LED pulses. The boot RGB
+  cycle and the SD-init blink ignore it. No board with a screen runs the
+  heartbeat pulse, so this gate never applies to it.
+- **Prox, a range or Off** opens a picker for the proximity ring (Off, 10 m,
+  25 m, 50 m, 100 m), the range at which a tracked target chirps again as you
+  close on it. Select applies and saves the range, and Back leaves it unchanged.
+  See [Alert behavior](alerts.md).
 
 ![Alerts menu, proximity picker](../assets/images/carousel_demo/15_alerts_prox.png)
 
-### Web Config menu
+### Web Config Menu
 
-Starts and stops the Admin-mode web portal:
+Starts and stops the Admin-mode web portal.
 
-- **On (Admin)**: enters the software access point (SoftAP) web portal, which
+- **On (Admin)** enters the software access point (SoftAP) web portal, which
   pauses scanning. This is the Admin gesture for a board with controls.
-- **Leaving Admin**: hold Back for `NAV_EXIT_HOLD_MS`, 3 seconds by default. A
-  click does not exit, so the portal cannot be dropped by a stray press while
-  the board is stowed. The web console command and the idle timeout still
-  release it, and on a board with `BOOT_ADMIN_TRIGGER` set the BOOT
-  double-press is a further escape. Analyze r0.2 clears that flag, leaving the
-  hold as its only button route out.
-- **Off**: closes the menu and returns to the resting Detect state.
+- **Leaving Admin** takes a double press of Back within `NAV_BACK_DOUBLE_MS`,
+  600 ms by default, or a hold for `NAV_EXIT_HOLD_MS`, 3 seconds. A single click
+  leaves the portal up, so a stray press in a bag or pocket cannot drop
+  it. Analyze r0.4 clears `BOOT_ADMIN_TRIGGER`, so these two gestures are its
+  only button routes out. The web console command and the idle timeout also
+  release the portal.
 
-### Device Wipe menu
+  The double press needs a dedicated Back button, so only the 4-button scheme
+  has it. Under the 3-button scheme Back is a long press of BTN_3, and those
+  boards keep the BOOT double-press instead.
+- **Off** closes the menu and returns to the resting Detect state.
 
-Erases the unit so it can be sold, donated, or handed on. Selecting either wipe option prompts a confirmation screen to avoid accidental data loss. After the wipe function finishes running, the device is put into deep sleep and must be power cycled to start fresh.
+### Device Wipe Menu
 
-- **Wipe Device**: onboard state only. The detection table is zeroed, SPIFFS is
-  formatted, and the NVS partition is erased whole. For the usual case, where
-  the card is pulled and replaced rather than cleaned.
-- **Wipe Device + Card**: the above, plus every entry in the card's root,
-  removed recursively.
+Erases the unit so you can sell, donate, or hand it on. Either wipe option opens
+a confirmation screen that takes three presses of Confirm. When the wipe
+finishes, the device enters deep sleep, and you power cycle it to start fresh.
+
+- **Wipe Device** clears onboard state only. It zeroes the detection table,
+  formats SPIFFS, and erases the whole NVS partition. Use it when you pull and
+  replace the card.
+- **Wipe Device + Card** does the above, then recursively removes every entry
+  in the card's root.
 
 ![Device Wipe menu, drilled in](../assets/images/carousel_demo/17_wipe_open.png)
 
+## Round TFT Screens (esp32round)
 
-
-## Round TFT screens (esp32round)
-
-The round GC9A01 board renders its own UX rather than the carousel above. It has
+The round GC9A01 board renders its own UX in place of the carousel above. It has
 two screens, toggled with the IO19 button.
 
-- **Scan screen** (default): a small procedural flock of birds, a handful of
-  chevron shapes, stays centered at all times. While idle the background is
-  black. When a camera is actively in range, meaning within
-  `HB_DEVICE_ACTIVE_MS` (3 s) of the last hit, the background turns red and a
-  ring and pointer marker are drawn at the screen edge on top of the flock. The
-  pointer position is driven by RSSI on a 270° gauge. The pointer is a
-  proximity indicator, not a compass direction, since that board has no bearing
-  or antenna-array hardware.
-- **Count screen**: a "Flocks:" label with the session detection count, large
-  and centered.
+- **Scan screen** (default) keeps a small procedural flock of birds, a handful
+  of chevron shapes, centered at all times. While idle the background is black.
+  When a camera is in range, meaning within `HB_DEVICE_ACTIVE_MS` (3 s) of the
+  last hit, the background turns red, and the board draws a ring and pointer
+  marker at the screen edge on top of the flock. RSSI drives the pointer around
+  a 270° gauge. The pointer shows proximity only, since that board has no
+  bearing or antenna-array hardware.
+- **Count screen** shows a `Flocks:` label with the session detection count,
+  large and centered.
 
-Switching screens only changes what is rendered, since `displayTick()` branches
-on `currentScreen`. The WiFi promiscuous callback, SPIFFS persistence, and SD
-logging are untouched by which screen is showing.
+Switching screens only changes what the board draws, since `displayTick()`
+branches on `currentScreen`. The WiFi promiscuous callback, SPIFFS persistence,
+and SD logging run the same on either screen.
 
 IO4 fires the manual area-of-interest marker. See
 [the board's pinout](hardware/hardware_esp32round.md) for the wiring.
 
-## Control grammar
+## Control Grammar
 
-One grammar applies at both levels: move, confirm, back. On the 3-button board:
+One grammar applies at both levels, move, confirm, back. On the 3-button board
+the buttons map as follows.
 
 | Button | Gesture | Top level                                       | Inside a menu             |
 |--------|---------|-------------------------------------------------|---------------------------|
@@ -189,18 +223,17 @@ One grammar applies at both levels: move, confirm, back. On the 3-button board:
 The carousel behaves as a spinner, where Up means a higher screen number, which
 matches the Single-channel picker where Up means a higher channel. A menu list
 uses the usual convention instead, where Up moves the highlight toward the first
-item. The two differ because the visual contexts differ.
+item.
 
-Manual mark keeps a dedicated, always-available gesture on long BTN_1 rather
-than an overloaded context press, because it has to work on any screen. Firing it
-flashes a brief "Saved Manual Record!" overlay for 1.5 seconds, which is the only
-on-screen indication; no screen prints the gesture.
+Manual mark has a dedicated gesture on long BTN_1, because it has to work on any
+screen. Firing it flashes a "Saved Manual Record!" overlay for 1.5 seconds, the
+only on-screen sign of the gesture.
 
-## Semantic nav layer
+## Semantic Nav Layer
 
 `coreNavTick()` maps the physical buttons, distinguishing short from long press
 per `NAV_SCHEME`, into display-independent events. `coreNavApply()` feeds those
-into the screen and menu state machine:
+into the screen and menu state machine.
 
 | Event                 | Meaning                                  |
 |-----------------------|------------------------------------------|
@@ -209,17 +242,17 @@ into the screen and menu state machine:
 | `NAV_BACK`            | exit menu without change                 |
 | `NAV_MARK`            | manual area-of-interest marker           |
 
-Events also arrive from the serial nav injector, so the whole screen and menu
-machine can be driven with no physical input:
+The serial nav injector also sends events, so you can drive the whole screen and
+menu machine with no physical input.
 
 ```text
 nav up | nav down | nav select | nav back | nav mark
 ```
 
-## Serial commands
+## Serial Commands
 
-Commands are word-based, using brief noun and verb tokens, and are
-newline-terminated. Core owns the shared verbs and each board adds its own.
+Commands are newline-terminated words, brief noun and verb tokens. Core owns the
+shared verbs and each board adds its own.
 
 | Command                              | Owner         | Action                       |
 |--------------------------------------|---------------|------------------------------|
@@ -233,66 +266,66 @@ newline-terminated. Core owns the shared verbs and each board adds its own.
 | `crow` / `hawk`                      | core (buzzer) | play either boot call        |
 | `help` / `?`                         | board         | list commands                |
 
-### Web console parity
+### Web Console Parity
 
 The Admin-mode web console (`lib/birdoscope_core/web_portal.cpp`, backed by
-WebConsole) registers
-the same verbs, so it stands in fully for the UART console and its `help` lists
-everything. Differences on the web side:
+WebConsole) registers the same verbs, so it stands in fully for the UART console
+and its `help` lists everything. The web side differs in these ways.
 
 - `dump` and `prev` stream the SPIFFS session JSON into the web log, capped at
   8 KB and batched, with a download fallback.
 - `log` defaults to the CSV header plus the last 10 rows, held in a RAM-safe
-  rolling window. `log full` streams the whole file. It always draws from the
-  currently active log (`sdLog`), which is `/log.csv` until GPS anchors a
-  timestamped name and then follows the rename. Output is batched so a bulk dump
-  cannot overrun the WebSocket and drop the client.
+  rolling window. `log full` streams the whole file. It reads the open
+  session's `wifi_obs` file and follows the directory rename when GPS anchors
+  the clock. The console batches output so a bulk dump cannot overrun the
+  WebSocket and drop the client.
+- The Logs page lists each session directory's files, and any `.csv` in the
+  card's root, as download links.
 - `gps` prints the GPS detail (fix, satellites, position, and parser counters)
   on demand. The web console has no equivalent of the serial `[gps]` 5-second
   auto-line.
-- `inject` and `nav` are Detect-loop actions and no-op in Admin, where scanning
-  is paused.
-- `wifi` is a pinned form taking an SSID and password. It saves the network used
-  for the boot-time NTP time-sync fallback, the one that applies when no GPS
-  module is detected. Credentials are stored to SPIFFS at `/wifi.json` and
-  consumed at the next boot. Submitting an empty SSID reports the currently
-  saved network, and `wifi-forget` erases it. This is web-only, since it needs a
-  form. The password is never echoed back.
-- `calibrate` tunes the distance estimate behind the Overview screen's `dst:` row.
-  It takes an Environment Density preset (low, medium, or high) and `rssi_1m`, the
-  expected RSSI one metre from a target. `rssi_trim` steps that reference instead
-  of replacing it, which is the in-field adjustment when an estimate is visibly
-  wrong. Both settings persist to SPIFFS at `/settings.json` and reload at boot.
-  Submitting nothing reports the active model against the last real detection.
-  Changes apply to the next detection rather than rescaling the estimate already
-  on screen. Web-only, since it needs a form. See
+- `inject` and `nav` are Detect-loop actions and do nothing in Admin, which
+  pauses scanning.
+- `wifi` is a pinned form taking an SSID and password. It saves the network the
+  boot-time NTP time sync uses when no GPS module is present. The firmware
+  stores the credentials to SPIFFS at `/wifi.json` and reads them at the next
+  boot. Submitting an empty SSID reports the saved network, and `wifi-forget`
+  erases it. This is web-only, since it needs a form. The console never echoes
+  the password.
+- `calibrate` tunes the distance estimate behind the Overview screen's `dst:`
+  row. It takes an Environment Density preset (low, medium, or high) and
+  `rssi_1m`, the expected RSSI one meter from a target. `rssi_trim` steps that
+  reference without replacing it, for in-field adjustment when an estimate is
+  visibly wrong. Both settings persist to SPIFFS at `/settings.json` and reload
+  at boot. Submitting nothing reports the active model against the last real
+  detection. Changes apply from the next detection, and the estimate already on
+  screen stays as it is. Web-only, since it needs a form. See
   [Distance estimation](distance_estimation.md).
-- Pinned buttons in the Controls card are `status`, `wifi`, and `help`, though
-  typing `help` still uses the client-side listing. The tone tests `chirp`,
-  `prox`, `jingle`, `crow` and `hawk` are unpinned typed verbs, present on both
-  consoles. A board with no buzzer reports them as unknown rather than accepting
-  them and doing nothing. Each acknowledges on the console, so the verb is
-  distinguishable from a silent failure.
+- The Controls card pins `status`, `wifi`, and `help`, and typing `help` still
+  uses the client-side listing. Both consoles accept the tone tests `chirp`,
+  `prox`, `jingle`, `crow` and `hawk` as typed verbs, with no pinned button. A
+  board with no buzzer reports them as unknown. Each verb acknowledges on the
+  console, so you can tell it from a silent failure.
 - `session`, `prev_session`, and the SD CSVs are also one-click downloads.
 
-## Input hardware
+## Input Hardware
 
 The semantic nav layer is the swap point. Supporting a new control type means
 adding a `NAV_SCHEME_*` implementation in `coreNavTick()` that emits the same
-events. Nothing downstream changes: the screen carousel, the menu state machine,
-and every board's render code stay as they are.
+events. The screen carousel, the menu state machine, and every board's render
+code stay as they are.
 
 Two schemes exist. `NAV_SCHEME_3BTN` uses three buttons distinguished by short
 and long press. `NAV_SCHEME_4BTN` is the same grammar with Back moved to a
-fourth button as a short press, so Confirm no longer carries a long press. Both
-emit identical events, and a board picks one in its `board_config.h`.
+fourth button as a short press, so Confirm has no long press. Both emit
+identical events, and a board picks one in its `board_config.h`.
 
-| Button | `NAV_SCHEME_3BTN` | `NAV_SCHEME_4BTN` |
-|--------|-------------------|-------------------|
-| 1      | short Up, long Mark | short Up, long Mark |
-| 2      | short Down        | short Down        |
-| 3      | short Confirm, long Back | short Confirm |
-| 4      | not present       | short Back        |
+| Button | `NAV_SCHEME_3BTN`        | `NAV_SCHEME_4BTN`   |
+|--------|--------------------------|---------------------|
+| 1      | short Up, long Mark      | short Up, long Mark |
+| 2      | short Down               | short Down          |
+| 3      | short Confirm, long Back | short Confirm       |
+| 4      | not present              | short Back          |
 
 Holding Back for 3 seconds emits `NAV_BACK_HOLD` on either scheme, meaning long
 button 3 on the three-button boards and long button 4 on the four-button ones.
@@ -300,7 +333,6 @@ Only the Admin screen consumes it. On four buttons the hold cancels the click
 that release would otherwise send. On three buttons Back has already fired at
 the 500 ms mark, which Admin discards.
 
-The scan mode and the Single-mode channel are session-only by design. Both boot
-to the board defaults every time. The alert gates behave the same way. The
-proximity ring and the `calibrate` settings are calibration-class and do
-persist, as noted in the Alerts and Web Config sections above.
+The scan mode, the Single-mode channel and the alert gates reset to the board
+defaults at every boot. The proximity ring and the `calibrate` settings persist,
+as the Alerts and Web Config sections above describe.

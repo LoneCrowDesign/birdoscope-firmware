@@ -3,11 +3,9 @@
 //
 // Host tests for this board's roost contract declaration.
 //
-// Asserted against the generated header rather than a recorded fixture. A
-// fixture pins the bytes of one build and has to be regenerated whenever the
-// registry grows; the checks here follow the registry automatically and catch
-// the class of failure that actually occurs: a row whose fields do not line up
-// with the header its manifest declares.
+// The checks read the generated registry header, so they follow the registry
+// as it grows. They assert that a row's fields line up with the header its
+// manifest declares.
 
 #include <stdint.h>
 #include <stddef.h>
@@ -35,36 +33,52 @@ static int columnsIn(RoostFieldMask mask, RoostRecord rec) {
 
 void test_components_are_valid_and_distinct(void) {
   TEST_ASSERT_EQUAL_INT(1, roostComponentsValid());
-  TEST_ASSERT_EQUAL_INT(3, ROOST_COMPONENT_COUNT);
+  TEST_ASSERT_EQUAL_INT(4, ROOST_COMPONENT_COUNT);
   TEST_ASSERT_EQUAL_STRING("wifi0", roostComponentId(ROOST_COMP_WIFI0));
+  TEST_ASSERT_EQUAL_STRING("ble0",  roostComponentId(ROOST_COMP_BLE0));
   TEST_ASSERT_EQUAL_STRING("gnss0", roostComponentId(ROOST_COMP_GNSS0));
   TEST_ASSERT_EQUAL_STRING("sys",   roostComponentId(ROOST_COMP_SYS));
 }
 
-// The radio reaches 2.4 GHz only. Without this an absent 5 GHz row is
-// undecidable between a hardware limit and a channel plan that never went there.
+// The radio reaches 2.4 GHz only. With the band mask, a reader can tell a
+// hardware limit from a channel plan that never visited 5 GHz.
 void test_wifi_component_reaches_only_2_4(void) {
   TEST_ASSERT_EQUAL_UINT(ROOST_BAND_REACH_2_4,
                          roostComponentBandMask(ROOST_COMP_WIFI0));
 }
 
-// Five of six. ble_obs is out until a BLE capture mode exists; declaring it
-// would put an empty ble_obs.v1.csv in every session, asserting BLE was
-// reachable and nothing was heard.
+// All six records. radio_mode tells an empty ble_obs apart from a radio
+// switched off.
 void test_emitted_record_set(void) {
   TEST_ASSERT_TRUE(ROOST_EMITS_WIFI_OBS);
   TEST_ASSERT_TRUE(ROOST_EMITS_GPS_TRACK);
   TEST_ASSERT_TRUE(ROOST_EMITS_CONFIG_CHANGE);
   TEST_ASSERT_TRUE(ROOST_EMITS_DEVICE_EVENT);
   TEST_ASSERT_TRUE(ROOST_EMITS_OPERATOR_MARK);
-  TEST_ASSERT_FALSE(ROOST_EMITS_BLE_OBS);
+  TEST_ASSERT_TRUE(ROOST_EMITS_BLE_OBS);
 }
 
-// A record this build emits but cannot fill the required set of would produce
-// nothing but voided rows at runtime.
+// A BLE survey row writes operator_survey, per spec O3. The ble_obs
+// restriction must allow it, or the row builder voids every survey row.
+void test_ble_obs_accepts_survey_rows(void) {
+  TEST_ASSERT_TRUE(roostValueAllowed(ROOST_REC_BLE_OBS,
+                                     ROOST_BLE_OBS_DETECTION_METHOD,
+                                     ROOST_DETECTION_METHOD_OPERATOR_SURVEY));
+  TEST_ASSERT_TRUE(roostValueAllowed(ROOST_REC_BLE_OBS,
+                                     ROOST_BLE_OBS_DETECTION_METHOD,
+                                     ROOST_DETECTION_METHOD_BLE_MFR));
+  TEST_ASSERT_FALSE(roostValueAllowed(ROOST_REC_BLE_OBS,
+                                      ROOST_BLE_OBS_DETECTION_METHOD,
+                                      ROOST_DETECTION_METHOD_OUI_ADDR2));
+}
+
+// Every emitted record's columns must cover its required fields, or the row
+// builder voids every row.
 void test_column_masks_cover_required(void) {
   TEST_ASSERT_TRUE(roostMaskSatisfiesRequired(ROOST_REC_WIFI_OBS,
                                               ROOST_WIFI_OBS_COLUMNS_MASK));
+  TEST_ASSERT_TRUE(roostMaskSatisfiesRequired(ROOST_REC_BLE_OBS,
+                                              ROOST_BLE_OBS_COLUMNS_MASK));
   TEST_ASSERT_TRUE(roostMaskSatisfiesRequired(ROOST_REC_GPS_TRACK,
                                               ROOST_GPS_TRACK_COLUMNS_MASK));
   TEST_ASSERT_TRUE(roostMaskSatisfiesRequired(ROOST_REC_CONFIG_CHANGE,
@@ -75,9 +89,8 @@ void test_column_masks_cover_required(void) {
                                               ROOST_OPERATOR_MARK_COLUMNS_MASK));
 }
 
-// auth_mode is reachable through ie_parse and has no producer, so it is
-// excluded rather than left permanently empty. Capable but not recorded is a
-// different statement from reachable-and-nothing-to-report.
+// auth_mode is reachable through ie_parse and has no producer. See
+// ROOST_WIFI_OBS_EXCLUDE in board_config.h.
 void test_auth_mode_is_capable_but_excluded(void) {
   const RoostFieldMask f = ROOST_F(ROOST_WIFI_OBS_AUTH_MODE);
   TEST_ASSERT_TRUE(ROOST_WIFI_OBS_CAPABLE_MASK & f);
@@ -85,7 +98,7 @@ void test_auth_mode_is_capable_but_excluded(void) {
 }
 
 // capable must be a superset of columns, or the manifest claims a column the
-// hardware cannot fill.
+// build cannot fill.
 void test_capable_is_a_superset_of_columns(void) {
   TEST_ASSERT_EQUAL_UINT(ROOST_WIFI_OBS_COLUMNS_MASK,
       ROOST_WIFI_OBS_COLUMNS_MASK & ROOST_WIFI_OBS_CAPABLE_MASK);
@@ -93,12 +106,11 @@ void test_capable_is_a_superset_of_columns(void) {
       ROOST_GPS_TRACK_COLUMNS_MASK & ROOST_GPS_TRACK_CAPABLE_MASK);
 }
 
-// --- Row against header, the check this file exists for ---------------------
+// --- Row against header -----------------------------------------------------
 
-// Builds a wifi_obs row populating only the required fields. roostRowFinish()
-// pads every other declared column, so the separator count must equal the
-// header's exactly. This is the shifted-column failure, and nothing on the
-// device would report it.
+// The test fills only the required fields of a wifi_obs row. roostRowFinish()
+// pads every other declared column, so the row's separator count must equal the
+// header's. No on-device check catches a shifted column.
 void test_wifi_obs_row_aligns_with_header(void) {
   char header[512];
   TEST_ASSERT_TRUE(roostHeader(header, sizeof(header), ROOST_REC_WIFI_OBS,
@@ -124,16 +136,16 @@ void test_wifi_obs_row_aligns_with_header(void) {
   TEST_ASSERT_EQUAL_UINT(0, w.unknownEnums);
 }
 
-// Every emitted record, not only the one with the most columns.
+// Each record's header carries one column per declared field.
 void test_every_record_row_aligns_with_header(void) {
   const RoostRecord recs[] = {
-    ROOST_REC_WIFI_OBS, ROOST_REC_GPS_TRACK, ROOST_REC_CONFIG_CHANGE,
-    ROOST_REC_DEVICE_EVENT, ROOST_REC_OPERATOR_MARK,
+    ROOST_REC_WIFI_OBS, ROOST_REC_BLE_OBS, ROOST_REC_GPS_TRACK,
+    ROOST_REC_CONFIG_CHANGE, ROOST_REC_DEVICE_EVENT, ROOST_REC_OPERATOR_MARK,
   };
   const RoostFieldMask masks[] = {
-    ROOST_WIFI_OBS_COLUMNS_MASK, ROOST_GPS_TRACK_COLUMNS_MASK,
-    ROOST_CONFIG_CHANGE_COLUMNS_MASK, ROOST_DEVICE_EVENT_COLUMNS_MASK,
-    ROOST_OPERATOR_MARK_COLUMNS_MASK,
+    ROOST_WIFI_OBS_COLUMNS_MASK, ROOST_BLE_OBS_COLUMNS_MASK,
+    ROOST_GPS_TRACK_COLUMNS_MASK, ROOST_CONFIG_CHANGE_COLUMNS_MASK,
+    ROOST_DEVICE_EVENT_COLUMNS_MASK, ROOST_OPERATOR_MARK_COLUMNS_MASK,
   };
 
   for (size_t i = 0; i < sizeof(recs) / sizeof(recs[0]); i++) {
@@ -143,8 +155,8 @@ void test_every_record_row_aligns_with_header(void) {
   }
 }
 
-// A row missing a required column must produce nothing rather than a short
-// row that still parses. Here cap_component, obs_mode, mac and rssi are absent.
+// A row missing a required column must produce nothing. This row lacks
+// cap_component, obs_mode, mac and rssi.
 void test_row_missing_required_field_is_voided(void) {
   char row[512];
   RoostRow w;
@@ -155,9 +167,8 @@ void test_row_missing_required_field_is_voided(void) {
   TEST_ASSERT_EQUAL_STRING("", row);
 }
 
-// Canonical order is enforced by the writer: a column already passed cannot be
-// filled in afterwards, so a misordered writer yields nothing rather than a
-// misaligned file.
+// The row builder enforces canonical order. It refuses a column it has already
+// passed, and the row then yields nothing.
 void test_out_of_order_write_is_refused(void) {
   static const uint8_t mac[6] = {0xb4, 0x1e, 0x52, 0x01, 0x02, 0x03};
   char row[512];
@@ -165,14 +176,13 @@ void test_out_of_order_write_is_refused(void) {
   roostRowBegin(&w, row, sizeof(row), ROOST_REC_WIFI_OBS,
                 ROOST_WIFI_OBS_COLUMNS_MASK);
   roostRowSetInt(&w, ROOST_WIFI_OBS_RSSI, -82);
-  // mac is earlier in canonical order and has already been passed.
+  // mac precedes rssi in canonical order, so the builder has already passed it.
   TEST_ASSERT_EQUAL_INT(0, roostRowSetMac(&w, ROOST_WIFI_OBS_MAC, mac));
   TEST_ASSERT_EQUAL_UINT(0, roostRowFinish(&w));
 }
 
-// A name the vocabulary does not carry leaves the column empty and is counted,
-// rather than voiding the row or writing an undeclared value. Unread, that
-// reads as "nothing to record" when a producer has drifted from the registry.
+// A name outside the vocabulary leaves the column empty and increments
+// unknownEnums. The row still writes.
 void test_unknown_enum_name_is_counted(void) {
   char row[512];
   RoostRow w;
@@ -182,14 +192,10 @@ void test_unknown_enum_name_is_counted(void) {
   TEST_ASSERT_EQUAL_UINT(1, w.unknownEnums);
 }
 
-// Every required column of every record this board emits must be reachable
-// with the setter its declared type calls for. Walks the types rather than
-// naming columns, so a record gaining a required field is covered without
-// this test being edited.
-//
-// This guards the registry, not the device writers: a device setting a typed
-// column with the wrong setter is not reachable from a host test. Its value is
-// in a required field being added later that some record cannot satisfy.
+// Every declared column of every record this board emits must accept the
+// setter its declared type calls for. The test walks the declared types, so it
+// covers a new required field with no edit. Its scope is the registry, since a
+// host test cannot reach the device writers.
 static void setByDeclaredType(RoostRow* w, RoostRecord rec, uint8_t idx) {
   static const uint8_t kMac[6] = {0x04, 0x17, 0xb6, 0x01, 0x02, 0x03};
   switch (roostFieldTypeOf(rec, idx)) {
@@ -199,7 +205,14 @@ static void setByDeclaredType(RoostRow* w, RoostRecord rec, uint8_t idx) {
     case ROOST_FT_INT:   roostRowSetInt(w, idx, -1);          break;
     case ROOST_FT_FLOAT: roostRowSetFloat(w, idx, 1.0);       break;
     case ROOST_FT_HEX:   roostRowSetHex(w, idx, kMac, 1);     break;
-    case ROOST_FT_ENUM:  roostRowSetEnum(w, idx, 0);          break;
+    case ROOST_FT_ENUM: {
+      // The lowest value the record allows, since a restricted column refuses
+      // the rest.
+      int v = 0;
+      while (v < 64 && !roostValueAllowed(rec, idx, v)) v++;
+      roostRowSetEnum(w, idx, v);
+      break;
+    }
     default: break;
   }
 }
@@ -221,8 +234,7 @@ void test_every_required_column_takes_its_declared_setter(void) {
   }
 }
 
-// The refusal itself, pinned: a text setter on a mac column takes the row down
-// rather than leaving one column empty.
+// A text setter on a mac column voids the whole row.
 void test_wrong_setter_class_voids_the_row(void) {
   char row[512];
   RoostRow w;
@@ -237,7 +249,7 @@ void test_wrong_setter_class_voids_the_row(void) {
   TEST_ASSERT_EQUAL_INT(0, row[0]);
 }
 
-// The four spellings corrected in P3, asserted so a producer cannot drift back.
+// These producer spellings must resolve in the vocabulary.
 void test_producer_vocabulary_resolves(void) {
   const char* subtypes[] = {"probe_req", "probe_resp", "beacon", "ctrl",
                             "unknown", "atim", "action", "data"};
@@ -267,6 +279,7 @@ int main(void) {
   RUN_TEST(test_components_are_valid_and_distinct);
   RUN_TEST(test_wifi_component_reaches_only_2_4);
   RUN_TEST(test_emitted_record_set);
+  RUN_TEST(test_ble_obs_accepts_survey_rows);
   RUN_TEST(test_column_masks_cover_required);
   RUN_TEST(test_auth_mode_is_capable_but_excluded);
   RUN_TEST(test_capable_is_a_superset_of_columns);

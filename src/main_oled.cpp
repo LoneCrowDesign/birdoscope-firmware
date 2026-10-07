@@ -1,10 +1,9 @@
 // Copyright (C) 2026 Lone Crow Design, LLC
 // Licensed under the MIT License. See LICENSE.
 //
-// Shared main file for the u8g2 status-line OLED boards. Detection logic lives
-// in lib/birdoscope_core, so this file covers OLED drawing plus setup() and
-// loop() orchestration only. The one per-board difference here is the u8g2
-// constructor, selected by OLED_HW_I2C in board_config.h.
+// Main file for the u8g2 OLED boards. Detection logic lives in
+// lib/birdoscope_core, so this file covers OLED drawing plus setup() and loop()
+// orchestration only. Boards differ here only through board_config.h flags.
 #include <Arduino.h>
 #include <string.h>
 #include "esp_wifi.h"
@@ -15,8 +14,9 @@
 #include <U8g2lib.h>
 
 // ============================================================
-// CONFIG: pins, feature flags, tuning constants for specific hardware.
-// Selected per-env via the -I build flag in platformio.ini.
+// CONFIG
+// Pins, feature flags and tuning constants for specific hardware. The -I build
+// flag in platformio.ini selects the board_config.h for each env.
 // ============================================================
 
 #include "board_config.h"
@@ -36,21 +36,20 @@ static void stopSniffing(const char* reason) {
 // ============================================================
 
 // OLED_ROTATION is the u8g2 rotation constant passed to the constructor. It
-// defaults to U8G2_R0 (native). A board whose panel is mounted upside-down
-// sets U8G2_R2 (180°) in its board_config.h.
+// defaults to U8G2_R0 (native). A board with its panel upside-down sets
+// U8G2_R2 (180°) in its board_config.h.
 #ifndef OLED_ROTATION
 #define OLED_ROTATION U8G2_R0
 #endif
 
-// OLED_HW_I2C selects between two u8g2 constructors:
+// OLED_HW_I2C picks one of two u8g2 constructors.
 //   0  software-bitbanged I2C with explicit SDA/SCL/RST pins, for a board
 //      with no hardware I2C bus free
-//   1  hardware I2C, with pins set via Wire.begin() in displayInit() rather
-//      than the constructor
-// OLED_SH1106 (HW-I2C path only) picks the SH1106 controller instead of the
-// SSD1306. The SH1106 has 132 columns of RAM behind a 128px panel, so its
-// u8g2 constructor applies a 2px column offset the SSD1306 one does not.
-// Using the wrong one shows a 2px horizontal shift and edge-column garbage.
+//   1  hardware I2C, with displayInit() setting the pins via Wire.begin()
+// OLED_SH1106 (HW-I2C path only) picks the SH1106 controller over the SSD1306.
+// The SH1106 has 132 columns of RAM behind a 128px panel, so its u8g2
+// constructor applies a 2px column offset. The constructor must match the
+// panel's controller.
 #if OLED_HW_I2C
 #include <Wire.h>
 #if defined(OLED_SH1106)
@@ -68,20 +67,19 @@ static int8_t dispRssi     = 0;
 static uint8_t dispCh      = 0;
 static int8_t dispVendor   = -1;   // Vendor enum value, or -1 for no match
 // Metres, straight from CoreAlertResult::distM so the panel and logs agree. -1
-// renders "via AP", spec S3. Cached, so recalibrating shows on the next
-// detection.
+// renders "via AP", spec S3. The panel keeps the cached value, so a
+// recalibration shows on the next detection.
 static float  dispDistM    = -1.0f;
 static bool   dispDirty    = false;
 static unsigned long dispLastRefresh = 0;
 #define DISPLAY_REFRESH_MS 2000
 
 // ============================================================
-// DEMO MODE (reduces screen flicker for photos; off unless -DDEMO_MODE=1)
+// DEMO MODE (holds a still frame for photos, off unless -DDEMO_MODE=1)
 //
-// Overwrites the display state with fixed values before so the panel holds a
-// still frame for the camera. Scanning still runs underneath; only what the
-// screen reads is pinned. Don't forget to reflash for standard mode if you
-// use this or the detector will look like it's broken.
+// displayTick() overwrites the display state with fixed values on each pass.
+// Scanning still runs underneath, and only the screen's readout holds still.
+// Reflash a standard build afterwards, or the detector looks broken.
 // ============================================================
 #ifndef DEMO_MODE
 #define DEMO_MODE 0
@@ -94,9 +92,9 @@ static unsigned long dispLastRefresh = 0;
 #define DEMO_MAC       DEMO_OUI ":7b:04:19"
 #define DEMO_RSSI      (-80)   // mid-range, so the frame shows a plausible distance
 #define DEMO_VENDOR    VENDOR_FLOCK      // DEMO_OUI is a Flock-tagged prefix
-// Stated outright, not derived, so a demo frame is a fixed picture. Kept
-// consistent by hand with DEMO_RSSI under the defaults, and equal to DEMO_DIST_M
-// in tools/screen_render/render.cpp.
+// A literal, so a demo frame is a fixed picture. Keep it consistent by hand
+// with DEMO_RSSI under the defaults, and equal to DEMO_DIST_M in
+// tools/screen_render/render.cpp.
 #define DEMO_DIST_M    (25.1f)
 
 static void demoSeedDisplayState() {
@@ -115,9 +113,10 @@ static void demoSeedDisplayState() {
 #endif  // DEMO_MODE
 
 // ============================================================
-// DRAIN QUEUE: pops core's alert queue, calls coreHandleAlert() for the
-// shareable table/SD/JSON/notification middle, then updates display state
-// and handles the (rare) stop-on-hit option.
+// DRAIN QUEUE
+// Pops core's alert queue, hands each entry to coreHandleAlert() for the table,
+// SD, JSON and notification work, then updates the display state and applies
+// the stop-on-hit options.
 // ============================================================
 
 static void drainAlertQueue() {
@@ -163,10 +162,10 @@ static void displayInit() {
 #else
   Wire.begin(OLED_SDA, OLED_SCL);
 
-  // OLED_I2C_ADDR is the panel's 7-bit address, set by boards whose
-  // module does not answer on u8g2's default. A board that sets the address
-  // also gets a boot-time probe naming every device on the bus, so a blank
-  // screen says whether it is a wrong address or no panel.
+  // OLED_I2C_ADDR is the panel's 7-bit address, set by boards whose module
+  // does not answer on u8g2's default. When nothing acks at that address, a
+  // boot-time scan names every device on the bus, so a blank screen tells a
+  // wrong address from a missing panel.
 #ifdef OLED_I2C_ADDR
   u8g2.setI2CAddress(OLED_I2C_ADDR << 1);
   Wire.beginTransmission(OLED_I2C_ADDR);
@@ -187,8 +186,8 @@ static void displayInit() {
   u8g2.clearBuffer();
   u8g2.drawStr(0, 12, "birdoscope");
   u8g2.drawStr(0, 28, "starting...");
-  // On the splash rather than a carousel row: wanted when confirming a flash,
-  // not while scanning. Also on the serial banner and in `status`.
+  // The build identity shows on the splash, for confirming a flash. The serial
+  // banner and `status` also print it.
   {
     char line[22];
     snprintf(line, sizeof(line), "v%s %s", BIRDOSCOPE_VERSION, coreBuildRev());
@@ -198,7 +197,7 @@ static void displayInit() {
   u8g2.sendBuffer();
 }
 
-// Two-line centred-ish message (boot-time status, e.g. SD-not-found notice).
+// Two-line message for boot-time status, such as the SD-not-found notice.
 static void displayMessage(const char* line1, const char* line2) {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
@@ -207,14 +206,18 @@ static void displayMessage(const char* line1, const char* line2) {
   u8g2.sendBuffer();
 }
 
+#ifdef BENCH_RADIO_TOGGLE
+#include "z_bench_radio.inc"   // local and gitignored, built by z_bench.ini
+#endif
+
 #if NAV_BTN_COUNT
 #include "screens.inc"
 #endif  // NAV_BTN_COUNT
 
 static void displayTick() {
 #if DEMO_MODE
-  // Before the hop check below, so the pinned channel never reads as a change
-  // and never forces an extra repaint.
+  // Seeds before the hop check below, so the pinned channel never reads as a
+  // change or forces an extra repaint.
   demoSeedDisplayState();
 #if NAV_BTN_COUNT
   coreCurrentScreen = SCREEN_OVERVIEW;
@@ -226,10 +229,9 @@ static void displayTick() {
     markOverlayUntil = 0;
     dispDirty = true;                          // force a clean redraw of the screen
   }
-  // The channel hops every CHANNEL_DWELL_MS (~250ms) but the periodic refresh is
-  // 2s, so a channel readout would look stuck between refreshes. On the two
-  // screens that show the live channel, repaint when it changes so it
-  // tracks the hop. Other screens don't show it, so they stay on the 2s cadence.
+  // The channel hops every CHANNEL_DWELL_MS (~250ms) but the periodic refresh
+  // is 2s. The two screens that show the live channel repaint on each hop, and
+  // the others stay on the 2s cadence.
   static uint8_t lastShownChannel = 0;
   if (currentChannel != lastShownChannel) {
     lastShownChannel = currentChannel;
@@ -271,10 +273,10 @@ static void displayTick() {
 #endif  // NAV_BTN_COUNT
 }
 
-// Manual "area of interest" marker. On the 3-button scheme it's the dedicated
-// long-press of BTN_1 (NAV_MARK, available regardless of screen). On the
-// 2-button scheme it is BTN_PIN_2 (INPUT_MANUAL_MARK).
-// The mark is written before the survey window opens, per spec O1.
+// Manual "area of interest" marker. On the nav-button schemes it's the long
+// press of BTN_1 (NAV_MARK, available on every screen). On the 2-button scheme
+// it is BTN_PIN_2 (INPUT_MANUAL_MARK). This logs the mark before it opens the
+// survey window, per spec O1.
 static void triggerManualAlert() {
   fyLastTargetSeen = millis();
 #if USE_SD
@@ -288,11 +290,7 @@ static void triggerManualAlert() {
 #endif
 }
 
-static void displayAdmin();   // defined below. checkInput() shows it on Admin entry
-
-// Runs a confirmed or resumed device wipe and powers the board down. Never
-// returns. The erase itself is in core, this owns the two frames around it and
-// the warning not to cut power.
+static void displayAdmin();   // checkInput() draws it on Admin entry
 
 static void displayCenteredMessage(const char* l1, const char* l2, const char* l3) {
   const int w   = u8g2.getDisplayWidth();
@@ -307,9 +305,11 @@ static void displayCenteredMessage(const char* l1, const char* l2, const char* l
   u8g2.sendBuffer();
 }
 
+// Runs a confirmed or resumed device wipe and powers the board down. Never
+// returns. coreDeviceWipe() does the erase, and this draws the two frames
+// around it and the warning not to cut power.
 static void runDeviceWipe(WipeScope scope) {
-  // A card scope with no card reports what it could not do rather than showing
-  // the same completion frame as a wipe that reached everything.
+  // A card scope with no card reports the card it could not reach.
 #if USE_SD
   const bool cardMissed = (scope == WIPE_DEVICE_AND_CARD) && !fySDReady;
 #else
@@ -326,10 +326,11 @@ static void runDeviceWipe(WipeScope scope) {
 
 // Returns true if a nav action entered Admin mode this tick, so loop() can bail
 // out before displayTick() repaints over the Admin screen (mirrors the BOOT
-// double-press path). Only ever true on the 3-button scheme.
+// double-press path). Only ever true on the nav-button schemes.
 static bool checkInput() {
 #if NAV_BTN_COUNT
-  // Drain every pending nav event this tick (physical buttons + serial injector).
+  // Drain every pending nav event this tick, from the buttons and the serial
+  // injector.
   NavEvent ev;
   while ((ev = coreNavTick()) != NAV_NONE) {
     NavAction act = coreNavApply(ev);
@@ -339,7 +340,7 @@ static bool checkInput() {
       webPortalStart(WEB_PORTAL_AP_SSID, WEB_PORTAL_AP_PASSWORD);
       displayAdmin();
       return true;
-    } else if (act == NAV_ACT_WIPE) {   // Device Wipe, third Confirm landed
+    } else if (act == NAV_ACT_WIPE) {   // Device Wipe, after the third Confirm
       runDeviceWipe(coreWipeSelectedScope());
     } else if (act == NAV_ACT_REDRAW) {
       dispDirty = true;                  // repaint on next displayTick
@@ -352,8 +353,8 @@ static bool checkInput() {
   return false;
 }
 
-// Admin (AP) screen, shown once when the web portal comes up. Static: the
-// portal pauses scanning, so there's nothing to refresh until power-cycle.
+// Admin (AP) screen, drawn once when the web portal comes up. The portal
+// pauses scanning, so nothing refreshes it until the portal stops.
 static void displayAdmin() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
@@ -365,17 +366,20 @@ static void displayAdmin() {
 }
 
 // ============================================================
-// SERIAL COMMANDS: 'status' is board-specific, since it reports psram=.
-// Core handles the shared verbs.
+// SERIAL COMMANDS
+// 'status' is board-specific, since it reports psram=. Core handles the shared
+// verbs.
 // ============================================================
 
 static void printStatus() {
   unsigned long ms = millis();
   unsigned long s  = ms / 1000;
-  dualPrintf("[bscope] status: uptime=%lus ch=%u mode=%s det=%d spiffs=%d"
+  dualPrintf("[bscope] status: uptime=%lus radio=%s ch=%u mode=%s det=%d spiffs=%d"
              " heap=%u psram=%u sniffing=%d direct=%u indirect=%u"
-             " seen=%u cand=%u qdrop=%u survey=%us\n",
-             s, currentChannel, channelModeName(), fyDetCount,
+             " seen=%u cand=%u qdrop=%u survey=%us"
+             " ble=%u match=%u 1m=%u cod=%u\n",
+             s, radioModeName(coreRadioMode),
+             currentChannel, channelModeName(), fyDetCount,
              fySpiffsReady ? 1 : 0,
              (unsigned)ESP.getFreeHeap(),
              (unsigned)ESP.getFreePsram(),
@@ -383,14 +387,18 @@ static void printStatus() {
              (unsigned)coreDirectFrames, (unsigned)coreIndirectFrames,
              (unsigned)coreSeenFrames, (unsigned)coreCandidateFrames,
              (unsigned)coreQueueDrops,
-             (unsigned)(coreSurveyRemainingMs() / 1000));   // 0 when no window is open
-  // From the roost writer, the same source the serial heartbeat reads.
+             (unsigned)(coreSurveyRemainingMs() / 1000),   // 0 when no window is open
+             (unsigned)coreBleReports, (unsigned)coreBleMatched,
+             (unsigned)coreBlePhy1M, (unsigned)coreBlePhyCoded);
+  // From the roost writer, the same figures as the web console's load line.
   uint32_t rw = 0, rd = 0, wf = 0, fx = 0;
   roostSessionStats(&rw, &rd, &wf, &fx);
-  dualPrintf("[bscope] load: qmax=%u/%u qdrop=%u rows=%u fixes=%u dropped=%u"
-             " worst_flush=%ums session=%s\n",
+  dualPrintf("[bscope] load: qmax=%u/%u qdrop=%u bqmax=%u/%u bqdrop=%u rows=%u"
+             " fixes=%u dropped=%u worst_flush=%ums session=%s\n",
              (unsigned)coreQueueDepthMax, (unsigned)coreAlertQueueSize(),
              (unsigned)coreQueueDrops,
+             (unsigned)coreBleQueueDepthMax, (unsigned)coreBleQueueSize(),
+             (unsigned)coreBleQueueDrops,
              (unsigned)rw, (unsigned)fx, (unsigned)rd, (unsigned)wf,
              roostSessionOpen() ? roostSessionDir() : "none");
   dualPrintf("[bscope] build: %s\n", coreBuildIdentity());
@@ -400,10 +408,9 @@ static void printStatus() {
 // promiscuous callback feeds, so the display, SD, SPIFFS, and JSON path can
 // run without a live camera nearby. Sweeps RSSI across successive calls.
 //
-// `indirect` builds an addr1 hit instead, carrying a synthetic AP as mac2. It
-// is the only way to reach the addr1 branches without a camera in range: those
-// carry no scanner-to-camera RSSI, so they are what spec A2, C1 and S3 change
-// the behaviour of.
+// `indirect` builds an addr1 hit, with a synthetic AP as the transmitter. It
+// reaches the addr1 branches without a camera in range. Those hits carry no
+// scanner-to-camera RSSI, and spec A2, C1 and S3 govern them.
 static void injectTestDetection(bool indirect) {
   static const int8_t sweep[] = { -30, -45, -60, -75, -95 };
   static size_t sweepIdx = 0;
@@ -412,15 +419,15 @@ static void injectTestDetection(bool indirect) {
 
   uint8_t targetOui[3];
   coreGetFirstTargetOui(targetOui);
-  // A distinct last byte per direction, so an indirect inject lands on its own
-  // row instead of adding a direction to the direct one.
+  // Each direction gets its own last byte, so direct and indirect injects land
+  // on separate rows.
   uint8_t fakeMac[6] = { targetOui[0], targetOui[1], targetOui[2],
                          0xAA, 0xBB, (uint8_t)(indirect ? 0xCD : 0xCC) };
-  // Locally administered, and not a target prefix: an AP MAC that cannot
-  // itself match, which is what a real addr1 hit looks like.
+  // A locally administered MAC outside every target prefix, so the AP cannot
+  // match, as on a real addr1 hit.
   uint8_t fakeAp[6] = { 0x02, 0x00, 0x5E, 0x11, 0x22, 0x33 };
-  // Addresses by position, as a real frame would carry them: on an indirect
-  // hit the target is the receiver and the AP transmitted.
+  // Addresses by position, as in a real frame. On an indirect hit the target
+  // is the receiver and the AP the transmitter.
   FrameMeta fm = {};
   if (indirect) { memcpy(fm.addr1, fakeMac, 6); memcpy(fm.addr2, fakeAp, 6); }
   else          { memcpy(fm.addr2, fakeMac, 6); }
@@ -438,7 +445,7 @@ static void printSerialHelp() {
   dualPrintln("[bscope] serial commands (word-based, newline-terminated):");
   dualPrintln("  status            print status");
   dualPrintln("  inject [addr1]    inject a test detection, direct or indirect");
-  corePrintSerialHelp();   // core-owned: dump/prev/nav (+ chirp/jingle on buzzer boards)
+  corePrintSerialHelp();   // core's shared verbs
   dualPrintln("  help              this help (also '?')");
 }
 
@@ -451,7 +458,7 @@ static void checkSerialCommands() {
     else if (!strcmp(verb, "inject")) injectTestDetection(arg && !strcmp(arg, "addr1"));
     else if (!strcmp(verb, "help") || !strcmp(verb, "?")) printSerialHelp();
     else if (verb[0]) dualPrintf("[bscope] unknown command: %s (try 'help')\n", verb);
-    // blank line silently ignored
+    // a blank line falls through silently
   }
 }
 
@@ -462,11 +469,10 @@ static void checkSerialCommands() {
 void setup() {
   Serial.begin(115200);
 #if ARDUINO_USB_CDC_ON_BOOT
-  // Crucial for USB-optional operation: without this, Serial.write() blocks
-  // indefinitely on a native-USB-CDC port when no host is attached. A board
-  // using a hardware UART-to-USB bridge does not set ARDUINO_USB_CDC_ON_BOOT
-  // and does not need this, since plain HardwareSerial has no such method and
-  // never blocks.
+  // Required for USB-optional operation. Without it, Serial.write() blocks
+  // indefinitely on a native-USB-CDC port with no host attached. A board with
+  // a hardware UART-to-USB bridge leaves ARDUINO_USB_CDC_ON_BOOT unset, since
+  // plain HardwareSerial has no such method and never blocks.
   Serial.setTxTimeoutMs(0);
 #endif
   delay(300);
@@ -487,23 +493,24 @@ void setup() {
   displayInit();
   coreNotifyBoot();    // startup tune + RGB sanity cycle (no-op unless USE_LED/USE_BUZZER)
 
-  // SPIFFS: format on first boot if missing. Non-fatal if it fails. Mounted
-  // BEFORE coreTimeSync() because the NTP fallback (when no GPS module is found)
-  // reads the saved WiFi credentials off SPIFFS.
+  // SPIFFS formats on first boot if missing, and a failure is non-fatal. Mount
+  // it before coreTimeSync(), whose NTP join reads the saved WiFi credentials
+  // off SPIFFS.
   if (SPIFFS.begin(true)) {
     fySpiffsReady = true;
     dualPrintln("[bscope] SPIFFS ready");
     fyPromotePrevSession();
-    // Before the first detection; nothing reloads it lazily.
+    // Before the first detection. Nothing reloads it lazily.
     coreSettingsLoad();
   } else {
     dualPrintln("[bscope] SPIFFS init FAILED - running without persistence");
   }
 
-  // coreTimeSync() powers on the GPS rail and starts Serial2 at GPS_BAUD on
-  // GPS_RX_PIN/GPS_TX_PIN, reconfiguring the same UART2 the mirror above
-  // started at MIRROR_BAUD. It probes for a GPS module and, if none is
-  // found, falls back to a WiFi/NTP join (saved creds from SPIFFS), else millis.
+  // coreTimeSync() powers the GPS module and starts GPS_SERIAL at GPS_BAUD on
+  // GPS_RX_PIN/GPS_TX_PIN. Where GPS_SERIAL is the default Serial2, this
+  // reconfigures the UART the mirror above started. It probes for the module,
+  // then bridges the time until GPS locks with an NTP join on the saved WiFi
+  // credentials, else millis().
   coreTimeSync();
 
   precompileOuis();
@@ -511,19 +518,19 @@ void setup() {
 #if USE_SD
   // micro SD on SPI2 via SD_SCK/MOSI/MISO/CS_PIN. Non-fatal if absent.
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-  // Frequency and mountpoint are the Arduino defaults, restated only because
+  // The frequency and mountpoint repeat the Arduino defaults, because
   // SD_MAX_OPEN_FILES is positional.
   if (SD.begin(SD_CS_PIN, SPI, 4000000, "/sd", SD_MAX_OPEN_FILES)) {
     fySDReady = true;
     dualPrintln("[bscope] SD card ready");
     roostSessionBegin();
-    roostSessionAnchor();   // name the session now if time already anchored (NTP
-                            // path). On the GPS path this no-ops and gpsTick()
-                            // names it once the clock locks.
+    roostSessionAnchor();   // names the session now if NTP anchored the clock,
+                            // else gpsTick() names it once GPS locks
   } else {
-    // No card, which is non-fatal: fall back to onboard SPIFFS. Signal it visibly
-    // (5 blue LED flashes + on-screen notice) since boot otherwise looks
-    // silent. Runs before loop()/coreInputTick(), so the LED pin is still ours.
+    // No card is non-fatal, and detections save to onboard SPIFFS. Five blue
+    // LED flashes and an on-screen notice signal it, since boot otherwise looks
+    // silent. This runs before loop() and coreInputTick(), so the LED pin is
+    // still free.
     dualPrintln("[bscope] SD card not found - saving to SPIFFS");
     coreLedBlink(0, 0, 255, 5, 150, 150);
 #if NAV_BTN_COUNT
@@ -555,9 +562,9 @@ void setup() {
     }
   }
 
-  // Raw-IDF promiscuous capture bring-up (Detect mode). Shared with
-  // webPortalStop()'s resume path. See coreWifiSnifferStart() in core.
-  coreWifiSnifferStart();
+  // Starts the radio coreRadioMode selects (Detect mode). webPortalStop()'s
+  // resume path calls it too.
+  coreRadioStart();
 
   dualPrintln("[bscope] OLED-family WiFi detector started");
   dualPrintf("[bscope] mode=%s dwell_ms=%u start_channel=%u rssi_min=%d spiffs=%d\n",
@@ -567,18 +574,19 @@ void setup() {
 
 void loop() {
   static bool wasAdmin = false;
-  // Admin (AP) mode: service only the portal. It releases back to Detect on a
-  // web "return to scan" command or an idle timeout (webPortalTick may end it),
-  // so this is not a latch. Detect and Admin can alternate freely.
+  // Admin (AP) mode services only the portal. A web "return to scan" command
+  // or an idle timeout in webPortalTick() releases it back to Detect, so Detect
+  // and Admin can alternate freely.
   if (webPortalActive()) {
     webPortalTick();                                             // may release (web / idle timeout)
 #if NAV_BTN_COUNT
-    const NavEvent adminEv = coreNavTick();   // drained every loop so the queue cannot stale
+    const NavEvent adminEv = coreNavTick();   // drained every loop so the queue cannot go stale
 #else
     const NavEvent adminEv = NAV_NONE;
 #endif
-    // Buttons are otherwise inert in Admin. Only the sustained Back hold acts,
-    // so a stray press cannot drop the portal mid-session.
+    // Buttons are otherwise inert in Admin. Only NAV_BACK_HOLD (a Back hold, or
+    // a double press on 4-button boards) acts, so a stray press cannot drop the
+    // portal mid-session.
     if (webPortalActive() && (adminEv == NAV_BACK_HOLD || coreAdminTriggerCheck())) webPortalStop();
     wasAdmin = true;
     delay(2);
@@ -586,7 +594,7 @@ void loop() {
   }
   if (wasAdmin) { wasAdmin = false; dispDirty = true; }   // resumed, so force a redraw
 
-  // Anytime BOOT double-press enters Admin.
+  // A BOOT double press enters Admin from any screen.
   if (coreAdminTriggerCheck()) {
     webPortalStart(WEB_PORTAL_AP_SSID, WEB_PORTAL_AP_PASSWORD);
     displayAdmin();
@@ -597,12 +605,16 @@ void loop() {
   roostSessionTick();   // manifest snapshot, so a power cut still leaves counters
   updateChannelMode();
   checkSerialCommands();
-  if (checkInput()) return;   // Config menu → Admin: portal serviced next loop
+  if (checkInput()) return;   // entered Admin, and the next loop services the portal
   coreSurveyTick();     // closes an operator survey window once it has elapsed
   drainAlertQueue();
+  if (coreBleDrain()) dispDirty = true;
+#ifdef BENCH_RADIO_TOGGLE
+  benchRadioTick();
+#endif
   displayTick();        // refresh OLED after any queue drain
   autosaveTick();       // periodic SPIFFS write if dirty
-  coreNotifyTick();     // LED off-timer (heartbeat pulse retired, spec A1)
+  coreNotifyTick();     // LED off-timer, spec A1
   printHeartbeat();
   delay(1);
 }
